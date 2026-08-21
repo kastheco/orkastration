@@ -14,7 +14,7 @@ version: 1
 max_parallel_lanes: 2
 supervisor: {{agent: codex, model: gpt-supervisor, strength: high}}
 roles:
-  worker: {{agent: codex, model: gpt-test, strength: {strength}}}
+  worker: {{agent: codex, model: gpt-test, strength: {strength}, fast: true}}
   initial_reviewer: {{agent: codex, model: gpt-test, strength: high}}
   fixer: {{agent: codex, model: gpt-test, strength: high}}
   re_reviewer: {{agent: codex, model: gpt-test, strength: xhigh}}
@@ -41,6 +41,8 @@ def test_settings_load_yaml_and_explicit_orca_command(
     assert settings.graph.supervisor.model == "gpt-supervisor"
     assert settings.graph.supervisor.fast is False
     assert settings.graph.roles.worker.model == "gpt-test"
+    assert settings.graph.roles.worker.fast is True
+    assert settings.graph.roles.initial_reviewer.fast is False
     assert settings.graph.roles.re_reviewer.strength == "xhigh"
     assert settings.database_path == tmp_path / "state.sqlite3"
 

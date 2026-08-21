@@ -41,8 +41,8 @@ This invokes the supervisor backend selected in `kasgraph.yaml`. `agent: codex`
 uses `codex exec` with an ephemeral read-only sandbox. `agent: claude` uses
 `claude -p` with plan permissions and no session persistence. Both receive the
 Pydantic-generated `SupervisorPlan` JSON Schema and must remain read-only against
-Linear, Notion, files, git, and Orca. The optional supervisor-only `fast` setting
-defaults to `false`; when enabled, it requests the backend's fast service mode.
+Linear, Notion, files, git, and Orca. Every profile's optional `fast` setting
+defaults to `false`; when enabled, it requests that backend's fast service mode.
 
 ## Accept
 
@@ -75,4 +75,5 @@ writes.
 
 The model you are talking to belongs to this interactive session. The top-level
 `supervisor` profile in `kasgraph.yaml` configures only the optional Codex or
-Claude planning turn. The four `roles` profiles configure Orca execution launches.
+Claude planning turn. The four `roles` profiles configure Orca execution launches,
+including provider-native fast mode before supervised task injection.

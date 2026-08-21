@@ -54,26 +54,31 @@ roles:
     agent: codex
     model: gpt-5.6-sol
     strength: high
+    fast: false
   initial_reviewer:
     agent: codex
     model: gpt-5.6-sol
     strength: high
+    fast: false
   fixer:
     agent: codex
     model: gpt-5.6-sol
     strength: high
+    fast: false
   re_reviewer:
     agent: codex
     model: gpt-5.6-sol
     strength: xhigh
+    fast: false
 ```
 
-The execution-role values map directly to Orca's supervised worker launch
-flags: `--agent`, `--model`, and `--effort`. The top-level `supervisor` profile
-selects the planner backend. Its optional `fast` value defaults to `false` and
-controls only that planning subprocess. For Codex, `fast: true` selects the
-`priority` service tier; for Claude, it requests Claude Code fast mode. Claude
-may decline the request when fast mode is unavailable for the account or model.
+Every profile accepts an optional `fast` value that defaults to `false`. The
+execution-role values map to Orca's supervised worker launch. A fast role uses
+Orca's custom-argv path so the provider-native fast setting is active before the
+terminal is attached to its Task Dispatch. The top-level `supervisor` profile
+selects the planner backend. For Codex, `fast: true` selects the `priority`
+service tier; for Claude, it requests Claude Code fast mode. Claude may decline
+the request when fast mode is unavailable for the account or model.
 `agent: codex` maps to `codex exec --model` and `model_reasoning_effort`;
 `agent: claude` maps to `claude -p --model --effort`. Set `KASGRAPH_CONFIG` to
 use a different YAML file. The surrounding interactive session still controls

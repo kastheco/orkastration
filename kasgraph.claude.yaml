@@ -12,18 +12,22 @@ roles:
     agent: claude
     model: sonnet
     strength: high
+    fast: false
 
   initial_reviewer:
     agent: claude
     model: sonnet
     strength: high
+    fast: false
 
   fixer:
     agent: claude
     model: sonnet
     strength: high
+    fast: false
 
   re_reviewer:
     agent: claude
     model: sonnet
     strength: high
+    fast: false

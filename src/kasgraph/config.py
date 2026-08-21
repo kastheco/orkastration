@@ -25,12 +25,11 @@ class AgentProfile(BaseModel):
     agent: str = Field(default="codex", pattern=r"^[a-z][a-z0-9-]*$")
     model: str = Field(min_length=1, max_length=200)
     strength: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+    fast: bool = False
 
 
 class SupervisorProfile(AgentProfile):
-    """Planner launch profile with an explicit fast-mode preference."""
-
-    fast: bool = False
+    """Planner launch profile."""
 
 
 class RoleProfiles(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,6 +129,15 @@ class OrcaClient:
     ) -> tuple[str, str, JsonObject]:
         """Start one supervised worker with an explicit model and effort."""
 
+        if profile.fast:
+            return await self._start_fast_worker(
+                task_id=task_id,
+                lane_name=lane_name,
+                repo_selector=repo_selector,
+                worktree_id=worktree_id,
+                profile=profile,
+            )
+
         arguments = ["orchestration", "worker-start", "--task", task_id]
         if worktree_id is None:
             arguments.extend(
@@ -160,6 +170,68 @@ class OrcaClient:
         resolved_worktree = worktree_id or _required_recursive_string(
             response, "worktreeId", "workspaceId"
         )
+        return dispatch_id, resolved_worktree, response
+
+    async def _start_fast_worker(
+        self,
+        *,
+        task_id: str,
+        lane_name: str,
+        repo_selector: str,
+        worktree_id: str | None,
+        profile: AgentProfile,
+    ) -> tuple[str, str, JsonObject]:
+        """Launch fast provider argv, then attach it to a supervised Dispatch."""
+
+        resolved_worktree = worktree_id
+        if resolved_worktree is None:
+            worktree_response = await self._ok(
+                "worktree",
+                "create",
+                "--name",
+                lane_name,
+                "--no-parent",
+                "--repo",
+                repo_selector,
+                "--setup",
+                "run",
+                "--json",
+            )
+            resolved_worktree = _worktree_id(worktree_response)
+
+        terminal_response = await self._ok(
+            "terminal",
+            "create",
+            "--worktree",
+            f"id:{resolved_worktree}",
+            "--title",
+            f"{lane_name}-{profile.agent}-fast",
+            "--command",
+            shlex.join(_fast_agent_command(profile)),
+            "--json",
+        )
+        terminal_handle = _required_recursive_string(terminal_response, "terminalHandle", "handle")
+        await self._ok(
+            "terminal",
+            "wait",
+            "--terminal",
+            terminal_handle,
+            "--for",
+            "tui-idle",
+            "--timeout-ms",
+            "20000",
+            "--json",
+        )
+        response = await self._ok(
+            "orchestration",
+            "worker-start",
+            "--task",
+            task_id,
+            "--terminal",
+            terminal_handle,
+            "--json",
+        )
+        dispatch_id = _required_recursive_string(response, "dispatchId")
         return dispatch_id, resolved_worktree, response
 
     async def release_worker(self, dispatch_id: str) -> JsonObject:
@@ -203,6 +275,48 @@ def _required_recursive_string(value: object, *keys: str) -> str:
                 continue
     joined = "/".join(keys)
     raise OrcaError(f"Orca response omitted {joined}")
+
+
+def _worktree_id(response: JsonObject) -> str:
+    """Read a full worktree ID from a worktree-create response."""
+
+    result = _object(response.get("result"), "result")
+    for key in ("worktreeId", "workspaceId"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    worktree = result.get("worktree")
+    if isinstance(worktree, dict):
+        value = worktree.get("id")
+        if isinstance(value, str) and value:
+            return value
+    raise OrcaError("Orca response omitted the created worktree ID")
+
+
+def _fast_agent_command(profile: AgentProfile) -> tuple[str, ...]:
+    """Build provider-native argv with fast mode active before task injection."""
+
+    if profile.agent == "codex":
+        return (
+            "codex",
+            "--model",
+            profile.model,
+            "-c",
+            f'model_reasoning_effort="{profile.strength}"',
+            "-c",
+            'service_tier="priority"',
+        )
+    if profile.agent == "claude":
+        return (
+            "claude",
+            "--model",
+            profile.model,
+            "--effort",
+            profile.strength,
+            "--settings",
+            '{"fastMode":true}',
+        )
+    raise OrcaError(f"fast mode is unsupported for worker agent: {profile.agent}")
 
 
 def _orchestration_id(response: JsonObject, container: str, explicit_key: str) -> str:

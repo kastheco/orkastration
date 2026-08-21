@@ -21,8 +21,8 @@ class FakeRunner:
         return self.responses.pop(0)
 
 
-def profile() -> AgentProfile:
-    return AgentProfile(agent="codex", model="gpt-test", strength="high")
+def profile(*, agent: str = "codex", fast: bool = False) -> AgentProfile:
+    return AgentProfile(agent=agent, model="gpt-test", strength="high", fast=fast)
 
 
 def worktree_response() -> JsonObject:
@@ -151,6 +151,112 @@ async def test_start_worker_reuses_lane_worktree() -> None:
     )
     assert worktree_id == "repo::/tmp/issue-123"
     assert "id:repo::/tmp/issue-123" in runner.calls[0]
+
+
+async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -> None:
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}},
+            {"ok": True, "result": {"terminal": {"handle": "terminal-1"}}},
+            {"ok": True, "result": {}},
+            {"ok": True, "result": {"dispatchId": "dispatch-1"}},
+        ]
+    )
+    client = OrcaClient(runner)
+
+    dispatch_id, worktree_id, _ = await client.start_worker(
+        task_id="task-1",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id=None,
+        profile=profile(fast=True),
+    )
+
+    assert (dispatch_id, worktree_id) == ("dispatch-1", "repo::/tmp/issue-123")
+    assert runner.calls[0] == (
+        "worktree",
+        "create",
+        "--name",
+        "issue-123",
+        "--no-parent",
+        "--repo",
+        "id:repo",
+        "--setup",
+        "run",
+        "--json",
+    )
+    assert runner.calls[1] == (
+        "terminal",
+        "create",
+        "--worktree",
+        "id:repo::/tmp/issue-123",
+        "--title",
+        "issue-123-codex-fast",
+        "--command",
+        "codex --model gpt-test "
+        "-c 'model_reasoning_effort=\"high\"' -c 'service_tier=\"priority\"'",
+        "--json",
+    )
+    assert runner.calls[2][0:6] == (
+        "terminal",
+        "wait",
+        "--terminal",
+        "terminal-1",
+        "--for",
+        "tui-idle",
+    )
+    assert runner.calls[3] == (
+        "orchestration",
+        "worker-start",
+        "--task",
+        "task-1",
+        "--terminal",
+        "terminal-1",
+        "--json",
+    )
+
+
+async def test_fast_claude_worker_reuses_worktree_with_fast_settings() -> None:
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"terminalHandle": "terminal-2"}},
+            {"ok": True, "result": {}},
+            {"ok": True, "result": {"dispatchId": "dispatch-2"}},
+        ]
+    )
+    client = OrcaClient(runner)
+
+    _, worktree_id, _ = await client.start_worker(
+        task_id="task-2",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id="repo::/tmp/issue-123",
+        profile=profile(agent="claude", fast=True),
+    )
+
+    assert worktree_id == "repo::/tmp/issue-123"
+    assert runner.calls[0][0:8] == (
+        "terminal",
+        "create",
+        "--worktree",
+        "id:repo::/tmp/issue-123",
+        "--title",
+        "issue-123-claude-fast",
+        "--command",
+        "claude --model gpt-test --effort high --settings '{\"fastMode\":true}'",
+    )
+
+
+async def test_fast_worker_rejects_unsupported_agent() -> None:
+    client = OrcaClient(FakeRunner([]))
+    with pytest.raises(OrcaError, match="unsupported for worker agent: omp"):
+        await client.start_worker(
+            task_id="task-1",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id="repo::/tmp/issue-123",
+            profile=profile(agent="omp", fast=True),
+        )
 
 
 @pytest.mark.parametrize(
