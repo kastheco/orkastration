@@ -27,6 +27,12 @@ class AgentProfile(BaseModel):
     strength: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
 
 
+class SupervisorProfile(AgentProfile):
+    """Planner launch profile with an explicit fast-mode preference."""
+
+    fast: bool = False
+
+
 class RoleProfiles(BaseModel):
     """The four fixed execution roles in every lane graph."""
 
@@ -45,7 +51,7 @@ class GraphConfig(BaseModel):
 
     version: int = Field(default=1, ge=1, le=1)
     max_parallel_lanes: int = Field(default=2, ge=1, le=32)
-    supervisor: AgentProfile
+    supervisor: SupervisorProfile
     roles: RoleProfiles
 
 

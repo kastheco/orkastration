@@ -5,6 +5,7 @@ supervisor:
   agent: claude
   model: sonnet
   strength: high
+  fast: false
 
 roles:
   worker:
@@ -26,4 +27,3 @@ roles:
     agent: claude
     model: sonnet
     strength: high
-

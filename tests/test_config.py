@@ -39,6 +39,7 @@ def test_settings_load_yaml_and_explicit_orca_command(
     assert settings.claude_command == ("claude-dev", "--profile", "planner")
     assert settings.codex_command == ("codex-dev", "--profile", "planner")
     assert settings.graph.supervisor.model == "gpt-supervisor"
+    assert settings.graph.supervisor.fast is False
     assert settings.graph.roles.worker.model == "gpt-test"
     assert settings.graph.roles.re_reviewer.strength == "xhigh"
     assert settings.database_path == tmp_path / "state.sqlite3"

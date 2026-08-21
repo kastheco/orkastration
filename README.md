@@ -47,6 +47,7 @@ supervisor:
   agent: codex
   model: gpt-5.6-sol
   strength: high
+  fast: false
 
 roles:
   worker:
@@ -69,11 +70,14 @@ roles:
 
 The execution-role values map directly to Orca's supervised worker launch
 flags: `--agent`, `--model`, and `--effort`. The top-level `supervisor` profile
-selects the planner backend. `agent: codex` maps to `codex exec --model` and
-`model_reasoning_effort`; `agent: claude` maps to `claude -p --model --effort`.
-Set `KASGRAPH_CONFIG` to use a different YAML file. The surrounding interactive
-session still controls the model you are talking to; this supervisor profile
-controls only Kasgraph's optional typed planning subprocess.
+selects the planner backend. Its optional `fast` value defaults to `false` and
+controls only that planning subprocess. For Codex, `fast: true` selects the
+`priority` service tier; for Claude, it requests Claude Code fast mode. Claude
+may decline the request when fast mode is unavailable for the account or model.
+`agent: codex` maps to `codex exec --model` and `model_reasoning_effort`;
+`agent: claude` maps to `claude -p --model --effort`. Set `KASGRAPH_CONFIG` to
+use a different YAML file. The surrounding interactive session still controls
+the model you are talking to.
 
 An all-Claude example is provided in
 [`kasgraph.claude.yaml`](kasgraph.claude.yaml):

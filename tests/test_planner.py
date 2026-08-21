@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from kasgraph.config import AgentProfile
+from kasgraph.config import SupervisorProfile
 from kasgraph.planner import (
     ClaudeCliPlanner,
     CodexCliPlanner,
@@ -82,11 +82,13 @@ class FakeProcess:
         self.killed = True
 
 
-def subprocess_runner(*, agent: str = "codex", timeout: float = 1) -> SubprocessCodexRunner:
+def subprocess_runner(
+    *, agent: str = "codex", timeout: float = 1, fast: bool = False
+) -> SubprocessCodexRunner:
     return SubprocessCodexRunner(
         command=("codex",),
         cwd=Path("/repo"),
-        profile=AgentProfile(agent=agent, model="gpt-test", strength="xhigh"),
+        profile=SupervisorProfile(agent=agent, model="gpt-test", strength="xhigh", fast=fast),
         timeout_seconds=timeout,
     )
 
@@ -111,6 +113,7 @@ async def test_subprocess_runner_uses_ephemeral_read_only_schema(
     assert json.loads(output)["next_action"] == "propose_lanes"
     assert observed[:5] == ("codex", "exec", "--ephemeral", "--sandbox", "read-only")
     assert 'model_reasoning_effort="xhigh"' in observed
+    assert 'service_tier="default"' in observed
     assert process is not None and process.prompt == b"Plan this"
 
 
@@ -160,11 +163,13 @@ async def test_subprocess_runner_kills_timeout(monkeypatch: pytest.MonkeyPatch) 
     assert process is not None and process.killed is True
 
 
-def claude_runner(*, agent: str = "claude", timeout: float = 1) -> SubprocessClaudeRunner:
+def claude_runner(
+    *, agent: str = "claude", timeout: float = 1, fast: bool = False
+) -> SubprocessClaudeRunner:
     return SubprocessClaudeRunner(
         command=("claude",),
         cwd=Path("/repo"),
-        profile=AgentProfile(agent=agent, model="sonnet", strength="high"),
+        profile=SupervisorProfile(agent=agent, model="sonnet", strength="high", fast=fast),
         timeout_seconds=timeout,
     )
 
@@ -207,7 +212,29 @@ async def test_claude_runner_uses_print_plan_mode_and_structured_output(
     assert "--permission-mode" in observed
     assert "--no-session-persistence" in observed
     assert "--json-schema" in observed
+    settings_index = observed.index("--settings")
+    assert observed[settings_index + 1] == '{"fastMode":false}'
     assert process.prompt == b"Plan this"
+
+
+async def test_fast_mode_maps_to_each_cli_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[tuple[str, ...]] = []
+
+    async def create(*arguments: str, **kwargs: Any) -> FakeClaudeProcess | FakeProcess:
+        observed.append(arguments)
+        if arguments[0] == "claude":
+            envelope = json.dumps({"type": "result", "structured_output": json.loads(plan_json())})
+            return FakeClaudeProcess(stdout=envelope.encode())
+        output_path = Path(arguments[arguments.index("--output-last-message") + 1])
+        return FakeProcess(output_path)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    await subprocess_runner(fast=True).run("Plan", {})
+    await claude_runner(fast=True).run("Plan", {})
+
+    assert 'service_tier="priority"' in observed[0]
+    settings_index = observed[1].index("--settings")
+    assert observed[1][settings_index + 1] == '{"fastMode":true}'
 
 
 async def test_claude_runner_accepts_result_string(monkeypatch: pytest.MonkeyPatch) -> None:

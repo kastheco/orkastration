@@ -11,7 +11,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from kasgraph.config import AgentProfile
+from kasgraph.config import SupervisorProfile
 from kasgraph.models import SupervisorPlan
 
 
@@ -68,7 +68,7 @@ class SubprocessCodexRunner:
 
     command: tuple[str, ...]
     cwd: Path
-    profile: AgentProfile
+    profile: SupervisorProfile
     timeout_seconds: float
 
     async def run(self, prompt: str, schema: dict[str, object]) -> str:
@@ -76,6 +76,7 @@ class SubprocessCodexRunner:
 
         if self.profile.agent != "codex":
             raise PlannerError("the supervisor profile agent must be codex")
+        service_tier = "priority" if self.profile.fast else "default"
         with tempfile.TemporaryDirectory(prefix="kasgraph-planner-") as raw_directory:
             directory = Path(raw_directory)
             schema_path = directory / "supervisor-plan.schema.json"
@@ -91,6 +92,8 @@ class SubprocessCodexRunner:
                 self.profile.model,
                 "-c",
                 f'model_reasoning_effort="{self.profile.strength}"',
+                "-c",
+                f'service_tier="{service_tier}"',
                 "--output-schema",
                 str(schema_path),
                 "--output-last-message",
@@ -134,7 +137,7 @@ class SubprocessClaudeRunner:
 
     command: tuple[str, ...]
     cwd: Path
-    profile: AgentProfile
+    profile: SupervisorProfile
     timeout_seconds: float
 
     async def run(self, prompt: str, schema: dict[str, object]) -> str:
@@ -152,6 +155,8 @@ class SubprocessClaudeRunner:
             "--permission-mode",
             "plan",
             "--no-session-persistence",
+            "--settings",
+            json.dumps({"fastMode": self.profile.fast}, separators=(",", ":")),
             "--output-format",
             "json",
             "--json-schema",
