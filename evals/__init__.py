@@ -1,1 +1,1 @@
-"""Local evaluation suites."""
+"""Local Kasgraph evaluation suites."""

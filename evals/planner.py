@@ -1,84 +1,78 @@
-"""Deterministic release smoke for the non-model planning policy."""
+"""Deterministic contract eval for subscription-backed planner output."""
 
 from __future__ import annotations
 
 from typing import TypedDict
 
+from pydantic import ValidationError
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EqualsExpected
 
-from kasgraph.models import OrcaSnapshot, OrcaWorktree, SupervisorPlan
-from kasgraph.planner import PlanRejected, validate_plan
+from kasgraph.models import SupervisorPlan
 
 
-class PolicyInput(TypedDict):
+class ContractInput(TypedDict):
     plan: dict[str, object]
-    active_count: int
-    max_parallel: int
 
 
-def evaluate_policy(value: PolicyInput) -> bool:
-    """Return whether deterministic policy accepts the proposed plan."""
+def validates_supervisor_plan(value: ContractInput) -> bool:
+    """Return whether a candidate satisfies the exact planner contract."""
 
-    worktrees = [
-        OrcaWorktree(
-            worktree_id=f"repo::/tmp/active-{index}",
-            repo_id="repo",
-            repo="example",
-            path=f"/tmp/active-{index}",
-            display_name=f"active-{index}",
-            workspace_status="in-progress",
-            status="working",
-        )
-        for index in range(value["active_count"])
-    ]
     try:
-        validate_plan(
-            SupervisorPlan.model_validate(value["plan"]),
-            OrcaSnapshot(worktrees=worktrees),
-            value["max_parallel"],
-        )
-    except (PlanRejected, ValueError):
+        SupervisorPlan.model_validate(value["plan"])
+    except ValidationError:
         return False
     return True
 
 
-START_PLAN: dict[str, object] = {
-    "rationale": "One independent issue is ready.",
-    "next_action": "start_lane",
-    "selected_lane_name": "issue-123",
-    "lanes": [
-        {
-            "name": "issue-123",
-            "issue_id": "ISSUE-123",
-            "repo_selector": "id:repo",
-            "role": "implementer",
-            "can_run_parallel": True,
-            "prompt": "Implement ISSUE-123 and stop after verification.",
-            "stop_condition": "Focused tests pass and a review summary exists.",
-        }
-    ],
+LANE: dict[str, object] = {
+    "name": "issue-123",
+    "issue_id": "ISSUE-123",
+    "repo_selector": "id:repo",
+    "dependencies": [],
+    "prompt": "Implement ISSUE-123 and stop after verification.",
+    "stop_condition": "Focused and broad relevant checks pass.",
 }
 
-dataset: Dataset[PolicyInput, bool, None] = Dataset(
-    name="planner_policy",
+dataset: Dataset[ContractInput, bool, None] = Dataset(
+    name="supervisor_plan_contract",
     cases=[
         Case(
-            name="accept_one_lane_below_limit",
-            inputs={"plan": START_PLAN, "active_count": 0, "max_parallel": 2},
+            name="accept_independent_lane_proposal",
+            inputs={
+                "plan": {
+                    "objective": "Ship ready work.",
+                    "rationale": "The lane is unblocked.",
+                    "next_action": "propose_lanes",
+                    "owner_question": None,
+                    "lanes": [LANE],
+                }
+            },
             expected_output=True,
         ),
         Case(
-            name="reject_at_concurrency_limit",
-            inputs={"plan": START_PLAN, "active_count": 2, "max_parallel": 2},
+            name="reject_needs_owner_without_question",
+            inputs={
+                "plan": {
+                    "objective": "Ship ready work.",
+                    "rationale": "A product choice is missing.",
+                    "next_action": "needs_owner",
+                    "owner_question": None,
+                    "lanes": [],
+                }
+            },
             expected_output=False,
         ),
         Case(
-            name="accept_wait_at_limit",
+            name="accept_wait_without_lanes",
             inputs={
-                "plan": {"rationale": "Wait for active lanes.", "next_action": "wait"},
-                "active_count": 2,
-                "max_parallel": 2,
+                "plan": {
+                    "objective": "Ship ready work.",
+                    "rationale": "Every issue is blocked.",
+                    "next_action": "wait",
+                    "owner_question": None,
+                    "lanes": [],
+                }
             },
             expected_output=True,
         ),
@@ -88,9 +82,9 @@ dataset: Dataset[PolicyInput, bool, None] = Dataset(
 
 
 def main() -> None:
-    """Run the local planner-policy experiment."""
+    """Run the local planner contract eval."""
 
-    report = dataset.evaluate_sync(evaluate_policy)
+    report = dataset.evaluate_sync(validates_supervisor_plan)
     report.print(include_input=True, include_output=True)
 
 

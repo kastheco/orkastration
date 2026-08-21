@@ -11,7 +11,8 @@ from typing import Protocol, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from kasgraph.models import LaneProposal, OrcaSnapshot, OrcaWorktree
+from kasgraph.config import AgentProfile
+from kasgraph.models import OrcaSnapshot, OrcaWorktree
 
 JsonObject = dict[str, object]
 
@@ -90,35 +91,83 @@ class OrcaClient:
             raise OrcaError("Orca worktree response did not match the expected schema") from exc
         return OrcaSnapshot(worktrees=worktrees)
 
-    async def create_lane(self, lane: LaneProposal) -> tuple[str, JsonObject]:
-        """Create one independent Orca worktree and launch its selected agent."""
+    async def create_run(self, objective: str) -> tuple[str, JsonObject]:
+        """Create and bind one Orca orchestration Run."""
 
-        existing = next(
-            (item for item in (await self.snapshot()).worktrees if item.display_name == lane.name),
-            None,
-        )
-        if existing is not None:
-            return existing.worktree_id, {"reused": True, "worktreeId": existing.worktree_id}
-        response = await self._ok(
-            "worktree",
-            "create",
-            "--repo",
-            lane.repo_selector,
-            "--name",
-            lane.name,
-            "--no-parent",
-            "--agent",
-            lane.agent_id,
-            "--prompt",
-            lane.prompt,
-            "--json",
-        )
+        response = await self._ok("orchestration", "run-create", "--objective", objective, "--json")
+        return _orchestration_id(response, "run", "runId"), response
+
+    async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
+        """Create one Orca Task with optional task-ID dependencies."""
+
+        arguments = ["orchestration", "task-create", "--spec", spec]
+        if dependencies:
+            arguments.extend(("--deps", json.dumps(dependencies, separators=(",", ":"))))
+        arguments.append("--json")
+        response = await self._ok(*arguments)
+        return _orchestration_id(response, "task", "taskId"), response
+
+    async def tasks(self, orca_run_id: str) -> list[JsonObject]:
+        """Read authoritative Task state for one Orca Run."""
+
+        response = await self._ok("orchestration", "task-list", "--run", orca_run_id, "--json")
         result = _object(response.get("result"), "result")
-        worktree = _object(result.get("worktree"), "result.worktree")
-        worktree_id = worktree.get("id")
-        if not isinstance(worktree_id, str) or not worktree_id:
-            raise OrcaError("Orca create response omitted result.worktree.id")
-        return worktree_id, response
+        tasks = result.get("tasks")
+        if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
+            raise OrcaError("Orca task-list response omitted result.tasks")
+        return cast(list[JsonObject], tasks)
+
+    async def start_worker(
+        self,
+        *,
+        task_id: str,
+        lane_name: str,
+        repo_selector: str,
+        worktree_id: str | None,
+        profile: AgentProfile,
+    ) -> tuple[str, str, JsonObject]:
+        """Start one supervised worker with an explicit model and effort."""
+
+        arguments = ["orchestration", "worker-start", "--task", task_id]
+        if worktree_id is None:
+            arguments.extend(
+                (
+                    "--worktree",
+                    "new-top-level",
+                    "--repo",
+                    repo_selector,
+                    "--name",
+                    lane_name,
+                    "--setup",
+                    "run",
+                )
+            )
+        else:
+            arguments.extend(("--worktree", f"id:{worktree_id}"))
+        arguments.extend(
+            (
+                "--agent",
+                profile.agent,
+                "--model",
+                profile.model,
+                "--effort",
+                profile.strength,
+                "--json",
+            )
+        )
+        response = await self._ok(*arguments)
+        dispatch_id = _required_recursive_string(response, "dispatchId")
+        resolved_worktree = worktree_id or _required_recursive_string(
+            response, "worktreeId", "workspaceId"
+        )
+        return dispatch_id, resolved_worktree, response
+
+    async def release_worker(self, dispatch_id: str) -> JsonObject:
+        """Release the exact terminal owned by a settled Dispatch."""
+
+        return await self._ok(
+            "orchestration", "worker-release", "--dispatch", dispatch_id, "--json"
+        )
 
     async def _ok(self, *arguments: str) -> JsonObject:
         response = await self._runner.run(arguments)
@@ -131,3 +180,41 @@ def _object(value: object, field: str) -> JsonObject:
     if not isinstance(value, dict):
         raise OrcaError(f"Orca response omitted {field}")
     return cast(JsonObject, value)
+
+
+def _required_recursive_string(value: object, *keys: str) -> str:
+    """Find a non-empty string field in a bounded JSON response tree."""
+
+    if isinstance(value, dict):
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        for candidate in value.values():
+            try:
+                return _required_recursive_string(candidate, *keys)
+            except OrcaError:
+                continue
+    elif isinstance(value, list):
+        for candidate in value:
+            try:
+                return _required_recursive_string(candidate, *keys)
+            except OrcaError:
+                continue
+    joined = "/".join(keys)
+    raise OrcaError(f"Orca response omitted {joined}")
+
+
+def _orchestration_id(response: JsonObject, container: str, explicit_key: str) -> str:
+    """Read an orchestration entity ID without confusing it with the RPC request ID."""
+
+    result = _object(response.get("result"), "result")
+    explicit = result.get(explicit_key)
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    nested = result.get(container)
+    if isinstance(nested, dict):
+        identifier = nested.get("id")
+        if isinstance(identifier, str) and identifier:
+            return identifier
+    raise OrcaError(f"Orca response omitted result.{explicit_key}")

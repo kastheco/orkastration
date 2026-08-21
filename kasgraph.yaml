@@ -1,0 +1,28 @@
+version: 1
+max_parallel_lanes: 3
+
+supervisor:
+  agent: codex
+  model: gpt-5.6-sol
+  strength: high
+
+roles:
+  worker:
+    agent: codex
+    model: gpt-5.6-sol
+    strength: high
+
+  initial_reviewer:
+    agent: codex
+    model: gpt-5.6-sol
+    strength: high
+
+  fixer:
+    agent: codex
+    model: gpt-5.6-sol
+    strength: high
+
+  re_reviewer:
+    agent: codex
+    model: gpt-5.6-sol
+    strength: xhigh

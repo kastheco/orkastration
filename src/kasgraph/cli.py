@@ -1,4 +1,4 @@
-"""Command-line interface for one-cycle supervision."""
+"""Command-line interface for proposal acceptance and graph monitoring."""
 
 from __future__ import annotations
 
@@ -9,17 +9,19 @@ from pathlib import Path
 from typing import Annotated, Any, Never
 
 import typer
-from pydantic import BaseModel
+import yaml
+from pydantic import BaseModel, ValidationError
 
 from kasgraph import __version__
 from kasgraph.config import ConfigError, Settings
+from kasgraph.execution import ExecutionController
+from kasgraph.models import SupervisorPlan
 from kasgraph.orca import OrcaClient, OrcaError, SubprocessRunner
-from kasgraph.planner import PlannerDeps, PlanRejected, PydanticPlanner
+from kasgraph.planner import CodexCliPlanner, PlannerError, SubprocessCodexRunner
 from kasgraph.store import StateStore
-from kasgraph.supervisor import Supervisor
 
 app = typer.Typer(
-    help="Plan and reconcile one safe action at a time through Orca.",
+    help="Record, accept, and monitor Orca execution graphs.",
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
@@ -33,7 +35,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
-    version: Annotated[  # pyright: ignore[reportUnusedParameter]
+    version: Annotated[
         bool | None,
         typer.Option("--version", callback=_version_callback, is_eager=True),
     ] = None,
@@ -45,17 +47,21 @@ def main(
 def doctor(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Check local configuration, SQLite, and Orca reachability."""
+    """Check YAML configuration, SQLite, and Orca reachability."""
 
     async def check() -> dict[str, object]:
-        settings, store, orca = _components(require_model=False)
+        settings, store, orca = _components()
         status = await orca.status()
         return {
             "ok": True,
-            "model_configured": settings.model is not None,
+            "config_path": str(settings.config_path),
+            "roles": settings.graph.roles.model_dump(mode="json"),
+            "supervisor": settings.graph.supervisor.model_dump(mode="json"),
+            "max_parallel_lanes": settings.graph.max_parallel_lanes,
             "database_path": str(settings.database_path),
             "database": store.counts(),
             "orca_command": list(settings.orca_command),
+            "codex_command": list(settings.codex_command),
             "orca_reachable": status.get("ok") is True,
         }
 
@@ -66,10 +72,10 @@ def doctor(
 def snapshot(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Read the current Orca worktree snapshot without mutation."""
+    """Read current Orca worktree state without mutation."""
 
     async def read() -> BaseModel:
-        _, _, orca = _components(require_model=False)
+        _, _, orca = _components()
         return await orca.snapshot()
 
     _run(read(), json_output=json_output)
@@ -80,45 +86,94 @@ def plan(
     objective: Annotated[str, typer.Option("--objective", "-o", help="Work to coordinate.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Generate and validate a typed plan without persisting or executing it."""
+    """Use authenticated Codex to generate and record a typed proposal."""
 
     async def create() -> BaseModel:
-        supervisor = _supervisor()
-        _, proposal = await supervisor.plan(objective)
-        if not isinstance(proposal, BaseModel):
-            raise TypeError("planner returned an invalid plan")
-        return proposal
+        proposal = await _planner().plan(objective)
+        return _controller().propose(proposal)
 
     _run(create(), json_output=json_output)
 
 
-@app.command(name="run")
-def run_cycle(
-    objective: Annotated[str, typer.Option("--objective", "-o", help="Work to coordinate.")],
-    execute: Annotated[
-        bool,
-        typer.Option("--execute", help="Create the selected Orca lane. Default is dry-run."),
-    ] = False,
+@app.command()
+def propose(
+    file: Annotated[Path, typer.Option("--file", "-f", help="Graph proposal YAML file.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Record one plan and optionally perform its one selected Orca mutation."""
+    """Validate and record a proposal without creating Orca state."""
 
-    _run(_supervisor().run_cycle(objective, execute=execute), json_output=json_output)
+    try:
+        proposal = _load_proposal(file)
+        receipt = _controller().propose(proposal)
+    except (ConfigError, OSError, yaml.YAMLError, ValidationError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(receipt, json_output=json_output)
 
 
 @app.command()
-def reconcile(
+def accept(
+    run_id: Annotated[str, typer.Argument(help="Recorded proposal run ID.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Reconcile persisted lanes against current Orca state."""
+    """Accept a proposal, create its Orca Task DAGs, and start the first wave."""
 
-    _run(_supervisor().reconcile(), json_output=json_output)
+    _run(_controller().accept(run_id), json_output=json_output)
 
 
-def _components(*, require_model: bool) -> tuple[Settings, StateStore, OrcaClient]:
+@app.command()
+def monitor(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", help="Continue until the graph reaches a terminal state."),
+    ] = False,
+    interval: Annotated[
+        float,
+        typer.Option("--interval", min=0.25, help="Seconds between Orca reconciliations."),
+    ] = 5.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Advance ready stages and reconcile the graph against Orca Tasks."""
+
+    async def advance() -> BaseModel:
+        controller = _controller()
+        while True:
+            result = await controller.monitor(run_id)
+            if not watch or result.status in {"complete", "failed", "blocked"}:
+                return result
+            await asyncio.sleep(interval)
+
+    _run(advance(), json_output=json_output)
+
+
+@app.command(name="show")
+def show_graph(
+    run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Show local proposal and graph correlations without touching Orca."""
+
+    try:
+        _, store, _ = _components()
+        payload = {
+            "run": store.run(run_id).model_dump(mode="json"),
+            "lanes": [lane.model_dump(mode="json") for lane in store.lanes(run_id)],
+            "stages": [stage.model_dump(mode="json") for stage in store.stages(run_id)],
+        }
+    except (ConfigError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(payload, json_output=json_output)
+
+
+def _load_proposal(path: Path) -> SupervisorPlan:
+    raw = yaml.safe_load(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"Graph proposal must be a YAML mapping: {path}")
+    return SupervisorPlan.model_validate(raw)
+
+
+def _components() -> tuple[Settings, StateStore, OrcaClient]:
     settings = Settings.from_env()
-    if require_model:
-        settings.require_model()
     store = StateStore(settings.database_path)
     store.setup()
     runner = SubprocessRunner(
@@ -129,20 +184,26 @@ def _components(*, require_model: bool) -> tuple[Settings, StateStore, OrcaClien
     return settings, store, OrcaClient(runner)
 
 
-def _supervisor() -> Supervisor:
-    settings, store, orca = _components(require_model=True)
-    model = settings.require_model()
-    planner = PydanticPlanner(
-        model,
-        PlannerDeps(orca=orca, max_parallel_lanes=settings.max_parallel_lanes),
+def _controller() -> ExecutionController:
+    settings, store, orca = _components()
+    return ExecutionController(config=settings.graph, orca=orca, store=store)
+
+
+def _planner() -> CodexCliPlanner:
+    settings = Settings.from_env()
+    runner = SubprocessCodexRunner(
+        command=settings.codex_command,
+        cwd=Path.cwd(),
+        profile=settings.graph.supervisor,
+        timeout_seconds=settings.planner_timeout_seconds,
     )
-    return Supervisor(planner=planner, orca=orca, store=store)
+    return CodexCliPlanner(runner)
 
 
 def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
     try:
         result = asyncio.run(awaitable)
-    except (ConfigError, OrcaError, PlanRejected, TypeError, ValueError, KeyError) as exc:
+    except (ConfigError, OrcaError, PlannerError, KeyError, TypeError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(result, json_output=json_output)
 
@@ -154,10 +215,7 @@ def _emit(value: object, *, json_output: bool) -> None:
         payload = [item.model_dump(mode="json", by_alias=True) for item in value]
     else:
         payload = value
-    if json_output:
-        typer.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
-    else:
-        typer.echo(json.dumps(payload, indent=2, default=str))
+    typer.echo(json.dumps(payload, indent=2, sort_keys=json_output, default=str))
 
 
 def _fail(message: str, *, json_output: bool) -> Never:

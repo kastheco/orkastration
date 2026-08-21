@@ -1,4 +1,4 @@
-"""Orca adapter contract tests."""
+"""Orca JSON adapter contract tests."""
 
 import asyncio
 from collections.abc import Sequence
@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from kasgraph.models import LaneProposal
+from kasgraph.config import AgentProfile
 from kasgraph.orca import JsonObject, OrcaClient, OrcaError, SubprocessRunner
 
 
@@ -21,108 +21,153 @@ class FakeRunner:
         return self.responses.pop(0)
 
 
-def worktree_response(*, name: str = "main", worktree_id: str = "repo::/tmp/main") -> JsonObject:
+def profile() -> AgentProfile:
+    return AgentProfile(agent="codex", model="gpt-test", strength="high")
+
+
+def worktree_response() -> JsonObject:
     return {
         "ok": True,
         "result": {
             "worktrees": [
                 {
-                    "worktreeId": worktree_id,
+                    "worktreeId": "repo::/tmp/main",
                     "repoId": "repo",
                     "repo": "example",
                     "path": "/tmp/main",
-                    "displayName": name,
+                    "displayName": "main",
                     "workspaceStatus": "in-progress",
                     "status": "working",
-                    "liveTerminalCount": 1,
                 }
             ]
         },
     }
 
 
-async def test_snapshot_parses_stable_worktree_fields() -> None:
-    client = OrcaClient(FakeRunner([worktree_response()]))
-
-    snapshot = await client.snapshot()
-
+async def test_snapshot_parses_stable_fields() -> None:
+    snapshot = await OrcaClient(FakeRunner([worktree_response()])).snapshot()
     assert snapshot.worktrees[0].worktree_id == "repo::/tmp/main"
-    assert snapshot.active_count == 1
 
 
-async def test_create_lane_reuses_existing_name() -> None:
-    runner = FakeRunner([worktree_response(name="issue-123")])
-    client = OrcaClient(runner)
-    lane = LaneProposal(
-        name="issue-123",
-        issue_id="ISSUE-123",
-        repo_selector="id:repo",
-        role="implementer",
-        prompt="Implement the issue.",
-        stop_condition="Tests pass.",
-    )
-
-    worktree_id, payload = await client.create_lane(lane)
-
-    assert worktree_id == "repo::/tmp/main"
-    assert payload["reused"] is True
-    assert runner.calls == [("worktree", "ps", "--json")]
-
-
-async def test_non_success_response_is_rejected() -> None:
-    client = OrcaClient(FakeRunner([{"ok": False}]))
-    with pytest.raises(OrcaError, match="non-success"):
-        await client.status()
-
-
-async def test_create_lane_uses_fixed_orca_arguments() -> None:
+async def test_create_run_and_task_parse_nested_ids() -> None:
     runner = FakeRunner(
         [
-            {"ok": True, "result": {"worktrees": []}},
-            {"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}},
+            {"id": "request-1", "ok": True, "result": {"run": {"id": "run-1"}}},
+            {"id": "request-2", "ok": True, "result": {"taskId": "task-1"}},
         ]
     )
     client = OrcaClient(runner)
-    lane = LaneProposal(
-        name="issue-123",
-        issue_id="ISSUE-123",
-        repo_selector="id:repo",
-        role="implementer",
-        prompt="Implement the issue.",
-        stop_condition="Tests pass.",
+
+    run_id, _ = await client.create_run("Ship work")
+    task_id, _ = await client.create_task("Implement it", ["task-0"])
+
+    assert run_id == "run-1"
+    assert task_id == "task-1"
+    assert runner.calls[1] == (
+        "orchestration",
+        "task-create",
+        "--spec",
+        "Implement it",
+        "--deps",
+        '["task-0"]',
+        "--json",
     )
 
-    worktree_id, _ = await client.create_lane(lane)
 
-    assert worktree_id == "repo::/tmp/issue-123"
+async def test_tasks_and_release_worker() -> None:
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"tasks": [{"id": "task-1", "status": "ready"}]}},
+            {"ok": True, "result": {}},
+        ]
+    )
+    client = OrcaClient(runner)
+    assert (await client.tasks("run-1"))[0]["id"] == "task-1"
+    await client.release_worker("dispatch-1")
     assert runner.calls[1] == (
-        "worktree",
-        "create",
+        "orchestration",
+        "worker-release",
+        "--dispatch",
+        "dispatch-1",
+        "--json",
+    )
+
+
+async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "dispatchId": "dispatch-1",
+                    "worker": {"worktreeId": "repo::/tmp/issue-123"},
+                },
+            }
+        ]
+    )
+    client = OrcaClient(runner)
+
+    dispatch_id, worktree_id, _ = await client.start_worker(
+        task_id="task-1",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id=None,
+        profile=profile(),
+    )
+
+    assert (dispatch_id, worktree_id) == ("dispatch-1", "repo::/tmp/issue-123")
+    assert runner.calls[0] == (
+        "orchestration",
+        "worker-start",
+        "--task",
+        "task-1",
+        "--worktree",
+        "new-top-level",
         "--repo",
         "id:repo",
         "--name",
         "issue-123",
-        "--no-parent",
+        "--setup",
+        "run",
         "--agent",
         "codex",
-        "--prompt",
-        "Implement the issue.",
+        "--model",
+        "gpt-test",
+        "--effort",
+        "high",
         "--json",
     )
+
+
+async def test_start_worker_reuses_lane_worktree() -> None:
+    runner = FakeRunner([{"ok": True, "result": {"dispatchId": "dispatch-2"}}])
+    client = OrcaClient(runner)
+    _, worktree_id, _ = await client.start_worker(
+        task_id="task-2",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id="repo::/tmp/issue-123",
+        profile=profile(),
+    )
+    assert worktree_id == "repo::/tmp/issue-123"
+    assert "id:repo::/tmp/issue-123" in runner.calls[0]
 
 
 @pytest.mark.parametrize(
     "response",
     [
+        {"ok": False},
         {"ok": True},
-        {"ok": True, "result": {}},
-        {"ok": True, "result": {"worktrees": "not-a-list"}},
-        {"ok": True, "result": {"worktrees": [{}]}},
+        {"ok": True, "result": {"tasks": "bad"}},
     ],
 )
-async def test_snapshot_rejects_invalid_contract(response: JsonObject) -> None:
+async def test_invalid_orca_contracts_are_rejected(response: JsonObject) -> None:
+    client = OrcaClient(FakeRunner([response]))
     with pytest.raises(OrcaError):
-        await OrcaClient(FakeRunner([response])).snapshot()
+        if response.get("ok") is False:
+            await client.status()
+        else:
+            await client.tasks("run-1")
 
 
 class FakeProcess:
@@ -149,7 +194,6 @@ async def test_subprocess_runner_parses_json(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     runner = SubprocessRunner(("orca-ide",), Path("/tmp"), 1)
-
     assert await runner.run(("status", "--json")) == {"ok": True}
 
 
@@ -168,10 +212,8 @@ async def test_subprocess_runner_rejects_bad_results(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
-    runner = SubprocessRunner(("orca-ide",), Path("/tmp"), 1)
-
     with pytest.raises(OrcaError, match=message):
-        await runner.run(("status", "--json"))
+        await SubprocessRunner(("orca-ide",), Path("/tmp"), 1).run(("status", "--json"))
 
 
 async def test_subprocess_runner_kills_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,8 +229,6 @@ async def test_subprocess_runner_kills_timeout(monkeypatch: pytest.MonkeyPatch) 
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
-    runner = SubprocessRunner(("orca-ide",), Path("/tmp"), 0.001)
-
     with pytest.raises(OrcaError, match="timed out"):
-        await runner.run(("status", "--json"))
+        await SubprocessRunner(("orca-ide",), Path("/tmp"), 0.001).run(("status", "--json"))
     assert process.killed is True

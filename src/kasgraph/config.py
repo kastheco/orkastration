@@ -1,4 +1,4 @@
-"""Environment-backed configuration with no implicit dotenv loading."""
+"""YAML execution profiles plus environment-backed process configuration."""
 
 from __future__ import annotations
 
@@ -9,28 +9,66 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 
 class ConfigError(ValueError):
     """Raised when required runtime configuration is invalid."""
+
+
+class AgentProfile(BaseModel):
+    """One Orca worker launch profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str = Field(default="codex", pattern=r"^[a-z][a-z0-9-]*$")
+    model: str = Field(min_length=1, max_length=200)
+    strength: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+
+
+class RoleProfiles(BaseModel):
+    """The four fixed execution roles in every lane graph."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker: AgentProfile
+    initial_reviewer: AgentProfile
+    fixer: AgentProfile
+    re_reviewer: AgentProfile
+
+
+class GraphConfig(BaseModel):
+    """Declarative execution-graph configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(default=1, ge=1, le=1)
+    max_parallel_lanes: int = Field(default=2, ge=1, le=32)
+    supervisor: AgentProfile
+    roles: RoleProfiles
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Runtime settings for one supervisor process."""
 
-    model: str | None
+    config_path: Path
+    graph: GraphConfig
     database_path: Path
+    codex_command: tuple[str, ...]
     orca_command: tuple[str, ...]
-    max_parallel_lanes: int
     command_timeout_seconds: float
+    planner_timeout_seconds: float
 
     @classmethod
     def from_env(cls) -> Settings:
         """Build settings from explicit environment variables."""
 
-        max_parallel = _positive_int("KASGRAPH_MAX_PARALLEL_LANES", default=2)
         timeout = _positive_float("KASGRAPH_COMMAND_TIMEOUT_SECONDS", default=30.0)
-        raw_model = os.environ.get("KASGRAPH_MODEL", "").strip()
+        planner_timeout = _positive_float("KASGRAPH_PLANNER_TIMEOUT_SECONDS", default=300.0)
+        config_path = Path(os.environ.get("KASGRAPH_CONFIG", "kasgraph.yaml")).expanduser()
+        graph = load_graph_config(config_path)
         database_path = Path(
             os.environ.get(
                 "KASGRAPH_DB_PATH",
@@ -38,19 +76,31 @@ class Settings:
             )
         ).expanduser()
         return cls(
-            model=raw_model or None,
+            config_path=config_path,
+            graph=graph,
             database_path=database_path,
+            codex_command=_command("KASGRAPH_CODEX_COMMAND", default=("codex",)),
             orca_command=_orca_command(),
-            max_parallel_lanes=max_parallel,
             command_timeout_seconds=timeout,
+            planner_timeout_seconds=planner_timeout,
         )
 
-    def require_model(self) -> str:
-        """Return the configured model or raise an actionable error."""
 
-        if self.model is None:
-            raise ConfigError("KASGRAPH_MODEL is required for plan and run commands")
-        return self.model
+def load_graph_config(path: Path) -> GraphConfig:
+    """Load and validate the explicit YAML execution configuration."""
+
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Kasgraph config does not exist: {path}") from exc
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f"Could not read Kasgraph config {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(f"Kasgraph config must be a YAML mapping: {path}")
+    try:
+        return GraphConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid Kasgraph config {path}: {exc}") from exc
 
 
 def _orca_command() -> tuple[str, ...]:
@@ -65,15 +115,14 @@ def _orca_command() -> tuple[str, ...]:
     return ("orca",)
 
 
-def _positive_int(name: str, *, default: int) -> int:
-    raw = os.environ.get(name)
-    try:
-        value = default if raw is None else int(raw)
-    except ValueError as exc:
-        raise ConfigError(f"{name} must be an integer") from exc
-    if value < 1:
-        raise ConfigError(f"{name} must be at least 1")
-    return value
+def _command(name: str, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    explicit = os.environ.get(name, "").strip()
+    if not explicit:
+        return default
+    command = tuple(shlex.split(explicit))
+    if not command:
+        raise ConfigError(f"{name} did not contain an executable")
+    return command
 
 
 def _positive_float(name: str, *, default: float) -> float:

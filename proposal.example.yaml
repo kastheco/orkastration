@@ -1,0 +1,30 @@
+objective: Deliver the currently unblocked work for the assistant project.
+rationale: >-
+  These issues have no incomplete blockers and touch separate implementation
+  surfaces, so they can run in parallel without sharing a branch.
+next_action: propose_lanes
+owner_question: null
+
+lanes:
+  - name: kas-501-search-filters
+    issue_id: KAS-501
+    repo_selector: path:/home/kas/dev/kashh
+    dependencies:
+      - KAS-492
+    prompt: >-
+      Implement the accepted search-filter contract from KAS-501 using the
+      authoritative Linear issue and linked Notion design context.
+    stop_condition: >-
+      Focused and full relevant checks pass, the exact-head change is committed,
+      and the lane is ready for independent review.
+
+  - name: kas-502-activity-copy
+    issue_id: KAS-502
+    repo_selector: path:/home/kas/dev/kashh
+    dependencies: []
+    prompt: >-
+      Implement the accepted activity-copy update from KAS-502 without changing
+      the existing activity state model.
+    stop_condition: >-
+      Focused UI checks pass, the exact-head change is committed, and the lane is
+      ready for independent review.

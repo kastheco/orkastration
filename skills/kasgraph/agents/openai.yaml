@@ -1,0 +1,6 @@
+interface:
+  display_name: "Kasgraph"
+  short_description: "Propose and monitor supervised Orca lanes"
+  default_prompt: "Use $kasgraph to propose the currently unblocked lanes and stop for my acceptance."
+policy:
+  allow_implicit_invocation: false
