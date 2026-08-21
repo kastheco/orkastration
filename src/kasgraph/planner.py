@@ -25,8 +25,8 @@ class PlannerRunner(Protocol):
     async def run(self, prompt: str, schema: dict[str, object]) -> str: ...
 
 
-class CodexCliPlanner:
-    """Validate subscription-backed `codex exec` output as a SupervisorPlan."""
+class SchemaCliPlanner:
+    """Validate schema-constrained CLI output as a SupervisorPlan."""
 
     def __init__(self, runner: PlannerRunner):
         self._runner = runner
@@ -49,7 +49,17 @@ class CodexCliPlanner:
         try:
             return SupervisorPlan.model_validate_json(raw)
         except ValidationError as exc:
-            raise PlannerError("Codex returned JSON that failed SupervisorPlan validation") from exc
+            raise PlannerError(
+                "Planner CLI returned JSON that failed SupervisorPlan validation"
+            ) from exc
+
+
+class CodexCliPlanner(SchemaCliPlanner):
+    """Plan through subscription-authenticated `codex exec`."""
+
+
+class ClaudeCliPlanner(SchemaCliPlanner):
+    """Plan through subscription-authenticated `claude -p`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,3 +126,66 @@ class SubprocessCodexRunner:
                     "codex exec did not write the structured final message"
                     + (f": {stdout_detail}" if stdout_detail else "")
                 ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class SubprocessClaudeRunner:
+    """Run Claude Code in non-interactive, schema-constrained plan mode."""
+
+    command: tuple[str, ...]
+    cwd: Path
+    profile: AgentProfile
+    timeout_seconds: float
+
+    async def run(self, prompt: str, schema: dict[str, object]) -> str:
+        """Invoke one non-persistent `claude -p` turn and return structured JSON."""
+
+        if self.profile.agent != "claude":
+            raise PlannerError("the Claude supervisor profile agent must be claude")
+        process = await asyncio.create_subprocess_exec(
+            *self.command,
+            "-p",
+            "--model",
+            self.profile.model,
+            "--effort",
+            self.profile.strength,
+            "--permission-mode",
+            "plan",
+            "--no-session-persistence",
+            "--output-format",
+            "json",
+            "--json-schema",
+            json.dumps(schema, sort_keys=True, separators=(",", ":")),
+            cwd=self.cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(prompt.encode()), timeout=self.timeout_seconds
+            )
+        except TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise PlannerError(
+                f"Claude planning timed out after {self.timeout_seconds:g}s"
+            ) from exc
+        if process.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()[-4_000:]
+            raise PlannerError(
+                f"claude -p failed with rc={process.returncode}: {detail or 'no stderr'}"
+            )
+        try:
+            envelope = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise PlannerError("claude -p returned invalid JSON") from exc
+        if not isinstance(envelope, dict):
+            raise PlannerError("claude -p returned a non-object JSON envelope")
+        structured = envelope.get("structured_output")
+        if isinstance(structured, dict):
+            return json.dumps(structured, separators=(",", ":"))
+        result = envelope.get("result")
+        if isinstance(result, str):
+            return result
+        raise PlannerError("claude -p response omitted structured_output")

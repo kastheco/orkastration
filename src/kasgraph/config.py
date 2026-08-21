@@ -56,6 +56,7 @@ class Settings:
     config_path: Path
     graph: GraphConfig
     database_path: Path
+    claude_command: tuple[str, ...]
     codex_command: tuple[str, ...]
     orca_command: tuple[str, ...]
     command_timeout_seconds: float
@@ -79,6 +80,7 @@ class Settings:
             config_path=config_path,
             graph=graph,
             database_path=database_path,
+            claude_command=_command("KASGRAPH_CLAUDE_COMMAND", default=("claude",)),
             codex_command=_command("KASGRAPH_CODEX_COMMAND", default=("codex",)),
             orca_command=_orca_command(),
             command_timeout_seconds=timeout,

@@ -17,7 +17,14 @@ from kasgraph.config import ConfigError, Settings
 from kasgraph.execution import ExecutionController
 from kasgraph.models import SupervisorPlan
 from kasgraph.orca import OrcaClient, OrcaError, SubprocessRunner
-from kasgraph.planner import CodexCliPlanner, PlannerError, SubprocessCodexRunner
+from kasgraph.planner import (
+    ClaudeCliPlanner,
+    CodexCliPlanner,
+    PlannerError,
+    SchemaCliPlanner,
+    SubprocessClaudeRunner,
+    SubprocessCodexRunner,
+)
 from kasgraph.store import StateStore
 
 app = typer.Typer(
@@ -61,6 +68,7 @@ def doctor(
             "database_path": str(settings.database_path),
             "database": store.counts(),
             "orca_command": list(settings.orca_command),
+            "claude_command": list(settings.claude_command),
             "codex_command": list(settings.codex_command),
             "orca_reachable": status.get("ok") is True,
         }
@@ -189,15 +197,26 @@ def _controller() -> ExecutionController:
     return ExecutionController(config=settings.graph, orca=orca, store=store)
 
 
-def _planner() -> CodexCliPlanner:
+def _planner() -> SchemaCliPlanner:
     settings = Settings.from_env()
-    runner = SubprocessCodexRunner(
-        command=settings.codex_command,
-        cwd=Path.cwd(),
-        profile=settings.graph.supervisor,
-        timeout_seconds=settings.planner_timeout_seconds,
-    )
-    return CodexCliPlanner(runner)
+    profile = settings.graph.supervisor
+    if profile.agent == "codex":
+        runner = SubprocessCodexRunner(
+            command=settings.codex_command,
+            cwd=Path.cwd(),
+            profile=profile,
+            timeout_seconds=settings.planner_timeout_seconds,
+        )
+        return CodexCliPlanner(runner)
+    if profile.agent == "claude":
+        claude_runner = SubprocessClaudeRunner(
+            command=settings.claude_command,
+            cwd=Path.cwd(),
+            profile=profile,
+            timeout_seconds=settings.planner_timeout_seconds,
+        )
+        return ClaudeCliPlanner(claude_runner)
+    raise ConfigError(f"unsupported supervisor agent: {profile.agent}")
 
 
 def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:

@@ -1,0 +1,29 @@
+version: 1
+max_parallel_lanes: 3
+
+supervisor:
+  agent: claude
+  model: sonnet
+  strength: high
+
+roles:
+  worker:
+    agent: claude
+    model: sonnet
+    strength: high
+
+  initial_reviewer:
+    agent: claude
+    model: sonnet
+    strength: high
+
+  fixer:
+    agent: claude
+    model: sonnet
+    strength: high
+
+  re_reviewer:
+    agent: claude
+    model: sonnet
+    strength: high
+

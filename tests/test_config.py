@@ -28,6 +28,7 @@ def test_settings_load_yaml_and_explicit_orca_command(
     config_path = tmp_path / "graph.yaml"
     write_config(config_path)
     monkeypatch.setenv("KASGRAPH_CONFIG", str(config_path))
+    monkeypatch.setenv("KASGRAPH_CLAUDE_COMMAND", "claude-dev --profile planner")
     monkeypatch.setenv("ORCA_CLI_COMMAND", "orca-dev --profile test")
     monkeypatch.setenv("KASGRAPH_CODEX_COMMAND", "codex-dev --profile planner")
     monkeypatch.setenv("KASGRAPH_DB_PATH", str(tmp_path / "state.sqlite3"))
@@ -35,6 +36,7 @@ def test_settings_load_yaml_and_explicit_orca_command(
     settings = Settings.from_env()
 
     assert settings.orca_command == ("orca-dev", "--profile", "test")
+    assert settings.claude_command == ("claude-dev", "--profile", "planner")
     assert settings.codex_command == ("codex-dev", "--profile", "planner")
     assert settings.graph.supervisor.model == "gpt-supervisor"
     assert settings.graph.roles.worker.model == "gpt-test"

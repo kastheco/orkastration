@@ -8,7 +8,13 @@ from typing import Any
 import pytest
 
 from kasgraph.config import AgentProfile
-from kasgraph.planner import CodexCliPlanner, PlannerError, SubprocessCodexRunner
+from kasgraph.planner import (
+    ClaudeCliPlanner,
+    CodexCliPlanner,
+    PlannerError,
+    SubprocessClaudeRunner,
+    SubprocessCodexRunner,
+)
 
 
 def plan_json() -> str:
@@ -152,3 +158,88 @@ async def test_subprocess_runner_kills_timeout(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(PlannerError, match="timed out"):
         await subprocess_runner(timeout=0.001).run("Plan", {})
     assert process is not None and process.killed is True
+
+
+def claude_runner(*, agent: str = "claude", timeout: float = 1) -> SubprocessClaudeRunner:
+    return SubprocessClaudeRunner(
+        command=("claude",),
+        cwd=Path("/repo"),
+        profile=AgentProfile(agent=agent, model="sonnet", strength="high"),
+        timeout_seconds=timeout,
+    )
+
+
+class FakeClaudeProcess:
+    def __init__(self, *, stdout: bytes, stderr: bytes = b"", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.prompt = b""
+        self.killed = False
+
+    async def communicate(self, prompt: bytes | None = None) -> tuple[bytes, bytes]:
+        self.prompt = prompt or b""
+        return self.stdout, self.stderr
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+async def test_claude_runner_uses_print_plan_mode_and_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = json.dumps({"type": "result", "structured_output": json.loads(plan_json())})
+    process = FakeClaudeProcess(stdout=envelope.encode())
+    observed: tuple[str, ...] = ()
+
+    async def create(*arguments: str, **kwargs: Any) -> FakeClaudeProcess:
+        nonlocal observed
+        observed = arguments
+        assert kwargs["cwd"] == Path("/repo")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    output = await claude_runner().run("Plan this", {"type": "object"})
+    plan = await ClaudeCliPlanner(FakeRunner(output)).plan("Ship work")
+
+    assert plan.next_action == "propose_lanes"
+    assert observed[:4] == ("claude", "-p", "--model", "sonnet")
+    assert "--permission-mode" in observed
+    assert "--no-session-persistence" in observed
+    assert "--json-schema" in observed
+    assert process.prompt == b"Plan this"
+
+
+async def test_claude_runner_accepts_result_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeClaudeProcess(stdout=json.dumps({"result": plan_json()}).encode())
+
+    async def create(*arguments: str, **kwargs: Any) -> FakeClaudeProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    assert json.loads(await claude_runner().run("Plan", {}))["next_action"] == "propose_lanes"
+
+
+@pytest.mark.parametrize(
+    ("process", "message"),
+    [
+        (FakeClaudeProcess(stdout=b"nope"), "invalid JSON"),
+        (FakeClaudeProcess(stdout=b"[]"), "non-object"),
+        (FakeClaudeProcess(stdout=b"{}"), "omitted structured_output"),
+        (FakeClaudeProcess(stdout=b"", stderr=b"bad", returncode=2), "rc=2: bad"),
+    ],
+)
+async def test_claude_runner_rejects_bad_results(
+    monkeypatch: pytest.MonkeyPatch, process: FakeClaudeProcess, message: str
+) -> None:
+    async def create(*arguments: str, **kwargs: Any) -> FakeClaudeProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    with pytest.raises(PlannerError, match=message):
+        await claude_runner().run("Plan", {})
+
+
+async def test_claude_runner_rejects_wrong_agent() -> None:
+    with pytest.raises(PlannerError, match="must be claude"):
+        await claude_runner(agent="codex").run("Plan", {})

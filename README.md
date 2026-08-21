@@ -4,16 +4,16 @@ Kasgraph is a small execution-graph controller for supervised Orca workers.
 
 The supervisor is the interactive agent you talk to. It can use its installed
 Linear and Notion connectors directly, or invoke Kasgraph's subscription-backed
-`codex exec` planner, to discover work, resolve dependencies, and propose
-parallel lanes. Kasgraph creates Orca Tasks only after explicit acceptance and
-monitors each accepted lane through a fixed review loop.
+`codex exec` or `claude -p` planner, to discover work, resolve dependencies, and
+propose parallel lanes. Kasgraph creates Orca Tasks only after explicit
+acceptance and monitors each accepted lane through a fixed review loop.
 
 ```text
 interactive supervisor (Linear + Notion)
               |
               | optional typed planning turn
               v
-  codex exec --ephemeral --sandbox read-only
+  codex exec (read-only) or claude -p (plan mode)
               |
               | reviewed proposal
               v
@@ -27,12 +27,12 @@ interactive supervisor (Linear + Notion)
                          Orca Tasks/Dispatches
 ```
 
-Kasgraph does not call the OpenAI API and does not own API credentials. Its
-planner invokes the installed Codex CLI, which reuses saved ChatGPT
-authentication, supplies `SupervisorPlan.model_json_schema()` via
-`--output-schema`, and validates the final JSON with Pydantic. It is one
-ephemeral subprocess per planning cycle. Orca remains the only execution and
-lifecycle authority. SQLite stores proposal and correlation state.
+Kasgraph does not call model APIs directly and does not own API credentials. Its
+planner invokes either the installed Codex CLI or Claude Code CLI using their
+saved authentication, supplies `SupervisorPlan.model_json_schema()`, and
+validates the final JSON with Pydantic. It is one non-persistent subprocess per
+planning cycle. Orca remains the only execution and lifecycle authority. SQLite
+stores proposal and correlation state.
 
 ## Configuration
 
@@ -69,10 +69,19 @@ roles:
 
 The execution-role values map directly to Orca's supervised worker launch
 flags: `--agent`, `--model`, and `--effort`. The top-level `supervisor` profile
-maps to `codex exec --model` and `model_reasoning_effort`. Set
-`KASGRAPH_CONFIG` to use a different YAML file. The surrounding interactive
+selects the planner backend. `agent: codex` maps to `codex exec --model` and
+`model_reasoning_effort`; `agent: claude` maps to `claude -p --model --effort`.
+Set `KASGRAPH_CONFIG` to use a different YAML file. The surrounding interactive
 session still controls the model you are talking to; this supervisor profile
 controls only Kasgraph's optional typed planning subprocess.
+
+An all-Claude example is provided in
+[`kasgraph.claude.yaml`](kasgraph.claude.yaml):
+
+```bash
+KASGRAPH_CONFIG=kasgraph.claude.yaml uv run kasgraph plan \
+  --objective "find the currently unblocked lanes" --json
+```
 
 ## Setup
 
@@ -80,6 +89,7 @@ controls only Kasgraph's optional typed planning subprocess.
 uv sync --extra dev
 export KASGRAPH_CONFIG=kasgraph.yaml
 codex login status
+claude --version
 ```
 
 Inside an Orca-managed terminal, `orca` is resolved automatically. On Linux
@@ -104,10 +114,11 @@ proposal, stop at the owner decision, and monitor accepted Orca graphs.
    uv run kasgraph plan --objective "find the unblocked assistant lanes" --json
    ```
 
-   The planner runs read-only and does not mutate connector data, git, files, or
-   Orca. If the interactive supervisor already assembled the plan, create a
-   proposal shaped like [`proposal.example.yaml`](proposal.example.yaml) and
-   record it directly:
+   The Codex planner runs in a read-only sandbox. The Claude planner runs with
+   `--permission-mode plan`. Neither planner may mutate connector data, git,
+   files, or Orca. If the interactive supervisor already assembled the plan,
+   create a proposal shaped like [`proposal.example.yaml`](proposal.example.yaml)
+   and record it directly:
 
    ```bash
    uv run kasgraph propose --file proposal.yaml --json
@@ -156,6 +167,6 @@ uv run kasgraph-eval
 ```
 
 `pydantic-evals` remains a dependency for deterministic and later model-backed
-planner evaluations. App-server is intentionally deferred until persistent
-threads, turn steering, streaming events, or approval handling justify its
-larger protocol surface.
+planner evaluations. Persistent Codex app-server or Claude sessions are
+intentionally deferred until thread steering, streaming events, or approval
+handling justify their larger protocol surfaces.

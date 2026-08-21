@@ -15,6 +15,7 @@ from kasgraph import __version__, cli
 from kasgraph.config import GraphConfig
 from kasgraph.models import OrcaSnapshot, ProposalReceipt, SupervisorPlan
 from kasgraph.orca import OrcaError
+from kasgraph.planner import ClaudeCliPlanner, CodexCliPlanner
 from kasgraph.store import StateStore
 
 runner = CliRunner()
@@ -99,6 +100,7 @@ def fake_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         config_path=tmp_path / "kasgraph.yaml",
         graph=graph_config(),
         database_path=tmp_path / "state.sqlite3",
+        claude_command=("claude",),
         orca_command=("orca-ide",),
         codex_command=("codex",),
     )
@@ -196,7 +198,10 @@ roles:
     monkeypatch.setenv("KASGRAPH_DB_PATH", str(tmp_path / "state.sqlite3"))
     monkeypatch.setenv("ORCA_CLI_COMMAND", "orca-ide")
     assert cli._controller() is not None
-    assert cli._planner() is not None
+    assert isinstance(cli._planner(), CodexCliPlanner)
+
+    config_path.write_text(config_path.read_text().replace("agent: codex", "agent: claude", 1))
+    assert isinstance(cli._planner(), ClaudeCliPlanner)
 
 
 def test_plan_rejects_non_model_result(monkeypatch: pytest.MonkeyPatch) -> None:
