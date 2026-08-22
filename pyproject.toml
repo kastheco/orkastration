@@ -52,4 +52,4 @@ files = ["src", "evals", "tests"]
 
 [tool.pyright]
 reportUnusedVariable = "none"
-reportUnusedImport = "none"
+reportUnusedCallResult = "none"
