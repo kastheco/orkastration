@@ -220,6 +220,43 @@ def test_rejections_are_grouped_by_cause_not_by_message():
     assert report.rejection_rate == 1.0
 
 
+def test_rejections_separate_the_supervisor_own_faults_from_the_agent_ones():
+    """Every reason shares one prefix, so matching it first hides eight causes."""
+
+    reasons = [
+        "invalid structured result: escalations contract changed after persistence",
+        "invalid structured result: re-review result changed after persistence",
+        "invalid structured result: fixer result is not pinned to its assigned base and exact head",
+        "invalid structured result: fix attempt does not match its persisted finding and round",
+        "invalid structured result: initial review revision does not match the worker changeset",
+        "invalid structured result: 1 validation error for FixAttempt\ncommit_sha\n  "
+        "String should match pattern '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'",
+        "invalid structured result: nothing recognisable at all",
+    ]
+    events = [{"kind": "stage_started", "payload": {}} for _ in reasons]
+    events += [
+        {"kind": "stage_result_rejected", "payload": {"reason": reason, "stage_id": f"s{index}"}}
+        for index, reason in enumerate(reasons)
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=[],
+        findings=[],
+        integrations=[],
+        publications=[],
+        events=events,
+    )
+
+    assert report.rejection_reasons == {
+        "identity_mismatch": 3,
+        "supervisor_contract_race": 2,
+        "unresolved_sha": 1,
+        "malformed_result": 1,
+    }
+
+
 def test_late_stages_are_grouped_by_behaviour_not_by_the_ratio_that_proves_it():
     """A poll loop's ratio moves every observation; the histogram must not."""
 

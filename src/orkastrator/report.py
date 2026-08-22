@@ -260,15 +260,35 @@ def _rejection_class(reason: str) -> str:
 
     Rejection reasons embed identifiers and counts, so counting the raw strings
     produces a histogram with one entry per event and tells nobody anything.
+
+    The order is deliberate and the labels answer one question: whose fault is
+    the discarded dispatch. Every reason is prefixed `invalid structured result`,
+    so matching that first collapses the whole histogram into one bar - which is
+    exactly what it used to do, reporting 17 `malformed_result` for eight
+    distinct causes with three different owners. The specific markers come first
+    and the prefix is the last resort it was always meant to be.
     """
 
     lowered = reason.lower()
     for marker, label in (
-        ("does not match", "stale_changeset"),
-        ("invalid structured result", "malformed_result"),
+        # Ours: the contract handed out no longer matches the store by the time
+        # the result comes back. No agent could have avoided this one.
+        ("changed after persistence", "supervisor_contract_race"),
+        # Ours, differently: we asked the agent to restate an identity we
+        # assigned, then discarded the stage over the copy.
+        ("not pinned to", "identity_mismatch"),
+        ("does not match its persisted", "identity_mismatch"),
+        ("does not match the worker changeset", "identity_mismatch"),
+        # A sha or digest the agent abbreviated or truncated. Deterministically
+        # resolvable, so it is worth separating from a real schema violation.
+        ("[0-9a-f]{40}", "unresolved_sha"),
+        ("[0-9a-f]{64}", "unresolved_sha"),
         ("outside", "scope_escape"),
         ("not a descendant", "stale_base"),
         ("empty", "empty_result"),
+        ("does not match", "stale_changeset"),
+        ("validation error", "schema_violation"),
+        ("invalid structured result", "malformed_result"),
     ):
         if marker in lowered:
             return label

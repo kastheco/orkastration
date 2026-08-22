@@ -355,6 +355,11 @@ stages past soft budget  1   (0 released for exceeding a hard budget)
 overdue stages were doing
     3  exec poll loop
     1  unknown
+
+start rejections
+   11  supervisor_contract_race
+    7  identity_mismatch
+    2  unresolved_sha
 ```
 
 Both leading numbers should fall as the graph gets stricter about what it dispatches. Run `report`
@@ -368,8 +373,20 @@ waiting on a subprocess by burning an inference every thirty seconds - and it is
 there that names waste rather than slowness. `unknown` is a stage that could not be read, which is
 deliberately not folded into a tool bucket.
 
-Escalations are grouped by reason and start rejections by cause rather than by wording, so a class
-that recurs is visible as a count instead of as twenty near-identical strings. They are also
+A rejected start is the most expensive thing that can happen: a whole dispatch billed for input,
+output and wall clock, and nothing kept. So the buckets are named for who could have prevented it.
+`supervisor_contract_race` is the contract we handed out no longer matching the store by the time
+the result came back, and no agent could have avoided it. `identity_mismatch` is a base, head,
+finding or round we assigned and then asked the agent to type back. `unresolved_sha` is an
+abbreviated or truncated digest, which `git rev-parse` resolves without asking anyone. Only
+`schema_violation` and `scope_escape` are the agent's.
+
+The classifier is ordered specific-first on purpose. Every reason begins `invalid structured
+result`, so matching that prefix early collapses the histogram into a single bar - which is what it
+used to do, reporting 17 `malformed_result` for eight distinct causes with three different owners.
+
+Escalations are grouped by reason the same way, so a class that recurs is visible as a count instead
+of as twenty near-identical strings. They are also
 attributed per lane, because a run-wide total cannot say whether one lane's reviewer is writing
 findings the downstream roles cannot act on - which decides whether to fix the reviewer or the
 adjudicator. A single finding
