@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from orkastrator.models import ValidationRequirement, ValidationResult
+from orkastrator.runners import condense
 
 
 class GitError(RuntimeError):
@@ -218,8 +219,16 @@ class LocalGit:
                 )
                 break
             stdout, stderr = await process.communicate()
-            output = (stdout + stderr).decode(errors="replace")[-8_000:]
             satisfied = process.returncode == requirement.expect_exit
+            # Condense before the output becomes contract bytes. Everything this
+            # drops would otherwise be handed to an agent and then re-billed on
+            # every turn that agent takes afterwards, and a passing suite's
+            # progress dots say nothing its summary line does not.
+            output = condense(
+                (stdout + stderr).decode(errors="replace"),
+                returncode=process.returncode or 0,
+                satisfied=satisfied,
+            )
             results.append(
                 ValidationResult(
                     command=requirement.command,

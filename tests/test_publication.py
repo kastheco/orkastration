@@ -370,7 +370,14 @@ async def test_a_head_whose_only_reported_check_is_advisory_stays_pending() -> N
         result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
         result(
             json.dumps(
-                [{"name": "conformance (advisory)", "bucket": "pass", "link": "", "description": "ok"}]
+                [
+                    {
+                        "name": "conformance (advisory)",
+                        "bucket": "pass",
+                        "link": "",
+                        "description": "ok",
+                    }
+                ]
             ),
             returncode=8,
         ),
