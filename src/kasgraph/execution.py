@@ -138,6 +138,8 @@ class ExecutionController:
             self._store.mark_accepted(run_id, orca_run_id)
         elif run.status not in {"active", "blocked"}:
             raise ValueError(f"run {run_id} cannot be accepted from status {run.status}")
+        else:
+            self._require_authorization(run_id)
         await self._ensure_tasks(run_id)
         return await self.monitor(run_id)
 
@@ -147,6 +149,7 @@ class ExecutionController:
         run = self._store.run(run_id)
         if run.orca_run_id is None:
             raise ValueError(f"run {run_id} has not been accepted")
+        self._require_authorization(run_id)
         tasks = await self._orca.tasks(run.orca_run_id)
         by_id = {_task_id(task): task for task in tasks}
         lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
@@ -1017,8 +1020,7 @@ class ExecutionController:
     async def _advance_publication(self, run_id: str) -> None:
         """Publish locally settled lanes and gate them on checks for the exact head."""
 
-        if self._store.acceptance_authorization(run_id) is None:
-            return
+        self._require_authorization(run_id)
         for lane in self._store.lanes(run_id):
             if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED}:
                 continue
@@ -1070,6 +1072,25 @@ class ExecutionController:
         return reviewed and all(
             item.phase in {FindingPhase.RESOLVED, FindingPhase.DEFERRED} for item in findings
         )
+
+    def _require_authorization(self, run_id: str) -> AcceptanceAuthorization:
+        """Reject resumed work when its frozen proposal or graph policy changed."""
+
+        run = self._store.run(run_id)
+        expected = AcceptanceAuthorization(
+            run_id=run_id,
+            proposal_sha256=_sha256_json(run.proposal.model_dump(mode="json")),
+            config_sha256=_sha256_json(self._config.model_dump(mode="json")),
+        )
+        authorization = self._store.acceptance_authorization(run_id)
+        if authorization is None:
+            raise ValueError(f"run {run_id} has no frozen acceptance authorization")
+        if authorization != expected:
+            raise ValueError(
+                f"run {run_id} proposal or graph policy changed after acceptance; "
+                "record and accept a new proposal"
+            )
+        return authorization
 
     async def _record_ci_failure(
         self,

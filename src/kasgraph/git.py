@@ -53,7 +53,7 @@ class LocalGit:
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
         """Hash the exact binary-capable diff frozen for review."""
 
-        cwd = _worktree_path(worktree_id)
+        cwd = worktree_path(worktree_id)
         process = await asyncio.create_subprocess_exec(
             "git",
             "diff",
@@ -120,7 +120,7 @@ class LocalGit:
     async def cherry_pick_in_progress_commits(self, worktree_id: str) -> list[str] | None:
         """Return source commits owned by the active Git sequencer, if any."""
 
-        cwd = _worktree_path(worktree_id)
+        cwd = worktree_path(worktree_id)
         commits: list[str] = []
         head = await self._git(
             worktree_id, "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False
@@ -166,7 +166,7 @@ class LocalGit:
     ) -> list[ValidationResult]:
         """Run configured validation commands without a shell."""
 
-        cwd = _worktree_path(worktree_id)
+        cwd = worktree_path(worktree_id)
         results: list[ValidationResult] = []
         for requirement in requirements:
             arguments = shlex.split(requirement.command)
@@ -192,7 +192,7 @@ class LocalGit:
         return results
 
     async def _git(self, worktree_id: str, *arguments: str, check: bool = True) -> GitCommandResult:
-        cwd = _worktree_path(worktree_id)
+        cwd = worktree_path(worktree_id)
         process = await asyncio.create_subprocess_exec(
             "git",
             *arguments,
@@ -212,7 +212,7 @@ class LocalGit:
         return result
 
 
-def _worktree_path(worktree_id: str) -> Path:
+def worktree_path(worktree_id: str) -> Path:
     """Resolve the local path from Orca's stable ``repo::path`` identity."""
 
     _, separator, raw_path = worktree_id.partition("::")

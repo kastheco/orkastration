@@ -433,6 +433,7 @@ class PublicationReceipt(WorkflowContract):
     run_id: str = Field(min_length=1, max_length=128)
     lane: str = Field(min_length=1, max_length=64)
     remote_url: str = Field(min_length=1, max_length=2_048)
+    base_branch: str = Field(min_length=1, max_length=512)
     branch: str = Field(min_length=1, max_length=512)
     pull_request_url: str = Field(min_length=1, max_length=2_048)
     head_sha: GitObjectId

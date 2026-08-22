@@ -7,8 +7,9 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
+from kasgraph.git import GitError, worktree_path
 from kasgraph.models import CiCheckResult, CiReceipt, LaneRecord, PublicationReceipt
 
 
@@ -86,23 +87,29 @@ class GitHubPublisher:
         head_sha: str,
         previous: PublicationReceipt | None,
     ) -> PublicationReceipt:
-        path = _worktree_path(lane)
+        try:
+            path = worktree_path(lane.worktree_id or "")
+        except GitError as exc:
+            raise PublicationError(str(exc)) from exc
         remote_url = await self._required(path, "git", "remote", "get-url", "origin")
         repository = _github_repository(remote_url.strip())
         default_branch = await self._default_branch(path, repository)
         branch = f"kasgraph/{run_id[:12]}/{lane.name}"
         if previous is not None and (
-            previous.branch != branch or previous.remote_url != remote_url.strip()
+            previous.branch != branch
+            or previous.remote_url != remote_url.strip()
+            or previous.base_branch != default_branch
         ):
             raise PublicationError("persisted publication target changed")
         remote_head = await self._remote_head(path, branch)
-        if previous is None and remote_head is not None:
-            raise PublicationError(f"refusing to overwrite existing unowned branch {branch}")
-        if previous is not None and remote_head != previous.head_sha:
+        if previous is None and remote_head is not None and remote_head != head_sha:
+            raise PublicationError(f"existing branch {branch} points to an unrelated revision")
+        if previous is not None and remote_head not in {previous.head_sha, head_sha}:
             raise PublicationError(
                 f"remote branch {branch} diverged from published head {previous.head_sha}"
             )
-        await self._required(path, "git", "push", "origin", f"{head_sha}:refs/heads/{branch}")
+        if remote_head != head_sha:
+            await self._required(path, "git", "push", "origin", f"{head_sha}:refs/heads/{branch}")
 
         pull_requests = await self._gh_json(
             path,
@@ -113,19 +120,29 @@ class GitHubPublisher:
             "--head",
             branch,
             "--state",
-            "open",
+            "all",
             "--json",
-            "url,isDraft",
+            "url,isDraft,state,body",
             "--limit",
-            "1",
+            "10",
         )
         body = _pull_request_body(run_id, lane, head_sha)
         if not isinstance(pull_requests, list):
             raise PublicationError("GitHub returned an invalid pull-request list")
+        if len(pull_requests) > 1:
+            raise PublicationError(f"multiple pull requests exist for lane branch {branch}")
         if pull_requests:
-            pull_request_url = str(pull_requests[0]["url"])
+            pull_request = pull_requests[0]
+            pull_request_url = str(pull_request["url"])
+            marker = f"Kasgraph run: `{run_id}`"
+            if previous is None and marker not in str(pull_request.get("body") or ""):
+                raise PublicationError("existing pull request is not owned by this accepted run")
+            if previous is not None and pull_request_url != previous.pull_request_url:
+                raise PublicationError("pull request identity changed after publication")
+            if str(pull_request.get("state")) != "OPEN":
+                raise PublicationError("the authorized lane pull request is no longer open")
             await self._required(path, *self._gh, "pr", "edit", pull_request_url, "--body", body)
-            draft = bool(pull_requests[0].get("isDraft", True))
+            draft = bool(pull_request.get("isDraft", True))
         else:
             result = await self._required(
                 path,
@@ -150,6 +167,7 @@ class GitHubPublisher:
             run_id=run_id,
             lane=lane.name,
             remote_url=remote_url.strip(),
+            base_branch=default_branch,
             branch=branch,
             pull_request_url=pull_request_url,
             head_sha=head_sha,
@@ -159,17 +177,32 @@ class GitHubPublisher:
     async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
         path = Path.cwd()
         repository = _github_repository(receipt.remote_url)
-        check_data = await self._gh_json(
+        pull_request = await self._gh_json(
             path,
-            "api",
-            f"repos/{repository}/commits/{receipt.head_sha}/check-runs",
-            "--paginate",
-            "--slurp",
+            "pr",
+            "view",
+            receipt.pull_request_url,
+            "--json",
+            "headRefOid,state,isDraft",
         )
-        status_data = await self._gh_json(
-            path, "api", f"repos/{repository}/commits/{receipt.head_sha}/status"
-        )
-        checks = _parse_checks(check_data, status_data, receipt.head_sha)
+        _verify_pull_request(pull_request, receipt)
+        required = await self._required_pr_checks(path, receipt.pull_request_url)
+        if required:
+            checks = required
+        else:
+            check_data = await self._gh_json(
+                path,
+                "api",
+                f"repos/{repository}/commits/{receipt.head_sha}/check-runs",
+                "--paginate",
+                "--slurp",
+            )
+            status_data = await self._gh_json(
+                path, "api", f"repos/{repository}/commits/{receipt.head_sha}/status"
+            )
+            checks = _required_checks(
+                _parse_checks(check_data, status_data, receipt.head_sha), None
+            )
         if any(item.status in {"failed", "cancelled"} for item in checks):
             status = "failed"
         elif any(item.status == "pending" for item in checks):
@@ -181,6 +214,17 @@ class GitHubPublisher:
     async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt:
         if not receipt.draft:
             return receipt
+        state = await self._gh_json(
+            Path.cwd(),
+            "pr",
+            "view",
+            receipt.pull_request_url,
+            "--json",
+            "headRefOid,state,isDraft",
+        )
+        _verify_pull_request(state, receipt)
+        if isinstance(state, dict) and state.get("isDraft") is False:
+            return receipt.model_copy(update={"draft": False})
         await self._required(Path.cwd(), *self._gh, "pr", "ready", receipt.pull_request_url)
         return receipt.model_copy(update={"draft": False})
 
@@ -212,22 +256,36 @@ class GitHubPublisher:
         except json.JSONDecodeError as exc:
             raise PublicationError("GitHub CLI returned invalid JSON") from exc
 
+    async def _required_pr_checks(self, path: Path, pull_request_url: str) -> list[CiCheckResult]:
+        result = await self._runner.run(
+            path,
+            *self._gh,
+            "pr",
+            "checks",
+            pull_request_url,
+            "--required",
+            "--json",
+            "name,bucket,link,description",
+        )
+        try:
+            payload = cast(object, json.loads(result.stdout))
+        except json.JSONDecodeError as exc:
+            detail = (result.stderr or result.stdout).strip()[:2_000]
+            raise PublicationError(f"GitHub required-check query failed: {detail}") from exc
+        if not isinstance(payload, list):
+            raise PublicationError("GitHub returned an invalid required-check list")
+        checks = [_required_check(item) for item in payload]
+        if result.returncode not in {0, 1, 8}:
+            detail = (result.stderr or result.stdout).strip()[:2_000]
+            raise PublicationError(f"GitHub required-check query failed: {detail}")
+        return checks
+
     async def _required(self, path: Path, *arguments: str) -> str:
         result = await self._runner.run(path, *arguments)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()[:2_000]
             raise PublicationError(f"{' '.join(arguments)} failed: {detail}")
         return result.stdout
-
-
-def _worktree_path(lane: LaneRecord) -> Path:
-    if lane.worktree_id is None:
-        raise PublicationError("lane has no Orca worktree")
-    _, separator, raw_path = lane.worktree_id.partition("::")
-    path = Path(raw_path)
-    if not separator or not path.is_absolute() or not path.is_dir():
-        raise PublicationError(f"lane worktree is not a local Orca identity: {lane.worktree_id}")
-    return path
 
 
 def _github_repository(remote_url: str) -> str:
@@ -252,6 +310,36 @@ def _pull_request_body(run_id: str, lane: LaneRecord, head_sha: str) -> str:
         f"Issue: `{lane.issue_id}`\n"
         f"Published head: `{head_sha}`\n\n"
         "This pull request remains draft until required checks pass for this exact head."
+    )
+
+
+def _verify_pull_request(payload: object, receipt: PublicationReceipt) -> None:
+    if not isinstance(payload, dict):
+        raise PublicationError("GitHub returned invalid pull-request state")
+    if payload.get("headRefOid") != receipt.head_sha:
+        raise PublicationError("pull request head does not match the published revision")
+    if payload.get("state") != "OPEN":
+        raise PublicationError("the authorized lane pull request is no longer open")
+
+
+def _required_check(raw: object) -> CiCheckResult:
+    if not isinstance(raw, dict) or not raw.get("name"):
+        raise PublicationError("GitHub returned an invalid required check")
+    bucket = str(raw.get("bucket"))
+    status = {
+        "pass": "passed",
+        "fail": "failed",
+        "pending": "pending",
+        "skipping": "skipped",
+        "cancel": "cancelled",
+    }.get(bucket)
+    if status is None:
+        raise PublicationError(f"GitHub returned unknown required-check bucket {bucket}")
+    return CiCheckResult(
+        name=str(raw["name"]),
+        status=status,
+        details_url=str(raw["link"]) if raw.get("link") else None,
+        output=str(raw.get("description") or "")[-8_000:],
     )
 
 
@@ -302,6 +390,47 @@ def _parse_checks(check_data: object, status_data: object, head_sha: str) -> lis
                 output=str(raw.get("description") or "")[-8_000:],
             )
     return [parsed[name] for name in sorted(parsed)]
+
+
+def _required_checks(
+    observed: list[CiCheckResult], protection: object | None
+) -> list[CiCheckResult]:
+    """Require every protected context, or wait until unprotected checks appear."""
+
+    contexts: set[str] = set()
+    if isinstance(protection, dict):
+        raw_contexts = protection.get("contexts", [])
+        if isinstance(raw_contexts, list):
+            contexts.update(str(item) for item in raw_contexts if item)
+        raw_checks = protection.get("checks", [])
+        if isinstance(raw_checks, list):
+            contexts.update(
+                str(item["context"])
+                for item in raw_checks
+                if isinstance(item, dict) and item.get("context")
+            )
+    by_name = {item.name: item for item in observed}
+    if contexts:
+        return [
+            by_name.get(
+                name,
+                CiCheckResult(
+                    name=name,
+                    status="pending",
+                    output="Required check has not reported for this exact head.",
+                ),
+            )
+            for name in sorted(contexts)
+        ]
+    if observed:
+        return observed
+    return [
+        CiCheckResult(
+            name="check-discovery",
+            status="pending",
+            output="No checks have reported for this exact head yet.",
+        )
+    ]
 
 
 def _conclusion(value: str) -> str:

@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from kasgraph.git import GitError, worktree_path
 from kasgraph.models import LanePhase, LaneRecord, PublicationReceipt
 from kasgraph.publication import (
     CommandResult,
     GitHubPublisher,
     PublicationError,
     _github_repository,
-    _worktree_path,
 )
 
 
@@ -60,31 +60,20 @@ async def test_create_draft_pr_observe_exact_checks_and_mark_ready(tmp_path: Pat
         result(),
         result("[]"),
         result("https://github.com/owner/repo/pull/7\n"),
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
         result(
             json.dumps(
                 [
                     {
-                        "check_runs": [
-                            {
-                                "name": "tests",
-                                "head_sha": sha,
-                                "status": "completed",
-                                "conclusion": "success",
-                                "details_url": "https://github.com/check/1",
-                                "output": {"title": "passed", "summary": "ok"},
-                            },
-                            {
-                                "name": "stale",
-                                "head_sha": "c" * 40,
-                                "status": "completed",
-                                "conclusion": "failure",
-                            },
-                        ]
+                        "name": "tests",
+                        "bucket": "pass",
+                        "link": "https://github.com/check/1",
+                        "description": "ok",
                     }
                 ]
             )
         ),
-        result(json.dumps({"statuses": []})),
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
         result(),
     )
     publisher = GitHubPublisher(runner=runner)
@@ -111,6 +100,7 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
         run_id="run-1234567890",
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
         branch="kasgraph/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha=old_sha,
@@ -121,7 +111,18 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
         result(f"{old_sha}\trefs/heads/{previous.branch}\n"),
         result(),
-        result(json.dumps([{"url": previous.pull_request_url, "isDraft": True}])),
+        result(
+            json.dumps(
+                [
+                    {
+                        "url": previous.pull_request_url,
+                        "isDraft": True,
+                        "state": "OPEN",
+                        "body": "Kasgraph run: `run-1234567890`",
+                    }
+                ]
+            )
+        ),
         result(),
     )
 
@@ -144,6 +145,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
         run_id="run-1234567890",
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
         branch="kasgraph/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha="a" * 40,
@@ -167,7 +169,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
         result(f"{'c' * 40}\trefs/heads/{previous.branch}\n"),
     )
-    with pytest.raises(PublicationError, match="unowned"):
+    with pytest.raises(PublicationError, match="unrelated revision"):
         await GitHubPublisher(runner=unowned).publish(
             run_id=previous.run_id,
             lane=lane(tmp_path),
@@ -181,18 +183,163 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
         _github_repository("git@gitlab.com:owner/repo.git")
 
 
+async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path) -> None:
+    sha = "b" * 40
+    branch = "kasgraph/run-12345678/issue-123"
+    runner = QueueRunner(
+        result("git@github.com:owner/repo.git"),
+        result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result(f"{sha}\trefs/heads/{branch}\n"),
+        result(
+            json.dumps(
+                [
+                    {
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "isDraft": True,
+                        "state": "OPEN",
+                        "body": "Kasgraph run: `run-1234567890`",
+                    }
+                ]
+            )
+        ),
+        result(),
+    )
+
+    receipt = await GitHubPublisher(runner=runner).publish(
+        run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+    )
+
+    assert receipt.head_sha == sha
+    assert not any(call[:2] == ("git", "push") for call in runner.calls)
+
+    previous = receipt.model_copy(update={"head_sha": "a" * 40})
+    update_runner = QueueRunner(
+        result(receipt.remote_url),
+        result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result(f"{sha}\trefs/heads/{branch}\n"),
+        result(
+            json.dumps(
+                [
+                    {
+                        "url": receipt.pull_request_url,
+                        "isDraft": True,
+                        "state": "OPEN",
+                        "body": "Kasgraph run: `run-1234567890`",
+                    }
+                ]
+            )
+        ),
+        result(),
+    )
+    recovered_update = await GitHubPublisher(runner=update_runner).publish(
+        run_id=receipt.run_id,
+        lane=lane(tmp_path),
+        head_sha=sha,
+        previous=previous,
+    )
+    assert recovered_update.head_sha == sha
+    assert not any(call[:2] == ("git", "push") for call in update_runner.calls)
+
+
+async def test_missing_required_check_stays_pending() -> None:
+    sha = "b" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="kasgraph/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        result(
+            json.dumps(
+                [
+                    {
+                        "name": "tests",
+                        "bucket": "pending",
+                        "link": "https://github.com/check/1",
+                        "description": "queued",
+                    }
+                ]
+            ),
+            returncode=8,
+        ),
+    )
+
+    observed = await GitHubPublisher(runner=runner).checks(receipt)
+
+    assert observed.status == "pending"
+    assert observed.checks[0].name == "tests"
+    assert observed.checks[0].output == "queued"
+
+
+async def test_ready_transition_recovers_after_remote_success() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="kasgraph/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": receipt.head_sha, "state": "OPEN", "isDraft": False}))
+    )
+
+    ready = await GitHubPublisher(runner=runner).mark_ready(receipt)
+
+    assert ready.draft is False
+    assert len(runner.calls) == 1
+
+
+async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path) -> None:
+    sha = "b" * 40
+    branch = "kasgraph/run-12345678/issue-123"
+    runner = QueueRunner(
+        result("git@github.com:owner/repo.git"),
+        result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result(f"{sha}\trefs/heads/{branch}\n"),
+        result(
+            json.dumps(
+                [
+                    {
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "isDraft": True,
+                        "state": "CLOSED",
+                        "body": "Kasgraph run: `run-1234567890`",
+                    }
+                ]
+            )
+        ),
+    )
+
+    with pytest.raises(PublicationError, match="no longer open"):
+        await GitHubPublisher(runner=runner).publish(
+            run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+        )
+
+
 async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> None:
     sha = "b" * 40
     receipt = PublicationReceipt(
         run_id="run-1234567890",
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
         branch="kasgraph/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha=sha,
         draft=False,
     )
     runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": False})),
+        result("[]", returncode=1),
         result(
             json.dumps(
                 [
@@ -266,8 +413,8 @@ async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> Non
         )
 
     missing = lane(tmp_path).model_copy(update={"worktree_id": None})
-    with pytest.raises(PublicationError, match="no Orca worktree"):
-        _worktree_path(missing)
+    with pytest.raises(GitError, match="not a local Orca identity"):
+        worktree_path(missing.worktree_id or "")
 
     bad_default = GitHubPublisher(runner=QueueRunner(result(receipt.remote_url), result("{}")))
     with pytest.raises(PublicationError, match="default branch"):

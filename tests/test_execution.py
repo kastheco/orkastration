@@ -420,6 +420,7 @@ class FakePublisher:
             run_id=run_id,
             lane=lane.name,
             remote_url="git@github.com:example/repo.git",
+            base_branch="main",
             branch=f"kasgraph/{run_id[:12]}/{lane.name}",
             pull_request_url="https://github.com/example/repo/pull/1",
             head_sha=head_sha,
@@ -1283,6 +1284,28 @@ async def test_acceptance_freezes_authorization_before_publication(tmp_path: Pat
     assert authorization is not None
     assert len(authorization.proposal_sha256) == 64
     assert len(authorization.config_sha256) == 64
+    assert publisher.publish_calls == []
+
+
+async def test_resumed_run_rejects_changed_graph_policy(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    changed = ExecutionController(
+        config=config(max_workers=3),
+        orca=orca,
+        store=store,
+        git=FakeGit(),
+        publisher=publisher,
+    )
+
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await changed.monitor(run_id)
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await changed.accept(run_id)
+
     assert publisher.publish_calls == []
 
 
