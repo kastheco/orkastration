@@ -99,6 +99,34 @@ async def test_tasks_and_release_worker() -> None:
     )
 
 
+async def test_releasing_a_worker_closes_the_terminal_orkastrator_opened() -> None:
+    """Releasing the Dispatch reclaims nothing when orkastrator started the agent.
+
+    Orca calls such a terminal `external_terminal` and answers `processAction:
+    none`, which is how a settled stage kept a whole agent process tree resident
+    for the life of the run.
+    """
+
+    runner = FakeRunner([{"ok": True, "result": {}}, {"ok": True, "result": {}}])
+
+    await OrcaClient(runner).release_worker("dispatch-1", "terminal-1")
+
+    assert runner.calls == [
+        ("orchestration", "worker-release", "--dispatch", "dispatch-1", "--json"),
+        ("terminal", "close", "--terminal", "terminal-1", "--json"),
+    ]
+
+
+async def test_a_terminal_orca_no_longer_knows_is_already_closed() -> None:
+    """A refused close is the outcome asked for, not a reason to retry forever."""
+
+    runner = FakeRunner([{"ok": True, "result": {}}, {"ok": False, "error": {"code": "no_such"}}])
+
+    await OrcaClient(runner).release_worker("dispatch-1", "terminal-1")
+
+    assert len(runner.calls) == 2
+
+
 async def test_worker_dispatch_recovers_supervised_worktree() -> None:
     runner = FakeRunner(
         [
@@ -138,7 +166,7 @@ async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
     )
     client = OrcaClient(runner)
 
-    dispatch_id, worktree_id, _ = await client.start_worker(
+    dispatch_id, worktree_id, _, _ = await client.start_worker(
         task_id="task-1",
         lane_name="issue-123",
         repo_selector="id:repo",
@@ -173,7 +201,7 @@ async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
 async def test_start_worker_reuses_lane_worktree() -> None:
     runner = FakeRunner([{"ok": True, "result": {"dispatchId": "dispatch-2"}}])
     client = OrcaClient(runner)
-    _, worktree_id, _ = await client.start_worker(
+    _, worktree_id, _, _ = await client.start_worker(
         task_id="task-2",
         lane_name="issue-123",
         repo_selector="id:repo",
@@ -197,7 +225,7 @@ async def test_start_fixer_uses_child_worktree_at_exact_review_head() -> None:
         ]
     )
     client = OrcaClient(runner)
-    _, worktree_id, _ = await client.start_worker(
+    _, worktree_id, _, _ = await client.start_worker(
         task_id="task-3",
         lane_name="finding-1-fixer-r1",
         repo_selector="id:repo",
@@ -236,7 +264,7 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
     )
     client = OrcaClient(runner)
 
-    dispatch_id, worktree_id, _ = await client.start_worker(
+    dispatch_id, worktree_id, terminal_handle, _ = await client.start_worker(
         task_id="task-1",
         lane_name="issue-123",
         repo_selector="id:repo",
@@ -245,6 +273,8 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
     )
 
     assert (dispatch_id, worktree_id) == ("dispatch-1", "repo::/tmp/issue-123")
+    # orkastrator opened this pane, so it is the one that has to close it later.
+    assert terminal_handle == "terminal-1"
     assert runner.calls[0] == (
         "worktree",
         "create",
@@ -300,7 +330,7 @@ async def test_fast_claude_worker_reuses_worktree_with_fast_settings() -> None:
     )
     client = OrcaClient(runner)
 
-    _, worktree_id, _ = await client.start_worker(
+    _, worktree_id, _, _ = await client.start_worker(
         task_id="task-2",
         lane_name="issue-123",
         repo_selector="id:repo",

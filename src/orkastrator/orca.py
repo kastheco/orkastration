@@ -6,6 +6,7 @@ import asyncio
 import json
 import shlex
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -236,8 +237,15 @@ class OrcaClient:
         profile: AgentProfile,
         base_ref: str | None = None,
         parent_worktree_id: str | None = None,
-    ) -> tuple[str, str, JsonObject]:
-        """Start one supervised worker with an explicit model and effort."""
+    ) -> tuple[str, str, str | None, JsonObject]:
+        """Start one supervised worker with an explicit model and effort.
+
+        The third element is a terminal handle only when orkastrator created the
+        terminal itself. Orca refuses to close a terminal it did not open, so
+        whoever opened one has to be the one that closes it; recording the handle
+        here is what lets `release_worker` reclaim it later without guessing at
+        panes that belong to the owner.
+        """
 
         if profile.fast:
             return await self._start_fast_worker(
@@ -285,7 +293,9 @@ class OrcaClient:
         resolved_worktree = worktree_id or _required_recursive_string(
             response, "worktreeId", "workspaceId"
         )
-        return dispatch_id, resolved_worktree, response
+        # Orca opened this terminal, so Orca owns tearing it down: worker-release
+        # is enough and no handle needs carrying.
+        return dispatch_id, resolved_worktree, None, response
 
     async def _start_fast_worker(
         self,
@@ -297,7 +307,7 @@ class OrcaClient:
         base_ref: str | None,
         parent_worktree_id: str | None,
         profile: AgentProfile,
-    ) -> tuple[str, str, JsonObject]:
+    ) -> tuple[str, str, str | None, JsonObject]:
         """Launch fast provider argv, then attach it to a supervised Dispatch."""
 
         resolved_worktree = worktree_id
@@ -353,14 +363,31 @@ class OrcaClient:
             "--json",
         )
         dispatch_id = _required_recursive_string(response, "dispatchId")
-        return dispatch_id, resolved_worktree, response
+        return dispatch_id, resolved_worktree, terminal_handle, response
 
-    async def release_worker(self, dispatch_id: str) -> JsonObject:
-        """Release the exact terminal owned by a settled Dispatch."""
+    async def release_worker(
+        self, dispatch_id: str, terminal_handle: str | None = None
+    ) -> JsonObject:
+        """Release a settled Dispatch, and close the terminal orkastrator opened for it.
 
-        return await self._ok(
+        `worker-release` alone reclaims nothing when orkastrator started the agent
+        itself: Orca reports such a terminal as `external_terminal` and answers
+        `processAction: none`, leaving the whole agent process tree resident for
+        the life of the run. Passing the handle this client recorded at start
+        closes the exact pane it opened, which is the only one it may close.
+        """
+
+        response = await self._ok(
             "orchestration", "worker-release", "--dispatch", dispatch_id, "--json"
         )
+        if terminal_handle is None:
+            return response
+        # A handle Orca no longer knows is a handle that is already closed, which
+        # is the outcome asked for. Raising here would park the stage unreleased
+        # forever and retry the same refusal every tick.
+        with suppress(OrcaError):
+            await self._ok("terminal", "close", "--terminal", terminal_handle, "--json")
+        return response
 
     async def _ok(self, *arguments: str) -> JsonObject:
         response = await self._runner.run(arguments)

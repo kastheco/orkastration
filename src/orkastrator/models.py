@@ -652,6 +652,9 @@ class StageRecord(BaseModel):
     phase: StagePhase
     orca_task_id: str | None
     orca_dispatch_id: str | None
+    # Set only when orkastrator opened the agent terminal itself; that is the
+    # one case where releasing the Dispatch reclaims nothing on its own.
+    orca_terminal_handle: str | None = None
     worktree_id: str | None
     result_json: str | None
     processed: bool

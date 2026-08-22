@@ -571,6 +571,7 @@ class StateStore:
         dispatch_id: str,
         worktree_id: str,
         payload: object,
+        terminal_handle: str | None = None,
     ) -> None:
         with self._session() as session:
             row = session.get(WorkflowStageRow, stage_id)
@@ -582,6 +583,10 @@ class StateStore:
                 return
             row.phase = StagePhase.DISPATCHED.value
             row.orca_dispatch_id = dispatch_id
+            # Written with the dispatch rather than later, because a supervisor
+            # that dies between the two loses the only record of which terminal
+            # it opened and the pane leaks for the life of the machine.
+            row.orca_terminal_handle = terminal_handle
             row.worktree_id = worktree_id
             row.updated_at = _now()
             if row.role == StageKind.WORKER.value:
@@ -2079,7 +2084,10 @@ class StateStore:
                 ("review_head_sha", "TEXT"),
                 ("integration_head_sha", "TEXT"),
             ),
-            "workflow_stages": (("worktree_id", "TEXT"),),
+            "workflow_stages": (
+                ("worktree_id", "TEXT"),
+                ("orca_terminal_handle", "TEXT"),
+            ),
             "findings": (("dispatch_base_sha", "TEXT"),),
             "acceptance_authorizations": (("config_json", "TEXT"),),
             "integrations": (
@@ -2161,6 +2169,7 @@ def _stage(row: WorkflowStageRow) -> StageRecord:
         phase=StagePhase(row.phase),
         orca_task_id=row.orca_task_id,
         orca_dispatch_id=row.orca_dispatch_id,
+        orca_terminal_handle=row.orca_terminal_handle,
         worktree_id=row.worktree_id,
         result_json=row.result_json,
         processed=row.processed,

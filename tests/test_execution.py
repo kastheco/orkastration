@@ -203,6 +203,7 @@ class FakeOrca:
         self.dependencies: dict[str, list[str]] = {}
         self.starts: list[dict[str, object]] = []
         self.releases: list[str] = []
+        self.released_terminals: list[str | None] = []
         self.runs_by_id: dict[str, JsonObject] = {}
         self.bound_runs: list[str] = []
         self.unreadable_dispatches: set[str] = set()
@@ -257,7 +258,7 @@ class FakeOrca:
         self._refresh_ready()
         return list(self.tasks_by_id.values())
 
-    async def start_worker(self, **kwargs: object) -> tuple[str, str, JsonObject]:
+    async def start_worker(self, **kwargs: object) -> tuple[str, str, str | None, JsonObject]:
         task_id = str(kwargs["task_id"])
         if task_id in self.refuse_starts:
             # Refused outright: no Dispatch exists and none will.
@@ -279,10 +280,15 @@ class FakeOrca:
         if self.fail_after_worker_start:
             self.fail_after_worker_start = False
             raise RuntimeError("crash after remote worker start")
-        return dispatch_id, worktree_id, {"ok": True, "dispatchId": dispatch_id}
+        terminal_handle = f"term-{dispatch_id}"
+        self.starts[-1]["terminal_handle"] = terminal_handle
+        return dispatch_id, worktree_id, terminal_handle, {"ok": True, "dispatchId": dispatch_id}
 
-    async def release_worker(self, dispatch_id: str) -> JsonObject:
+    async def release_worker(
+        self, dispatch_id: str, terminal_handle: str | None = None
+    ) -> JsonObject:
         self.releases.append(dispatch_id)
+        self.released_terminals.append(terminal_handle)
         return {"ok": True}
 
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
@@ -2937,6 +2943,9 @@ async def test_a_stage_past_its_hard_budget_is_released_and_dispatched_again(
 
     assert [item.budget for item in result.overdue] == ["hard"]
     assert orca.releases == [dispatch_id]
+    # Releasing the Dispatch alone leaves the agent process tree resident, so the
+    # terminal orkastrator opened has to be named for it to actually be reclaimed.
+    assert orca.released_terminals == [f"term-{dispatch_id}"]
     timed_out = [item for item in store.events(run_id) if item["kind"] == "stage_timed_out"]
     assert len(timed_out) == 1
     released = next(item for item in store.stages(run_id) if item.role is StageKind.WORKER)
@@ -2948,6 +2957,28 @@ async def test_a_stage_past_its_hard_budget_is_released_and_dispatched_again(
 
     assert [launch.role for launch in restarted.started] == [StageKind.WORKER]
     assert restarted.status == "active"
+
+
+async def test_a_settled_stage_releases_the_terminal_orkastrator_opened(tmp_path: Path) -> None:
+    """The lane completing is not what reclaims the worker; releasing its pane is.
+
+    Orca refuses to close a terminal it did not create, so a stage that finishes
+    normally used to leave its whole agent tree resident. The handle recorded at
+    start is the only thing that tells the supervisor which pane is its to close.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    stage = next(item for item in store.stages(run_id) if item.role is StageKind.WORKER)
+    assert stage.orca_terminal_handle == f"term-{stage.orca_dispatch_id}"
+
+    orca.complete_dispatched(worker_result())
+    await value.monitor(run_id)
+
+    assert orca.releases == [stage.orca_dispatch_id]
+    assert orca.released_terminals == [stage.orca_terminal_handle]
 
 
 async def test_a_stage_that_wedges_every_time_blocks_instead_of_looping(tmp_path: Path) -> None:

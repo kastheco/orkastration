@@ -90,6 +90,11 @@ class WorkflowStageRow(SQLModel, table=True):
     phase: str
     orca_task_id: str | None = Field(default=None, unique=True)
     orca_dispatch_id: str | None = Field(default=None, unique=True)
+    # The terminal orkastrator opened for this stage, when it opened one. Orca
+    # will not close a terminal it did not create, so this is the only record of
+    # which panes are orkastrator's to reclaim. Nullable because a stage whose
+    # agent Orca launched has none, and because rows predate the column.
+    orca_terminal_handle: str | None = None
     worktree_id: str | None = None
     result_json: str | None = None
     processed: bool = False

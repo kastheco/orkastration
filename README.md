@@ -349,6 +349,19 @@ something a third dispatch will not.
 Both halves are optional and unset by default. A budget is a claim about how long this repository's
 work takes, and no default knows that.
 
+### Reclaiming a settled worker
+
+Whoever opened a terminal closes it. When a profile is not `fast`, Orca launches the agent and
+`worker-release` is enough. A `fast` profile is different: orkastrator creates the terminal itself so
+it can pass provider argv Orca does not model, and Orca then reports that terminal as
+`external_terminal` and answers `processAction: none` — the Dispatch is marked released and the whole
+agent process tree stays resident. Left alone that is one `codex` or `claude` tree, its MCP servers,
+and a `systemd-inhibit` per stage, for the life of the run.
+
+So the handle is recorded on the stage row at dispatch time, and releasing a settled or timed-out
+stage closes that exact pane and no other. A terminal Orca no longer knows about is treated as
+already closed rather than retried, and a stage whose agent Orca launched carries no handle at all.
+
 ## Verification
 
 ```bash

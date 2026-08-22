@@ -86,9 +86,11 @@ class OrcaGraphController(Protocol):
         profile: AgentProfile,
         base_ref: str | None = None,
         parent_worktree_id: str | None = None,
-    ) -> tuple[str, str, JsonObject]: ...
+    ) -> tuple[str, str, str | None, JsonObject]: ...
 
-    async def release_worker(self, dispatch_id: str) -> JsonObject: ...
+    async def release_worker(
+        self, dispatch_id: str, terminal_handle: str | None = None
+    ) -> JsonObject: ...
 
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None: ...
 
@@ -1383,7 +1385,9 @@ class ExecutionController:
                         f"{clock.timeouts + 1} times",
                     )
                     continue
-                await self._orca.release_worker(stage.orca_dispatch_id)
+                await self._orca.release_worker(
+                    stage.orca_dispatch_id, stage.orca_terminal_handle
+                )
                 self._store.note_stage_timed_out(run_id, stage, minutes)
                 overdue.append(
                     OverdueStage(
@@ -1418,7 +1422,9 @@ class ExecutionController:
                 and stage.orca_dispatch_id is not None
                 and not stage.released
             ):
-                await self._orca.release_worker(stage.orca_dispatch_id)
+                await self._orca.release_worker(
+                    stage.orca_dispatch_id, stage.orca_terminal_handle
+                )
                 self._store.mark_released(run_id, stage.stage_id)
 
     async def _reclaim_foreign_reservations(self, run_id: str) -> None:
@@ -1493,7 +1499,7 @@ class ExecutionController:
         if stage.orca_task_id is None:  # already checked before the slot was reserved
             raise ValueError(f"stage {stage.stage_id} has no Orca task")
         placement = self._placement(run_id, lane, stage)
-        dispatch_id, worktree_id, payload = await self._orca.start_worker(
+        dispatch_id, worktree_id, terminal_handle, payload = await self._orca.start_worker(
             task_id=stage.orca_task_id,
             lane_name=_worker_name(lane.name, stage),
             repo_selector=lane.repo_selector,
@@ -1502,7 +1508,9 @@ class ExecutionController:
             parent_worktree_id=placement.parent_worktree_id,
             profile=self._profile(stage),
         )
-        self._store.mark_stage_started(run_id, stage.stage_id, dispatch_id, worktree_id, payload)
+        self._store.mark_stage_started(
+            run_id, stage.stage_id, dispatch_id, worktree_id, payload, terminal_handle
+        )
         if stage.finding_id is not None:
             finding = self._finding_for_stage(run_id, stage)
             phase = {
