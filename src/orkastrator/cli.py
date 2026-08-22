@@ -186,6 +186,28 @@ def reopen(
     _emit(record.model_dump(mode="json"), json_output=json_output)
 
 
+@app.command()
+def settle(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    finding: Annotated[str, typer.Option("--finding", help="Finding ID to settle.")],
+    phase: Annotated[
+        FindingPhase, typer.Option("--phase", help="Owner decision to record.")
+    ] = FindingPhase.DEFERRED,
+    note: Annotated[
+        str, typer.Option("--note", help="Why this finding is being settled.")
+    ] = "settled by the supervisor",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Record an owner decision on a finding no further agent round can settle."""
+
+    try:
+        _, store, _ = _components()
+        record = store.settle_finding(run_id, finding, phase=phase, note=note)
+    except (ConfigError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(record.model_dump(mode="json"), json_output=json_output)
+
+
 @app.command(name="show")
 def show_graph(
     run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],

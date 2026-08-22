@@ -444,8 +444,7 @@ class FakeGit(LocalGit):
             else "passed"
         )
         return [
-            ValidationResult(command="pytest", status=status, output=status)
-            for _ in requirements
+            ValidationResult(command="pytest", status=status, output=status) for _ in requirements
         ]
 
 
@@ -2081,9 +2080,7 @@ async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
     # fix loop cannot tell a broken command from a broken fix. Say so while the
     # reviewer is still the one who can restate it.
     assert not result.findings
-    rejected = [
-        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
-    ]
+    rejected = [event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"]
     assert any("without a shell" in str(event["payload"]) for event in rejected)
 
 

@@ -417,6 +417,65 @@ def test_a_finding_cannot_be_reopened_into_a_phase_no_stage_advances(tmp_path: P
         store.reopen_finding(run_id, "finding-absent", phase=FindingPhase.PENDING_FIX, note="typo")
 
 
+def test_settling_a_finding_records_the_decision_and_retires_its_live_stage(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "settle.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    stage = store.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key="escalate:1",
+        role=StageKind.ESCALATION,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=1,
+    )
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+
+    settled = store.settle_finding(
+        run_id, finding.finding_id, phase=FindingPhase.DEFERRED, note="tracked elsewhere"
+    )
+
+    assert settled.phase is FindingPhase.DEFERRED
+    assert settled.escalation_reason is None
+    # An escalation still in flight would come back and re-adjudicate a finding
+    # the owner has already closed, so it has to be retired with the decision.
+    retired = next(item for item in store.stages(run_id) if item.stage_id == stage.stage_id)
+    assert retired.processed
+    assert retired.stage_key != "escalate:1"
+
+
+def test_a_finding_cannot_be_settled_into_a_phase_that_is_not_a_decision(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "decision.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+
+    with pytest.raises(ValueError, match="cannot settle"):
+        store.settle_finding(
+            run_id, finding.finding_id, phase=FindingPhase.PENDING_FIX, note="not a decision"
+        )
+    with pytest.raises(KeyError):
+        store.settle_finding(run_id, "finding-absent", phase=FindingPhase.DEFERRED, note="typo")
+
+
 def test_a_round_level_contract_constraint_is_rebuilt_around_the_stage(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     store = StateStore(path)

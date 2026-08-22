@@ -135,11 +135,7 @@ async def test_a_requirement_runs_in_its_own_workdir(tmp_path: Path) -> None:
 
     results = await LocalGit().validate(
         lane_id,
-        [
-            ValidationRequirement(
-                command="cat marker.txt", expected="prints here", workdir="app/ui"
-            )
-        ],
+        [ValidationRequirement(command="cat marker.txt", expected="prints here", workdir="app/ui")],
     )
 
     assert [item.status for item in results] == ["passed"]

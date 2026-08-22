@@ -84,6 +84,13 @@ _REOPENABLE_PHASES = (
     FindingPhase.PENDING_RE_REVIEW,
     FindingPhase.PENDING_ESCALATION,
 )
+
+_SETTLEABLE_PHASES = (FindingPhase.RESOLVED, FindingPhase.DEFERRED)
+"""The decisions an owner may record directly on a finding.
+
+These two are terminal by design, which is exactly why an owner has to be able to
+reach them: a blocked finding is one no further agent round can settle.
+"""
 """The phases a settled finding may be sent back to.
 
 Every other phase either names work already in flight or is itself terminal, and
@@ -822,6 +829,69 @@ class StateStore:
                     "phase": phase.value,
                     "round": target,
                     "reason": None if escalation_reason is None else escalation_reason.value,
+                    "retired_stages": retired,
+                    "note": note[:4_000],
+                },
+            )
+            return _finding(row)
+
+    def settle_finding(
+        self, run_id: str, finding_id: str, *, phase: FindingPhase, note: str
+    ) -> FindingRecord:
+        """Record the owner decision that a blocked finding was raised for.
+
+        `reopen_finding` is only half of the escape hatch, because it sends work
+        back to an agent. A finding blocks precisely when no further agent round
+        can settle it, so the other half has to exist too, or accepting or
+        dropping one means hand-written UPDATE statements against the state file -
+        which is what this class exists to stop.
+
+        Retire whatever the finding still has in flight as well. A dispatched
+        escalation returning after the decision would otherwise re-adjudicate a
+        finding the owner has already closed and move it back out of the phase
+        they chose.
+        """
+
+        if phase not in _SETTLEABLE_PHASES:
+            raise ValueError(f"cannot settle a finding into {phase.value}")
+        retired = 0
+        with self._session() as session:
+            row = session.exec(
+                select(FindingRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+                .where(LaneRow.run_id == run_id, FindingRow.finding_id == finding_id)
+            ).first()
+            if row is None:
+                raise KeyError(f"run {run_id} has no finding {finding_id}")
+            stages = session.exec(
+                select(WorkflowStageRow).where(WorkflowStageRow.finding_key == row.finding_key)
+            ).all()
+            for stage in stages:
+                if stage.phase in _SETTLED_STAGE_PHASES or stage.processed:
+                    continue
+                stage.processed = True
+                stage.stage_key = f"{stage.stage_key}:settled{_now():%Y%m%d%H%M%S}"
+                stage.updated_at = _now()
+                retired += 1
+            row.phase = phase.value
+            row.escalation_reason = None
+            row.updated_at = _now()
+            lane = session.get(LaneRow, row.lane_id)
+            if lane is not None and lane.phase != LanePhase.ACTIVE.value:
+                lane.phase = LanePhase.ACTIVE.value
+                lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status != "active":
+                run.status = "active"
+                run.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "finding_settled",
+                {
+                    "finding_id": finding_id,
+                    "phase": phase.value,
                     "retired_stages": retired,
                     "note": note[:4_000],
                 },
