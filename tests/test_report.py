@@ -1,0 +1,259 @@
+"""The report is the instrument that says whether a graph change converged anything.
+
+Its numbers get compared across runs, so the counting rules are pinned here.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from orkastrator.models import (
+    AllowedWriteScope,
+    FindingEvidence,
+    FindingLocation,
+    FindingRecord,
+    LaneRecord,
+    ReviewFinding,
+    StageKind,
+    StagePhase,
+    StageRecord,
+)
+from orkastrator.report import build_report, render
+
+NOW = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+
+
+def _contract(finding_id: str) -> ReviewFinding:
+    return ReviewFinding(
+        id=finding_id,
+        evidence=[
+            FindingEvidence(
+                location=FindingLocation(path="a.py", start_line=1, end_line=2),
+                claim="claim",
+            )
+        ],
+        failure_mode="fails",
+        required_outcome="passes",
+        allowed_write_scope=AllowedWriteScope(paths=["a.py"]),
+    )
+
+
+def _lane(lane_id: str, name: str) -> LaneRecord:
+    return LaneRecord(
+        lane_id=lane_id,
+        run_id="run",
+        name=name,
+        issue_id="KAS-1",
+        repo_selector="path:/tmp/repo",
+        base_ref="main",
+        phase="active",
+        worktree_id=None,
+        review_head_sha=None,
+        integration_head_sha=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _finding(lane_id: str, finding_id: str, *, phase: str = "resolved", round: int = 1):
+    return FindingRecord(
+        finding_key=f"{lane_id}:{finding_id}",
+        lane_id=lane_id,
+        finding_id=finding_id,
+        origin="initial_review",
+        contract=_contract(finding_id),
+        effective_contract=_contract(finding_id),
+        phase=phase,
+        round=round,
+        escalation_reason=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _stage(
+    lane_id: str,
+    role: StageKind,
+    *,
+    finding_id: str | None = None,
+    round: int | None = None,
+    key: str = "",
+) -> StageRecord:
+    return StageRecord(
+        stage_id=key or f"{lane_id}:{role}:{finding_id}:{round}",
+        stage_key=key or f"{lane_id}:{role}:{finding_id}:{round}",
+        lane_id=lane_id,
+        role=role,
+        finding_id=finding_id,
+        round=round,
+        attempt_kind=None,
+        phase=StagePhase.COMPLETED,
+        orca_task_id=None,
+        orca_dispatch_id=None,
+        worktree_id=None,
+        result_json=None,
+        processed=True,
+        released=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def test_only_per_finding_roles_count_against_dispatches_per_finding():
+    """A worker and an initial reviewer run once per lane however many findings land.
+
+    Counting them per finding would make a lane that found one thing look twice
+    as expensive as a lane that found two, which is backwards.
+    """
+
+    lane = _lane("lane", "demo")
+    stages = [
+        _stage("lane", StageKind.WORKER, key="w"),
+        _stage("lane", StageKind.INITIAL_REVIEWER, key="ir"),
+        _stage("lane", StageKind.FIXER, finding_id="finding-one", round=1),
+        _stage("lane", StageKind.RE_REVIEWER, finding_id="finding-one", round=1),
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[lane],
+        stages=stages,
+        findings=[_finding("lane", "finding-one")],
+        integrations=[],
+        publications=[],
+        events=[],
+    )
+
+    assert report.total_stages == 4
+    assert report.adjudication_stages == 2
+    assert report.dispatches_per_finding == 2.0
+
+
+def test_scheduling_the_same_work_twice_counts_as_a_repeat():
+    """(lane, role, finding, round) identifies one unit of work.
+
+    A second stage for that tuple exists because the first did not stick, and
+    that is the number that has to fall for the graph to be converging.
+    """
+
+    stages = [
+        _stage("lane", StageKind.FIXER, finding_id="finding-one", round=1, key="a"),
+        _stage("lane", StageKind.FIXER, finding_id="finding-one", round=1, key="b"),
+        _stage("lane", StageKind.RE_REVIEWER, finding_id="finding-one", round=1, key="c"),
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=stages,
+        findings=[_finding("lane", "finding-one")],
+        integrations=[],
+        publications=[],
+        events=[],
+    )
+
+    assert report.repeat_stages == 1
+    assert report.repeat_rate == round(1 / 3, 3)
+    assert report.findings[0].repeats == 1
+
+
+def test_escalations_are_grouped_by_reason_and_attributed_to_their_finding():
+    events = [
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-one", "reason": "ambiguous_result"},
+        },
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-one", "reason": "ambiguous_result"},
+        },
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-two", "reason": "validation_failed"},
+        },
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=[],
+        findings=[_finding("lane", "finding-one"), _finding("lane", "finding-two")],
+        integrations=[],
+        publications=[],
+        events=events,
+    )
+
+    assert report.escalations_by_reason == {"ambiguous_result": 2, "validation_failed": 1}
+    by_id = {item.finding_id: item for item in report.findings}
+    assert by_id["finding-one"].escalations == ("ambiguous_result", "ambiguous_result")
+    assert by_id["finding-two"].escalations == ("validation_failed",)
+
+
+def test_rejections_are_grouped_by_cause_not_by_message():
+    """Rejection messages embed identifiers, so raw strings histogram to one each."""
+
+    events = [
+        {"kind": "stage_started", "payload": {}},
+        {"kind": "stage_started", "payload": {}},
+        {
+            "kind": "stage_result_rejected",
+            "payload": {"reason": "invalid structured result: bad shape", "stage_id": "s1"},
+        },
+        {
+            "kind": "stage_result_rejected",
+            "payload": {"reason": "invalid structured result: other shape", "stage_id": "s2"},
+        },
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=[],
+        findings=[],
+        integrations=[],
+        publications=[],
+        events=events,
+    )
+
+    assert report.rejection_reasons == {"malformed_result": 2}
+    assert report.starts == 2
+    assert report.rejection_rate == 1.0
+
+
+def test_an_empty_run_reports_zeroes_rather_than_dividing_by_zero():
+    report = build_report(
+        run_id="run",
+        lanes=[],
+        stages=[],
+        findings=[],
+        integrations=[],
+        publications=[],
+        events=[],
+    )
+
+    assert report.dispatches_per_finding == 0.0
+    assert report.repeat_rate == 0.0
+    assert report.rejection_rate == 0.0
+    assert "run run" in render(report)
+
+
+def test_the_rendered_report_leads_with_the_two_numbers_that_must_fall():
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=[
+            _stage("lane", StageKind.FIXER, finding_id="finding-one", round=1, key="a"),
+            _stage("lane", StageKind.FIXER, finding_id="finding-one", round=1, key="b"),
+        ],
+        findings=[_finding("lane", "finding-one", phase="deferred", round=2)],
+        integrations=[],
+        publications=[],
+        events=[],
+    )
+
+    text = render(report)
+
+    assert "dispatches per finding" in text
+    assert "repeat rate" in text
+    assert "findings past round 1    1 of 1" in text
+    assert "finding-one" in text

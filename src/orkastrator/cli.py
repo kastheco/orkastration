@@ -24,6 +24,7 @@ from orkastrator.models import (
 )
 from orkastrator.orca import OrcaClient, OrcaError, SubprocessRunner
 from orkastrator.publication import GitHubPublisher, PublicationError
+from orkastrator.report import build_report, render
 from orkastrator.store import StateStore, UnsupportedStateError
 
 app = typer.Typer(
@@ -236,6 +237,37 @@ def show_graph(
     except (ConfigError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(payload, json_output=json_output)
+
+
+@app.command()
+def report(
+    run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Report what one run cost per finding, from persisted rows only.
+
+    Read-only and offline. Run it against two runs to tell whether a change to
+    the graph converged anything: `dispatches per finding` and `repeat rate`
+    are the two numbers that should fall.
+    """
+
+    try:
+        _, store, _ = _components()
+        summary = build_report(
+            run_id=run_id,
+            lanes=store.lanes(run_id),
+            stages=store.stages(run_id),
+            findings=store.findings(run_id),
+            integrations=store.integrations(run_id),
+            publications=store.publications(run_id),
+            events=store.events(run_id),
+        )
+    except (ConfigError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    if json_output:
+        _emit(summary.to_dict(), json_output=True)
+        return
+    typer.echo(render(summary))
 
 
 def _load_proposal(path: Path) -> SupervisorPlan:
