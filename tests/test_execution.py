@@ -2948,9 +2948,7 @@ async def test_an_overdue_stage_reports_a_poll_loop_rather_than_only_minutes(
 
     result = await value.monitor(run_id)
 
-    assert [item.activity for item in result.overdue] == [
-        "exec repeated 9/10 turns unchanged"
-    ]
+    assert [item.activity for item in result.overdue] == ["exec repeated 9/10 turns unchanged"]
     event = next(item for item in store.events(run_id) if item["kind"] == "stage_overdue")
     assert event["payload"]["activity"] == "exec repeated 9/10 turns unchanged"
 

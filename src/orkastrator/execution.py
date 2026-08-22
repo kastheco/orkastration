@@ -1387,9 +1387,7 @@ class ExecutionController:
                         f"{clock.timeouts + 1} times",
                     )
                     continue
-                await self._orca.release_worker(
-                    stage.orca_dispatch_id, stage.orca_terminal_handle
-                )
+                await self._orca.release_worker(stage.orca_dispatch_id, stage.orca_terminal_handle)
                 self._store.note_stage_timed_out(run_id, stage, minutes)
                 overdue.append(
                     OverdueStage(
@@ -1457,9 +1455,7 @@ class ExecutionController:
                 and stage.orca_dispatch_id is not None
                 and not stage.released
             ):
-                await self._orca.release_worker(
-                    stage.orca_dispatch_id, stage.orca_terminal_handle
-                )
+                await self._orca.release_worker(stage.orca_dispatch_id, stage.orca_terminal_handle)
                 self._store.mark_released(run_id, stage.stage_id)
 
     async def _reclaim_foreign_reservations(self, run_id: str) -> None:

@@ -26,6 +26,7 @@ has that error survive.
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 __all__ = ["condense"]
 
@@ -38,8 +39,11 @@ _KEEP_FAILURES = 12
 
 # Runners colour their output whenever they think a terminal is watching, and
 # pytest under `-n` decides that from the parent, not from this pipe. Every
-# pattern below is written against plain text, so the colour comes off first.
-_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# pattern below is written against plain text, so the escapes come off first.
+# The second alternative is the OSC 8 hyperlink ruff wraps its rule codes in:
+# it is not a CSI colour sequence, so a colour-only strip leaves the escape
+# sitting between the location and the code and every pattern below misses.
+_ANSI = re.compile(r"\x1b\][^\x1b\a]*(?:\x1b\\|\a)|\x1b\[[0-9;]*[A-Za-z]")
 
 # The summary line appears two ways and both have to match. Verbose pytest frames
 # it in `=` rules; `-q` prints it bare. What is stable across both is that the
@@ -68,6 +72,45 @@ _VITEST_COUNT = re.compile(r"^\s*(?:Test Files|Tests|Duration)\s+.*$", re.MULTIL
 # renders a character that is easy to confuse with an ASCII x.
 _VITEST_FAIL = re.compile("^\\s*(?:FAIL|\\u00d7|\\u2717)\\s+\\S.*$", re.MULTILINE)
 
+# Linters and type checkers are the worst offenders in the transcript, because
+# the diagnostic that decides the verdict is one line and ruff prints five more
+# drawing a box around it. Each pattern below matches only the decisive line, so
+# the code frames, the carets and the `= help:` suggestions never survive.
+# ruff has two renderers and the default one is not the greppable one. `concise`
+# puts the location first; the full renderer leads with the rule code and drops
+# the location onto a `-->` line underneath. Both are matched, and both are
+# reported in the concise shape, so the condensed result reads the same however
+# the command that produced it was invoked.
+_RUFF_CONCISE = re.compile(
+    r"^(?P<path>[^\s|=][^:]*):\d+:\d+: (?P<code>[A-Z]+\d+)(?: \[\*\])? (?P<message>.+)$",
+    re.MULTILINE,
+)
+_RUFF_FULL = re.compile(
+    r"^(?P<code>[A-Z]+\d+)(?: \[\*\])? (?P<message>.+)\n\s*-->\s(?P<path>\S+:\d+:\d+)$",
+    re.MULTILINE,
+)
+_PYRIGHT_DIAGNOSTIC = re.compile(
+    r"^\s*(?P<path>\S+):\d+:\d+ - (?:error|warning|information): "
+    r"(?P<message>.+?)(?:\s+\((?P<code>report\w+)\))?$",
+    re.MULTILINE,
+)
+# mypy's `note:` lines are continuations of the error above them, so they are
+# deliberately not matched: counting them would inflate the histogram and
+# keeping them would reintroduce the wrapping this exists to drop.
+_MYPY_DIAGNOSTIC = re.compile(
+    r"^(?P<path>[^\s|=][^:]*):\d+(?::\d+)?: (?:error|warning): "
+    r"(?P<message>.+?)(?:\s+\[(?P<code>[\w-]+)\])?$",
+    re.MULTILINE,
+)
+# Every one of these tools ends with a line that already states the verdict. It
+# is kept verbatim so a reader can see the tool's own words rather than a count
+# this module recomputed.
+_LINT_SUMMARY = re.compile(
+    r"^(?:Found \d+ errors?\b.*|\d+ errors?, \d+ warnings?.*|"
+    r"Success: no issues found.*|All checks passed!.*)$",
+    re.MULTILINE,
+)
+
 
 def condense(output: str, *, returncode: int, satisfied: bool) -> str:
     """Return the part of `output` a reader needs to justify the verdict.
@@ -93,7 +136,7 @@ def _condense(output: str, *, returncode: int, satisfied: bool) -> str:
 
     output = _ANSI.sub("", output)
 
-    for parser in (_pytest, _tsc, _node_tap, _vitest):
+    for parser in (_pytest, _tsc, _node_tap, _vitest, _lint):
         condensed = parser(output, satisfied=satisfied)
         if condensed is not None:
             return _cap(condensed)
@@ -145,11 +188,14 @@ def _failure_block(output: str, name: str) -> str:
 
 def _tsc(output: str, *, satisfied: bool) -> str | None:
     errors = _TSC_ERROR.findall(output)
-    count = _TSC_COUNT.findall(output)
-    if not errors and not count:
+    if not errors:
+        # `Found N errors.` is not tsc's alone - ruff and mypy end the same way,
+        # and claiming their output here would throw away their diagnostics and
+        # leave a bare count. A real `error TS####` is the only unambiguous
+        # signal, so a clean run falls through to `_lint`, which reports the very
+        # same summary line.
         return None
-    if satisfied and not errors:
-        return count[-1].strip() if count else "no type errors"
+    count = _TSC_COUNT.findall(output)
     kept = errors[:_KEEP_FAILURES]
     header = count[-1].strip() if count else f"{len(errors)} type errors"
     if len(errors) > len(kept):
@@ -177,6 +223,49 @@ def _vitest(output: str, *, satisfied: bool) -> str | None:
         return summary
     failures = [line.strip() for line in _VITEST_FAIL.findall(output)][:_KEEP_FAILURES]
     return "\n".join([summary, *failures])
+
+
+def _lint(output: str, *, satisfied: bool) -> str | None:
+    """Diagnostics from a linter or a type checker, counted by rule then capped.
+
+    A fixer told "ruff found 214 problems" cannot act, and a fixer handed all 214
+    pays for them on every turn it takes afterwards. The count by rule is the
+    part that is actually a decision - one rule at 200 is a formatting sweep, ten
+    rules at one each is real - and it costs a line. The diagnostics themselves
+    are capped, because a fixer that clears the first twelve can re-run the
+    command and get the next twelve for free.
+    """
+
+    diagnostics = [
+        (
+            match.group("code"),
+            f"{match.group('path')}: {match.group('code')} {match.group('message')}",
+        )
+        for match in _RUFF_FULL.finditer(output)
+    ]
+    if not diagnostics:
+        for pattern in (_RUFF_CONCISE, _PYRIGHT_DIAGNOSTIC, _MYPY_DIAGNOSTIC):
+            diagnostics = [
+                (match.group("code") or "?", match.group(0).strip())
+                for match in pattern.finditer(output)
+            ]
+            if diagnostics:
+                break
+
+    summaries = _LINT_SUMMARY.findall(output)
+    if not diagnostics and not summaries:
+        return None
+
+    summary = summaries[-1].strip() if summaries else f"{len(diagnostics)} diagnostics"
+    if satisfied and not diagnostics:
+        return summary
+
+    counts = Counter(code for code, _ in diagnostics)
+    kept = [text for _, text in diagnostics[:_KEEP_FAILURES]]
+    header = [summary, "  ".join(f"{code}={count}" for code, count in counts.most_common())]
+    if len(diagnostics) > len(kept):
+        header.append(f"(showing {len(kept)} of {len(diagnostics)})")
+    return "\n".join([*header, *kept])
 
 
 def _head_and_tail(output: str) -> str:

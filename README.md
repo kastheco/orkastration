@@ -267,6 +267,38 @@ safe to run against a live run. `doctor` reports what is currently being driven:
 uv run --project /home/kas/dev/orkastrator orkas doctor --json | jq .driving
 ```
 
+## Validation output
+
+The supervisor runs each finding's `validation` commands itself and writes the result into the
+contract the next agent reads. That output is then re-billed on every turn that agent takes
+afterwards, so it is condensed first, deterministically, by `runners.condense`.
+
+What survives is the part a verdict rests on. A passing `pytest` keeps its counts line and nothing
+else; a failing one keeps the counts plus up to twelve failures, each trimmed to the assertion and
+its immediate frames. `tsc`, `node:test` and `vitest` are handled the same way. Linters and type
+checkers get one extra step, because a fixer told "214 problems" cannot act on it and a fixer handed
+all 214 pays for them for the rest of its run:
+
+```text
+Found 214 errors.
+E501=201  F401=11  SIM105=2
+(showing 12 of 214)
+src/orkastrator/execution.py:12:8: F401 [*] `os` imported but unused
+...
+```
+
+The histogram is the decision - one rule at 200 is a formatting sweep, ten rules at one each is
+real - and it costs a line. `ruff`, `mypy` and `pyright` are recognised; their code frames, carets
+and `help:` suggestions are dropped, since they restate the diagnostic they sit under. Both of
+ruff's renderers are read, including the OSC 8 hyperlinks its default one wraps rule codes in, and
+both are reported in the concise shape above so the result does not depend on how the command was
+invoked.
+
+Whether a suite passed is an exit code compared against the requirement's `expect_exit`, never an
+inference, and `condense` never raises: an unrecognised runner falls back to keeping both ends of
+the stream rather than only its tail, so a tool that prints its fatal error first still has that
+error survive.
+
 ## Measuring convergence
 
 A run's cost is not its wall clock. It is how many agent dispatches each finding consumed, and how

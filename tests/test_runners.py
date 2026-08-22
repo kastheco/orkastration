@@ -240,3 +240,135 @@ def test_colour_codes_do_not_defeat_the_parser():
     condensed = condense(coloured, returncode=1, satisfied=False)
 
     assert condensed.startswith("3 failed, 9 passed in 1.20s")
+
+
+RUFF_FAILURE = """src/orkastrator/execution.py:12:8: F401 [*] `os` imported but unused
+   |
+10 | import asyncio
+11 | import json
+12 | import os
+   |        ^^ F401
+   |
+   = help: Remove unused import: `os`
+
+src/orkastrator/store.py:88:5: SIM105 Use `contextlib.suppress(OrcaError)` here
+   |
+86 |     try:
+87 |         close()
+88 |     except OrcaError:
+   |     ^^^^^^^^^^^^^^^^ SIM105
+   |
+   = help: Replace with `contextlib.suppress(OrcaError)`
+
+src/orkastrator/git.py:4:8: F401 [*] `shlex` imported but unused
+   |
+   = help: Remove unused import: `shlex`
+
+Found 3 errors.
+[*] 2 fixable with the `--fix` option.
+"""
+
+
+def test_a_failing_ruff_run_keeps_the_diagnostics_and_drops_the_code_frames() -> None:
+    condensed = condense(RUFF_FAILURE, returncode=1, satisfied=False)
+
+    assert "Found 3 errors." in condensed
+    assert "F401=2  SIM105=1" in condensed
+    assert "src/orkastrator/execution.py:12:8: F401 [*] `os` imported but unused" in condensed
+    assert "src/orkastrator/store.py:88:5: SIM105" in condensed
+    # The frames, carets and help lines are the whole reason this parser exists.
+    assert "^^^^" not in condensed
+    assert "= help:" not in condensed
+    assert "import asyncio" not in condensed
+
+
+def test_a_clean_ruff_run_is_its_own_summary_line() -> None:
+    assert condense("All checks passed!\n", returncode=0, satisfied=True) == "All checks passed!"
+
+
+def test_a_flood_of_one_rule_is_reported_as_a_count_before_it_is_reported_at_all() -> None:
+    output = "\n".join(
+        f"src/module_{index}.py:{index}:1: E501 line too long ({100 + index} > 100)"
+        for index in range(200)
+    )
+    condensed = condense(f"{output}\nFound 200 errors.\n", returncode=1, satisfied=False)
+
+    assert "E501=200" in condensed
+    assert "(showing 12 of 200)" in condensed
+    assert condensed.count("E501 line too long") == 12
+
+
+def test_mypy_diagnostics_are_grouped_by_their_bracketed_code() -> None:
+    output = """src/orkastrator/runners.py:111: error: Argument 1 has incompatible type  [arg-type]
+src/orkastrator/runners.py:111: note: this is context for the error above
+src/orkastrator/execution.py:164: error: Missing return statement  [return]
+src/orkastrator/execution.py:316: error: Missing return statement  [return]
+Found 3 errors in 2 files (checked 12 source files)
+"""
+    condensed = condense(output, returncode=1, satisfied=False)
+
+    assert "Found 3 errors in 2 files (checked 12 source files)" in condensed
+    assert "return=2  arg-type=1" in condensed
+    # A note is a continuation of the error above it, not a fourth diagnostic.
+    assert "note: this is context" not in condensed
+
+
+def test_a_clean_mypy_run_is_its_own_summary_line() -> None:
+    condensed = condense(
+        "Success: no issues found in 12 source files\n", returncode=0, satisfied=True
+    )
+
+    assert condensed == "Success: no issues found in 12 source files"
+
+
+def test_pyright_diagnostics_are_grouped_by_their_rule_name() -> None:
+    output = """
+/home/kas/dev/app/main.py:10:5 - error: "handle" undefined (reportUndefinedVariable)
+/home/kas/dev/app/main.py:22:9 - error: "spawn" is not defined (reportUndefinedVariable)
+/home/kas/dev/app/util.py:4:1 - warning: Import "os" is not accessed (reportUnusedImport)
+2 errors, 1 warning, 0 informations
+"""
+    condensed = condense(output, returncode=1, satisfied=False)
+
+    assert "2 errors, 1 warning, 0 informations" in condensed
+    assert "reportUndefinedVariable=2  reportUnusedImport=1" in condensed
+
+
+def test_a_pytest_failure_is_not_mistaken_for_a_lint_diagnostic() -> None:
+    output = """FAILED tests/test_store.py::test_stage_started - AssertionError: 3 != 4
+1 failed, 2850 passed in 95.72s
+"""
+    condensed = condense(output, returncode=1, satisfied=False)
+
+    assert "1 failed, 2850 passed in 95.72s" in condensed
+    # The lint parser never ran, so there is no rule histogram to show.
+    assert "=1" not in condensed
+
+
+# Captured verbatim from `ruff check`, escapes and all. Ruff's default renderer
+# leads with the rule code and wraps it in an OSC 8 hyperlink, neither of which
+# a hand-written sample would have got right.
+RUFF_DEFAULT_RENDERER = (
+    "\x1b[1m\x1b[91m\x1b]8;;https://docs.astral.sh/ruff/rules/unused-import\x1b\\F401"
+    "\x1b]8;;\x1b\\\x1b[0m [\x1b[1m\x1b[96m*\x1b[0m]\x1b[1m `os` imported but unused\x1b[0m\n"
+    " \x1b[1m\x1b[94m--> \x1b[0m/tmp/bad.py:1:8\n"
+    "  \x1b[1m\x1b[94m|\x1b[0m\n"
+    "\x1b[1m\x1b[94m1\x1b[0m \x1b[1m\x1b[94m|\x1b[0m import os\n"
+    "  \x1b[1m\x1b[94m|\x1b[0m        \x1b[1m\x1b[91m^^\x1b[0m\n"
+    "  \x1b[1m\x1b[94m|\x1b[0m\n"
+    "\x1b[1m\x1b[92mhelp\x1b[0m: Remove unused import: `os`\n"
+    "\nFound 1 error.\n"
+)
+
+
+def test_ruffs_own_renderer_is_read_through_its_hyperlinks() -> None:
+    condensed = condense(RUFF_DEFAULT_RENDERER, returncode=1, satisfied=False)
+
+    # Reported in the concise shape even though ruff rendered the other one, so
+    # a reader sees one format regardless of how the command was invoked.
+    assert "/tmp/bad.py:1:8: F401 `os` imported but unused" in condensed
+    assert "F401=1" in condensed
+    assert "Found 1 error." in condensed
+    assert "\x1b" not in condensed
+    assert "^^" not in condensed
+    assert "help:" not in condensed

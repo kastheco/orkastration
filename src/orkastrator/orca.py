@@ -376,8 +376,13 @@ class OrcaClient:
         """
 
         response = await self._ok(
-            "orchestration", "worker-read", "--dispatch", dispatch_id,
-            "--limit", str(limit), "--json",
+            "orchestration",
+            "worker-read",
+            "--dispatch",
+            dispatch_id,
+            "--limit",
+            str(limit),
+            "--json",
         )
         result = _object(response.get("result"), "result")
         transcript = result.get("transcript")
