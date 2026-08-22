@@ -267,6 +267,41 @@ safe to run against a live run. `doctor` reports what is currently being driven:
 uv run --project /home/kas/dev/orkastrator orkas doctor --json | jq .driving
 ```
 
+## Reclaiming terminals
+
+Releasing a settled stage closes the pane orkastrator opened for it. That only covers stages
+dispatched after the handle was recorded on the row, by a supervisor that lived long enough to
+write it. Everything dispatched before that, or by a supervisor that died between `terminal create`
+and the stage row's first update, settles with no local record that a pane was ever opened, and the
+agent tree stays resident with nobody responsible for it.
+
+Orca still knows. `orca orchestration worker-list` maps every Dispatch in a Run to the terminal it
+is attached to, and orkastrator never attaches a worker to a terminal it did not create, so a handle
+on one of its own dispatches is unambiguously its own pane. The owner's sessions, the coordinator
+terminal and the worktree setup panes are not dispatches of this run and are never named.
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas reap <run-id>
+```
+
+```
+run 1f13dd37-342a-4cd1-8137-c9a06fbcaaf3
+
+  to close        0
+  held in flight  1
+  already closed  96
+```
+
+The safety rule is the stage, not the terminal. A pane is a candidate only when its stage is both
+released and processed, meaning orkastrator has consumed that result and nothing is still reading
+it. Everything else is held, whatever Orca reports about it being idle, which is why this is safe to
+run against a live run: the stage in flight lands in `held`. It is a dry run until `--confirm`, and
+it deliberately does not take the run lock, since the case it exists for is a supervisor that is
+already ticking.
+
+If Orca truncates its terminal listing, the plan says so and treats what it could not see as already
+closed. It under-reaps rather than over-reaps; re-run to pick up the rest.
+
 ## Validation output
 
 The supervisor runs each finding's `validation` commands itself and writes the result into the

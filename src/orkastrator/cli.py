@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Coroutine
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Never
 
@@ -26,6 +27,9 @@ from orkastrator.models import (
 )
 from orkastrator.orca import OrcaClient, OrcaError, SubprocessRunner
 from orkastrator.publication import GitHubPublisher, PublicationError
+from orkastrator.reap import ReapPlan
+from orkastrator.reap import build_plan as build_reap_plan
+from orkastrator.reap import render as render_reap_plan
 from orkastrator.report import build_report, render
 from orkastrator.store import StateStore, UnsupportedStateError
 
@@ -286,6 +290,60 @@ def reauthorize(
         for line in _policy_change_lines(run_id, result):
             typer.echo(line)
     _emit(result.model_dump(mode="json"), json_output=json_output)
+
+
+@app.command()
+def reap(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Close the panes shown by a previous run of this command."),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Close agent terminals a previous supervisor left behind.
+
+    Releasing a settled stage closes the pane orkastrator opened for it, but
+    only for stages dispatched after the handle was recorded on the row. Older
+    stages, and stages whose supervisor died between opening the terminal and
+    writing the row, settle with no local record and their agent tree stays
+    resident. Orca still knows which terminal each Dispatch was attached to.
+
+    A pane is only a candidate when its stage is both released and processed,
+    so the stage in flight is held whatever Orca reports about it. That is what
+    makes this safe to run against a live run, and it deliberately does not take
+    the run lock, since the case it exists for is a supervisor already ticking.
+
+    Without `--confirm` this prints what it would close and closes nothing:
+    which panes it thinks are yours is the whole question.
+    """
+
+    async def sweep() -> ReapPlan:
+        _, store, orca = _components()
+        record = store.run(run_id)
+        if record.orca_run_id is None:
+            raise ValueError(f"run {run_id} has no accepted Orca Run to sweep")
+        plan = build_reap_plan(
+            run_id=run_id,
+            lanes=store.lanes(run_id),
+            stages=store.stages(run_id),
+            attached=await orca.worker_terminals(record.orca_run_id),
+            terminals=await orca.open_terminals(),
+        )
+        if not confirm:
+            return plan
+        for target in plan.close:
+            await orca.close_terminal(target.terminal_handle)
+        return replace(plan, closed=tuple(target.terminal_handle for target in plan.close))
+
+    try:
+        plan = asyncio.run(sweep())
+    except (ConfigError, OrcaError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    if json_output:
+        _emit(plan.to_dict(), json_output=True)
+        return
+    typer.echo(render_reap_plan(plan))
 
 
 @app.command(name="show")

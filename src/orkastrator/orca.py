@@ -88,6 +88,14 @@ class SubprocessRunner:
         return cast(JsonObject, value)
 
 
+@dataclass(frozen=True, slots=True)
+class OpenTerminals:
+    """The panes Orca currently lists, and whether that listing was the whole set."""
+
+    handles: frozenset[str]
+    complete: bool
+
+
 class OrcaClient:
     """Typed read and narrowly gated mutation operations."""
 
@@ -428,6 +436,61 @@ class OrcaClient:
         with suppress(OrcaError):
             await self._ok("terminal", "close", "--terminal", terminal_handle, "--json")
         return response
+
+    async def worker_terminals(self, orca_run_id: str) -> dict[str, str]:
+        """Map every Dispatch in one Orca Run to the agent terminal it is attached to.
+
+        Orca is the authority on this and orkastrator's own ledger is not: a
+        stage dispatched before the handle was recorded, or by a supervisor that
+        died between opening the terminal and writing the row, has no local
+        record at all. What makes reading it back safe is that orkastrator never
+        attaches a worker to a terminal it did not create, so a handle on one of
+        its own dispatches is unambiguously its own pane.
+        """
+
+        response = await self._ok("orchestration", "worker-list", "--run", orca_run_id, "--json")
+        result = _object(response.get("result"), "result")
+        workers = result.get("workers")
+        if not isinstance(workers, list):
+            return {}
+        attached: dict[str, str] = {}
+        for worker in workers:
+            if not isinstance(worker, dict):
+                continue
+            dispatch_id = worker.get("dispatchId")
+            handle = worker.get("agentTerminalHandle")
+            if isinstance(dispatch_id, str) and isinstance(handle, str) and handle:
+                attached[dispatch_id] = handle
+        return attached
+
+    async def open_terminals(self) -> OpenTerminals:
+        """Handles Orca still knows about, so a closed pane is never named twice.
+
+        `complete` carries whether Orca truncated the listing. A handle missing
+        from a truncated listing is not necessarily a closed pane, and the caller
+        skips what it cannot see - which is safe but silent, and a sweep that
+        quietly reclaims half of what it should is worse than one that says so.
+        """
+
+        response = await self._ok("terminal", "list", "--json")
+        result = _object(response.get("result"), "result")
+        terminals = result.get("terminals")
+        handles = (
+            frozenset(
+                terminal["handle"]
+                for terminal in terminals
+                if isinstance(terminal, dict) and isinstance(terminal.get("handle"), str)
+            )
+            if isinstance(terminals, list)
+            else frozenset()
+        )
+        return OpenTerminals(handles=handles, complete=result.get("truncated") is not True)
+
+    async def close_terminal(self, terminal_handle: str) -> None:
+        """Close one pane, treating a handle Orca has forgotten as already closed."""
+
+        with suppress(OrcaError):
+            await self._ok("terminal", "close", "--terminal", terminal_handle, "--json")
 
     async def _ok(self, *arguments: str) -> JsonObject:
         response = await self._runner.run(arguments)

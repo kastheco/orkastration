@@ -595,3 +595,65 @@ def test_a_run_without_a_coordinator_handle_is_an_error_not_an_empty_from() -> N
 
     with pytest.raises(OrcaError, match="coordinator_handle"):
         asyncio.run(OrcaClient(runner).coordinator_handle("orca-run-1"))
+
+
+async def test_worker_terminals_maps_dispatches_to_the_panes_orca_attached() -> None:
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "workers": [
+                        {"dispatchId": "ctx-1", "agentTerminalHandle": "term-1"},
+                        {"dispatchId": "ctx-2", "agentTerminalHandle": "term-2"},
+                        # A dispatch Orca has no terminal for is not an entry.
+                        {"dispatchId": "ctx-3", "agentTerminalHandle": None},
+                        {"dispatchId": "ctx-4", "agentTerminalHandle": ""},
+                    ]
+                },
+            }
+        ]
+    )
+
+    attached = await OrcaClient(runner).worker_terminals("run-1")
+
+    assert attached == {"ctx-1": "term-1", "ctx-2": "term-2"}
+    assert runner.calls == [
+        ("orchestration", "worker-list", "--run", "run-1", "--json"),
+    ]
+
+
+async def test_open_terminals_reports_whether_it_saw_the_whole_listing() -> None:
+    listing = await OrcaClient(
+        FakeRunner(
+            [
+                {
+                    "ok": True,
+                    "result": {
+                        "terminals": [{"handle": "term-1"}, {"handle": "term-2"}],
+                        "truncated": True,
+                    },
+                }
+            ]
+        )
+    ).open_terminals()
+
+    assert listing.handles == frozenset({"term-1", "term-2"})
+    # Truncated means a handle missing from this set may still be an open pane.
+    assert listing.complete is False
+
+
+async def test_an_untruncated_listing_is_the_whole_set() -> None:
+    listing = await OrcaClient(
+        FakeRunner([{"ok": True, "result": {"terminals": [{"handle": "term-1"}]}}])
+    ).open_terminals()
+
+    assert listing.complete is True
+
+
+async def test_closing_a_terminal_orca_has_forgotten_is_already_the_outcome() -> None:
+    runner = FakeRunner([{"ok": False, "error": {"message": "unknown terminal"}}])
+
+    await OrcaClient(runner).close_terminal("term-gone")
+
+    assert runner.calls == [("terminal", "close", "--terminal", "term-gone", "--json")]
