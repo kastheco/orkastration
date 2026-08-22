@@ -430,13 +430,15 @@ class EscalationDecision(WorkflowContract):
         "validation_failed",
         "worker_decision",
     ]
-    action: Literal["approve_unchanged", "approve_scope_revision", "defer", "block"]
-    """approve_unchanged means the finding stands exactly as frozen.
+    action: Literal["accept_fix", "approve_unchanged", "approve_scope_revision", "defer", "block"]
+    """Four outcomes an adjudicator reaches, plus the one it used to be forced into.
 
-    An adjudicator that agrees with a finding and agrees its scope is already
-    sufficient used to have no action to name, so it picked block and killed a
-    live finding it had just called correct. Approving without a revision is a
-    real outcome and now has a word.
+    accept_fix settles the finding on the fix already committed: the escalation
+    was about the evidence, not the work, and the adjudicator verified the work
+    itself. approve_unchanged says the finding stands exactly as frozen and wants
+    another attempt. Both used to come out as block, because an adjudicator that
+    agreed with a finding had no other word available, so it killed live work in
+    a rationale that approved it.
     """
 
     rationale: str = Field(min_length=1, max_length=4_000)

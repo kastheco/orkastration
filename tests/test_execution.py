@@ -1039,6 +1039,42 @@ async def test_adjudicator_may_omit_the_revision_of_a_revised_contract(
     assert contract.allowed_write_scope.paths == ["src/file1.py", "src/widened.py"]
 
 
+async def test_accepting_a_verified_fix_settles_the_finding_instead_of_refixing(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+    orca.complete_dispatched(escalation("validation_failed", "accept_fix"))
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.RESOLVED
+    assert store.integrations(run_id)[0].status == "integrated"
+
+
+async def test_accepting_a_fix_that_was_never_committed_blocks(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(status="capability_mismatch"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt(status="capability_mismatch"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("ambiguous_result", "accept_fix"))
+
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+
+
 async def test_approving_a_finding_unchanged_starts_the_next_fix_round(
     tmp_path: Path,
 ) -> None:

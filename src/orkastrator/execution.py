@@ -357,7 +357,7 @@ class ExecutionController:
                 run_id, finding, stage, ReReviewResult.model_validate_json(lifecycle.body)
             )
         elif stage.role is StageKind.ESCALATION:
-            self._apply_escalation(
+            await self._apply_escalation(
                 run_id, finding, stage, EscalationDecision.model_validate_json(lifecycle.body)
             )
 
@@ -604,7 +604,7 @@ class ExecutionController:
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
 
-    def _apply_escalation(
+    async def _apply_escalation(
         self,
         run_id: str,
         finding: FindingRecord,
@@ -633,7 +633,21 @@ class ExecutionController:
             }
         )
         self._store.record_escalation(run_id, finding, stage, decision)
-        if decision.action in {"approve_unchanged", "approve_scope_revision"}:
+        if decision.action == "accept_fix":
+            # The escalation questioned the evidence for a fix, not the fix, and
+            # the adjudicator went and established that evidence itself. Settling
+            # it here is the same integration the re-reviewer would have driven;
+            # sending it back for another round would re-fix working code, and at
+            # the final round would block it outright.
+            attempt = self._store.latest_fix_attempt(finding.finding_key)
+            if attempt is None or attempt.status != "fixed" or attempt.commit_sha is None:
+                self._store.set_finding_state(
+                    run_id, finding.finding_key, phase=FindingPhase.BLOCKED
+                )
+                self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
+                return
+            await self._integrate_fix(run_id, finding, attempt)
+        elif decision.action in {"approve_unchanged", "approve_scope_revision"}:
             limit = self._config.review_cycle.max_fix_rounds_per_finding
             # A conflict is a fact about the lane head moving, not about the fix,
             # which re-review already approved. Re-landing it is a rebase, so it
@@ -1532,10 +1546,12 @@ class ExecutionController:
         schema = json.dumps(EscalationDecision.model_json_schema(), sort_keys=True)
         return (
             f"Adjudicate this finding without silently widening it: {contract}\n"
-            f"Trigger: {finding.escalation_reason}. Choose approve_unchanged when the finding is "
-            "correct and its existing scope already suffices, approve_scope_revision only when "
-            "the scope itself must change, defer when it belongs to another run, and block only "
-            "when the finding's own premise is invalid. finding_id, round, reason and every "
+            f"Trigger: {finding.escalation_reason}. Choose accept_fix when you established "
+            "yourself that the committed fix resolves the finding and only its evidence was "
+            "missing, approve_unchanged when the finding stands as frozen and wants another "
+            "attempt, approve_scope_revision only when the scope itself must change, defer when "
+            "it belongs to another run, and block only when the finding's own premise is "
+            "invalid. finding_id, round, reason and every "
             "review_revision are read from the record, so send any placeholder there. Send "
             f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
             f"{context}"
