@@ -617,3 +617,43 @@ def test_a_rebuild_interrupted_before_the_copy_is_finished_on_the_next_setup(
             "SELECT name FROM sqlite_master WHERE name = 'fix_attempts_superseded'"
         ).fetchall()
     assert left == []
+
+
+def test_a_publication_error_streak_counts_up_and_a_pass_resets_it(tmp_path: Path) -> None:
+    """The streak is the whole mechanism, so it is worth pinning on its own.
+
+    "GitHub has not answered yet" and "GitHub says this failed" arrive as the
+    same exception, and telling them apart by reading the message is guesswork
+    that goes stale. Consecutive failures need no taxonomy: the transient case
+    clears itself on the next pass, and the real one does not.
+    """
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(two_lane_proposal())
+    lane, other = store.lanes(run_id)
+
+    assert store.note_publication_error(run_id, lane.lane_id, "required check not found") == 1
+    assert store.note_publication_error(run_id, lane.lane_id, "required check not found") == 2
+
+    # A pass that got an answer ends the streak, whatever the answer was.
+    store.note_publication_progress(run_id, lane.lane_id)
+    assert store.note_publication_error(run_id, lane.lane_id, "still nothing") == 1
+
+    # And one lane's streak is not another's.
+    assert store.note_publication_error(run_id, other.lane_id, "unrelated") == 1
+
+
+def test_a_publication_pass_that_never_failed_records_nothing(tmp_path: Path) -> None:
+    """The healthy path is every tick of every lane, so it must not write."""
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+
+    store.note_publication_progress(run_id, lane.lane_id)
+    store.note_publication_progress(run_id, lane.lane_id)
+
+    kinds = [event["kind"] for event in store.events(run_id)]
+    assert "lane_publication_progress" not in kinds

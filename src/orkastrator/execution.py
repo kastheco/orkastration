@@ -1514,8 +1514,20 @@ class ExecutionController:
                     self._store.record_publication(run_id, lane.lane_id, ready)
                 elif ci.status == "failed":
                     await self._record_ci_failure(run_id, lane, publications, ci)
+                self._store.note_publication_progress(run_id, lane.lane_id)
             except PublicationError as exc:
-                self._store.block_lane(run_id, lane.lane_id, str(exc))
+                # One failed observation is not knowledge. `assistant-kas-576`
+                # blocked one second after pushing its branch, on a required-check
+                # query GitHub had not caught up with yet, and every check was
+                # green by the time anyone looked. Give the remote a few ticks to
+                # answer before calling that the lane's failure.
+                attempts = self._store.note_publication_error(run_id, lane.lane_id, str(exc))
+                if attempts >= _PUBLICATION_ATTEMPTS:
+                    self._store.block_lane(
+                        run_id,
+                        lane.lane_id,
+                        f"{exc} (unchanged over {attempts} publication passes)",
+                    )
 
     def _local_lane_settled(self, run_id: str, lane: LaneRecord) -> bool:
         stages = [item for item in self._store.stages(run_id) if item.lane_id == lane.lane_id]
@@ -1778,6 +1790,13 @@ class ExecutionController:
 
 _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})
 """Stage phases that will never advance again, so a retry needs a new key."""
+
+# How many consecutive failed publication passes make a lane's problem. A remote
+# that has not answered yet and a remote that answered badly produce the same
+# exception, and classifying GitHub's error strings to tell them apart is
+# guesswork that goes stale. Counting them needs no taxonomy: the transient case
+# clears itself on the next tick, and the real one does not.
+_PUBLICATION_ATTEMPTS = 3
 
 _RETRY_MARKER = ":retry"
 """Separates a stage key from the ordinal that makes a repeat of it dispatchable."""

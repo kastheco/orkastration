@@ -2310,7 +2310,9 @@ async def test_a_complete_lane_is_never_touched_by_publication_again(tmp_path: P
     assert store.lanes(run_id)[0].phase is LanePhase.COMPLETE
 
 
-async def test_stale_ci_sha_and_publication_errors_block_the_lane(tmp_path: Path) -> None:
+async def test_stale_ci_sha_and_publication_errors_block_the_lane_once_they_persist(
+    tmp_path: Path,
+) -> None:
     class StalePublisher(FakePublisher):
         async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
             return CiReceipt(provider="github", head_sha="d" * 40, status="passed", checks=[])
@@ -2333,12 +2335,63 @@ async def test_stale_ci_sha_and_publication_errors_block_the_lane(tmp_path: Path
         await value.accept(run_id)
         await advance_to_initial_review(value, orca, run_id)
         orca.complete_dispatched(initial_review_report_json())
+        first = await value.monitor(run_id)
+        assert first.status == "active"
+
+        await value.monitor(run_id)
         result = await value.monitor(run_id)
+
         assert result.status == "blocked"
         blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
         assert blocked
         payload = blocked[-1]["payload"]
-        assert isinstance(payload, dict) and payload["reason"]
+        assert isinstance(payload, dict)
+        assert "unchanged over 3 publication passes" in payload["reason"]
+
+
+async def test_a_remote_that_has_not_answered_yet_is_not_the_lanes_failure(
+    tmp_path: Path,
+) -> None:
+    """`assistant-kas-576` blocked one second after pushing its branch.
+
+    The required-check query ran before GitHub had registered the workflow for
+    that head, so it raised, and the lane was blocked on a run whose checks were
+    all green by the time anybody looked. Nothing about that first answer was
+    knowledge. Give the remote another pass before calling it a failure.
+    """
+
+    class SlowToAnswer(FakePublisher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.queries = 0
+
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            self.queries += 1
+            if self.queries == 1:
+                raise PublicationError(f"no required check has reported for {receipt.head_sha}")
+            return await super().checks(receipt)
+
+    orca = FakeOrca()
+    publisher = SlowToAnswer()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+
+    assert first.status == "active"
+    assert store.lanes(run_id)[0].phase is not LanePhase.BLOCKED
+    errors = [item for item in store.events(run_id) if item["kind"] == "lane_publication_error"]
+    assert len(errors) == 1
+
+    second = await value.monitor(run_id)
+
+    # And the lane finishes on the answer it was always going to get.
+    assert second.status == "complete", store.events(run_id)
+    assert store.publications(run_id)[-1].draft is False
+    assert [item["kind"] for item in store.events(run_id)].count("lane_blocked") == 0
 
 
 async def test_ci_fix_rounds_stop_after_two_failed_republished_heads(tmp_path: Path) -> None:

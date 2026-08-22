@@ -1583,6 +1583,54 @@ class StateStore:
         self.set_lane_phase(run_id, lane_id, LanePhase.BLOCKED)
         self._append_event(run_id, lane_id, "lane_blocked", {"reason": reason[:4_000]})
 
+    def note_publication_error(self, run_id: str, lane_id: str, detail: str) -> int:
+        """Record one failed publication pass, and return how many in a row that is.
+
+        "GitHub has not answered yet" and "GitHub says this failed" are different
+        facts, and only the second is the lane's problem. Telling them apart by
+        reading GitHub's error strings is guesswork that goes stale, so count
+        them instead: one failed observation is not knowledge, several in a row
+        is. That needs no taxonomy and cannot be wrong about a message nobody
+        has seen yet.
+
+        The streak is read from the append-only log and cleared by
+        `note_publication_progress`, so it survives a restart and cannot drift
+        out of step with a column somebody forgot to reset.
+        """
+
+        with self._session() as session:
+            self._event(
+                session, run_id, lane_id, "lane_publication_error", {"detail": detail[:4_000]}
+            )
+            session.commit()
+            return self._publication_error_streak(session, run_id, lane_id)
+
+    def note_publication_progress(self, run_id: str, lane_id: str) -> None:
+        """Record that this lane's publication pass got an answer, ending any streak."""
+
+        with self._session() as session:
+            if self._publication_error_streak(session, run_id, lane_id) == 0:
+                return
+            self._event(session, run_id, lane_id, "lane_publication_progress", {})
+
+    @staticmethod
+    def _publication_error_streak(session: Session, run_id: str, lane_id: str) -> int:
+        rows = session.exec(
+            select(EventRow)
+            .where(
+                EventRow.run_id == run_id,
+                EventRow.lane_id == lane_id,
+                col(EventRow.kind).in_(["lane_publication_error", "lane_publication_progress"]),
+            )
+            .order_by(col(EventRow.created_at).desc(), col(EventRow.event_id).desc())
+        ).all()
+        streak = 0
+        for row in rows:
+            if row.kind != "lane_publication_error":
+                break
+            streak += 1
+        return streak
+
     def resume_lane(self, run_id: str, lane_id: str, note: str) -> None:
         """Lift a lane block, and clear the run status that block wrote.
 
