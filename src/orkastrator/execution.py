@@ -1640,11 +1640,24 @@ def _next_key(settled: set[str], base: str) -> str:
     """Name the next stage under `base`, keeping the first attempt's key intact.
 
     Only keys still under `base` count. A stage retired by a reopen was renamed
-    out of this family on purpose, which frees the base key again.
+    out of this family on purpose, which frees the base key again - and the
+    rename appends its marker, so membership has to be decided on the whole
+    remainder rather than on a prefix. Matching the prefix counted every
+    retired stage as well, which handed a reopened finding an ordinal it had
+    never reached and blocked it on the tick right after the reopen.
     """
 
-    retried = sum(1 for key in settled if key == base or key.startswith(f"{base}{_RETRY_MARKER}"))
+    retried = sum(1 for key in settled if _under_base(key, base))
     return f"{base}{_RETRY_MARKER}{retried}" if retried else base
+
+
+def _under_base(stage_key: str, base: str) -> bool:
+    """Say whether a key is `base` itself or one of its own retries."""
+
+    if stage_key == base:
+        return True
+    prefix = f"{base}{_RETRY_MARKER}"
+    return stage_key.startswith(prefix) and stage_key[len(prefix) :].isdigit()
 
 
 def _retry_ordinal(stage_key: str) -> int:

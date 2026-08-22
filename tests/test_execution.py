@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from orkastrator.config import AgentProfile, GraphConfig
-from orkastrator.execution import ExecutionController
+from orkastrator.execution import ExecutionController, _next_key
 from orkastrator.git import GitCommandResult, LocalGit
 from orkastrator.models import (
     CiCheckResult,
@@ -2056,3 +2056,18 @@ async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
         event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
     ]
     assert any("without a shell" in str(event["payload"]) for event in rejected)
+
+
+def test_a_reopened_stage_no_longer_counts_toward_its_family() -> None:
+    base = "lane:finding-1:escalate:2:validation_failed"
+    settled = {
+        f"{base}:reopened20260822123245",
+        f"{base}:retry1:reopened20260822123245",
+        f"{base}:retry2:reopened20260822123245",
+    }
+
+    # A reopen renames a stage by appending, so a prefix match still saw all
+    # three and handed the finding an ordinal it had never reached - which the
+    # escalation ceiling then read as a loop and blocked on the next tick.
+    assert _next_key(settled, base) == base
+    assert _next_key(settled | {base}, base) == f"{base}:retry1"
