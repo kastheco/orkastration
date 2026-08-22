@@ -315,11 +315,23 @@ dispatches per finding   7.667   (92 adjudication stages / 12 findings)
 repeat rate              0.505   (49 of 97 stages redid attempted work)
 start rejection rate     0.196   (20 of 102 starts; 7 reservations reset)
 findings past round 1    7 of 12
+stages past soft budget  1   (0 released for exceeding a hard budget)
+
+overdue stages were doing
+    3  exec poll loop
+    1  unknown
 ```
 
 Both leading numbers should fall as the graph gets stricter about what it dispatches. Run `report`
 against a run from before a change and one from after: if the two numbers did not move, the change
 did not converge anything, whatever else it improved.
+
+A stage counts once against `stages past soft budget`, however many ticks observe it, and the
+histogram under it says what those stages were doing rather than only that they were late. `exec
+poll loop` is a stage that spent its budget making the same call over and over - a supervisor
+waiting on a subprocess by burning an inference every thirty seconds - and it is the one entry
+there that names waste rather than slowness. `unknown` is a stage that could not be read, which is
+deliberately not folded into a tool bucket.
 
 Escalations are grouped by reason and start rejections by cause rather than by wording, so a class
 that recurs is visible as a count instead of as twenty near-identical strings. A single finding

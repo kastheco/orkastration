@@ -92,6 +92,13 @@ class RunReport:
     rejection_rate: float = 0.0
     escalations_by_reason: dict[str, int] = field(default_factory=dict)
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    overdue_stages: int = 0
+    timed_out_stages: int = 0
+    # What the overdue stages were doing, grouped so the histogram has one entry
+    # per behaviour rather than one per observation. A run whose late stages are
+    # all poll loops has a different problem from one whose late stages are all
+    # working, and only this line tells them apart.
+    overdue_by_activity: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -121,7 +128,8 @@ def build_report(
     escalated: Counter[str] = Counter()
     per_finding_escalations: dict[str, list[str]] = {}
     rejected: Counter[str] = Counter()
-    starts = reset_starts = 0
+    activities: Counter[str] = Counter()
+    starts = reset_starts = overdue = timed_out = 0
     for event in events:
         kind = event.get("kind")
         payload = event.get("payload")
@@ -137,6 +145,11 @@ def build_report(
             reset_starts += 1
         elif kind == "stage_result_rejected":
             rejected[_rejection_class(str(payload.get("reason") or ""))] += 1
+        elif kind == "stage_overdue":
+            overdue += 1
+            activities[_activity_class(payload.get("activity"))] += 1
+        elif kind == "stage_timed_out":
+            timed_out += 1
 
     finding_reports = tuple(
         FindingReport(
@@ -191,6 +204,9 @@ def build_report(
         rejection_rate=_ratio(rejected_total, starts),
         escalations_by_reason=dict(escalated.most_common()),
         rejection_reasons=dict(rejected.most_common()),
+        overdue_stages=overdue,
+        timed_out_stages=timed_out,
+        overdue_by_activity=dict(activities.most_common()),
     )
 
 
@@ -205,6 +221,25 @@ def _repeats_for(stages: list[StageRecord], record: FindingRecord) -> int:
         if stage.lane_id == record.lane_id and stage.finding_id == record.finding_id
     ]
     return len(owned) - len({(stage.role, stage.round) for stage in owned})
+
+
+def _activity_class(activity: object) -> str:
+    """Group an overdue stage's observed activity by behaviour, not by wording.
+
+    `execution._stage_activity` reports either a tool name or that tool plus the
+    ratio of turns that repeated. The ratio is the evidence and it moves every
+    time the stage is looked at, so counting the raw strings would produce a
+    histogram with one entry per observation. What a reader wants is the count
+    of late stages that were burning turns on the same call, which is the
+    presence of "repeated", not its numerator.
+    """
+
+    if not isinstance(activity, str) or not activity.strip():
+        # Unreadable is its own answer. Folding it into a tool bucket would
+        # claim knowledge of a stage nobody could observe.
+        return "unknown"
+    tool, _, rest = activity.partition(" ")
+    return f"{tool} poll loop" if "repeated" in rest else tool
 
 
 def _rejection_class(reason: str) -> str:
@@ -245,7 +280,10 @@ def render(report: RunReport) -> str:
         f"   ({report.rejected_starts} of {report.starts} starts;"
         f" {report.reset_starts} reservations reset)",
         f"  findings past round 1    {report.multi_round_findings} of {len(report.findings)}",
+        f"  stages past soft budget  {report.overdue_stages}"
+        f"   ({report.timed_out_stages} released for exceeding a hard budget)",
     ]
+    lines += _histogram("overdue stages were doing", report.overdue_by_activity)
     lines += _histogram("escalations", report.escalations_by_reason)
     lines += _histogram("start rejections", report.rejection_reasons)
 

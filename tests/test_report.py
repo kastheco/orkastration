@@ -220,6 +220,53 @@ def test_rejections_are_grouped_by_cause_not_by_message():
     assert report.rejection_rate == 1.0
 
 
+def test_late_stages_are_grouped_by_behaviour_not_by_the_ratio_that_proves_it():
+    """A poll loop's ratio moves every observation; the histogram must not."""
+
+    events = [
+        {"kind": "stage_overdue", "payload": {"activity": "exec repeated 9/10 turns unchanged"}},
+        {"kind": "stage_overdue", "payload": {"activity": "exec repeated 16/21 turns unchanged"}},
+        {"kind": "stage_overdue", "payload": {"activity": "exec"}},
+        {"kind": "stage_overdue", "payload": {"activity": None}},
+        {"kind": "stage_timed_out", "payload": {"minutes": 240}},
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=[],
+        findings=[],
+        integrations=[],
+        publications=[],
+        events=events,
+    )
+
+    assert report.overdue_stages == 4
+    assert report.timed_out_stages == 1
+    assert report.overdue_by_activity == {"exec poll loop": 2, "exec": 1, "unknown": 1}
+
+    rendered = render(report)
+    assert "stages past soft budget  4" in rendered
+    assert "exec poll loop" in rendered
+    # The evidence stays out of the histogram, so the line is stable across runs.
+    assert "9/10" not in rendered
+
+
+def test_a_run_with_no_late_stages_says_so_without_an_empty_histogram():
+    report = build_report(
+        run_id="run",
+        lanes=[],
+        stages=[],
+        findings=[],
+        integrations=[],
+        publications=[],
+        events=[],
+    )
+
+    assert report.overdue_by_activity == {}
+    assert "overdue stages were doing" not in render(report)
+
+
 def test_an_empty_run_reports_zeroes_rather_than_dividing_by_zero():
     report = build_report(
         run_id="run",
