@@ -1377,7 +1377,7 @@ async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(
     # rather than the second and final round the ceiling would then close.
     assert result.findings[0].round == 1
     assert result.started[0].role is StageKind.FIXER
-    assert any(":rebase1" in stage.stage_key for stage in store.stages(run_id))
+    assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
 
 
 async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:
@@ -1928,3 +1928,35 @@ async def test_fixer_may_add_its_own_proof_beyond_the_contract(tmp_path: Path) -
 
     assert result.findings[0].escalation_reason is None
     assert [launch.role for launch in result.started] == [StageKind.RE_REVIEWER]
+
+
+async def test_an_adjudicated_retry_at_the_ceiling_is_granted_once(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged"))
+    result = await value.monitor(run_id)
+    assert result.findings[0].round == 2
+
+    orca.complete_dispatched(fix_attempt(round=2, validation=[]))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged", round=2))
+    result = await value.monitor(run_id)
+
+    # The adjudicator read the head itself and asked for one more attempt, so the
+    # ceiling round is re-run rather than closed over verified work.
+    assert result.findings[0].phase is FindingPhase.FIXING
+    assert result.findings[0].round == 2
+    assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
+
+    orca.complete_dispatched(fix_attempt(round=2, validation=[]))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged", round=2))
+    result = await value.monitor(run_id)
+
+    # A second grant would make the ceiling mean nothing, so the finding blocks.
+    assert result.findings[0].phase is FindingPhase.BLOCKED

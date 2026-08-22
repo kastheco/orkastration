@@ -663,6 +663,13 @@ class ExecutionController:
                 retry_round = finding.round if conflicts < limit else finding.round + 1
             else:
                 retry_round = finding.round + 1
+            if retry_round > limit and self._first_adjudicated_retry(run_id, finding, limit):
+                # An adjudicator that inspected the head itself and asked for one
+                # more attempt is supervising, not watching a fixer thrash on one
+                # defect, so it gets a retry at the ceiling round rather than
+                # having verified work thrown away under it. One grant per
+                # finding: a second would make the ceiling mean nothing.
+                retry_round = finding.round
             if retry_round > limit:
                 self._store.set_finding_state(
                     run_id, finding.finding_key, phase=FindingPhase.BLOCKED
@@ -681,6 +688,27 @@ class ExecutionController:
         else:
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
             self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
+
+    def _first_adjudicated_retry(self, run_id: str, finding: FindingRecord, limit: int) -> bool:
+        """Say whether this finding still holds its one supervised retry at the ceiling.
+
+        Spend the grant against the fixer stages that actually ran, not against
+        the decisions that asked for them: an adjudicator repeating itself
+        verbatim records no second row, so counting verdicts would hand out the
+        same retry forever.
+        """
+
+        if finding.round != limit:
+            return False
+        attempts = sum(
+            1
+            for stage in self._store.stages(run_id)
+            if stage.role is StageKind.FIXER
+            and stage.lane_id == finding.lane_id
+            and stage.finding_id == finding.finding_id
+            and stage.round == limit
+        )
+        return attempts == 1
 
     def _reject_stage(self, run_id: str, stage: StageRecord, reason: str) -> None:
         if stage.finding_id is None:
@@ -1019,10 +1047,20 @@ class ExecutionController:
 
     def _ensure_dynamic_stages(self, run_id: str) -> None:
         stages = self._store.stages(run_id)
-        conflicts = Counter(
-            receipt.finding_key
-            for receipt in self._store.integrations(run_id)
-            if receipt.status == "conflict"
+        # A retry re-runs a round the fixer already had a stage for, whether it
+        # was a rebase after a conflict or a supervised second attempt at the
+        # ceiling. Count what has already settled rather than what caused it.
+        settled_fixes = Counter(
+            (stage.lane_id, stage.finding_id, stage.round, stage.attempt_kind)
+            for stage in stages
+            if stage.role is StageKind.FIXER and stage.phase in _SETTLED_STAGES
+        )
+        # Re-review and adjudication belong to one fix attempt, so they carry the
+        # ordinal of the attempt that just settled rather than a per-kind count.
+        settled_rounds = Counter(
+            (stage.lane_id, stage.finding_id, stage.round)
+            for stage in stages
+            if stage.role is StageKind.FIXER and stage.phase in _SETTLED_STAGES
         )
         by_lane: dict[str, list[StageRecord]] = {}
         for stage in stages:
@@ -1055,16 +1093,18 @@ class ExecutionController:
                         if finding.escalation_reason is FindingReason.CAPABILITY_FALLBACK
                         else AttemptKind.PRIMARY
                     )
+                    # A retry re-lands a round that already had a stage, so the key
+                    # carries the retry ordinal or ensure_stage would find the
+                    # settled one and never dispatch a fixer again.
+                    retried = settled_fixes[
+                        (lane.lane_id, finding.finding_id, finding.round, attempt_kind)
+                    ]
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        # A conflict retry re-lands the same round, so the key
-                        # carries the rebase ordinal or ensure_stage would find
-                        # the settled stage and never dispatch the fixer again.
                         stage_key=(
                             f"{lane.lane_id}:{finding.finding_id}:fix:"
-                            f"{finding.round}:{attempt_kind.value}"
-                            f"{_rebase_suffix(conflicts[finding.finding_key])}"
+                            f"{finding.round}:{attempt_kind.value}{_retry_suffix(retried)}"
                         ),
                         role=StageKind.FIXER,
                         finding_key=finding.finding_key,
@@ -1073,11 +1113,13 @@ class ExecutionController:
                         attempt_kind=attempt_kind,
                     )
                 elif finding.phase is FindingPhase.PENDING_RE_REVIEW:
+                    attempts = settled_rounds[(lane.lane_id, finding.finding_id, finding.round)]
+                    cycle = _retry_suffix(max(attempts - 1, 0))
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
                         stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}"
+                            f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}{cycle}"
                         ),
                         role=StageKind.RE_REVIEWER,
                         finding_key=finding.finding_key,
@@ -1086,12 +1128,14 @@ class ExecutionController:
                     )
                 elif finding.phase is FindingPhase.PENDING_ESCALATION:
                     reason = finding.escalation_reason or FindingReason.AMBIGUOUS_RESULT
+                    attempts = settled_rounds[(lane.lane_id, finding.finding_id, finding.round)]
+                    cycle = _retry_suffix(max(attempts - 1, 0))
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
                         stage_key=(
                             f"{lane.lane_id}:{finding.finding_id}:escalate:"
-                            f"{finding.round}:{reason.value}"
+                            f"{finding.round}:{reason.value}{cycle}"
                         ),
                         role=StageKind.ESCALATION,
                         finding_key=finding.finding_key,
@@ -1561,10 +1605,14 @@ class ExecutionController:
         )
 
 
-def _rebase_suffix(conflicts: int) -> str:
-    """Name a conflict retry without renaming the first attempt at a round."""
+_SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})
+"""Stage phases that will never advance again, so a retry needs a new key."""
 
-    return f":rebase{conflicts}" if conflicts else ""
+
+def _retry_suffix(settled: int) -> str:
+    """Name a retry at a round without renaming the first attempt at it."""
+
+    return f":retry{settled}" if settled else ""
 
 
 def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
