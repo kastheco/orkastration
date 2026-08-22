@@ -360,6 +360,10 @@ wall clock by role
     736m  fixer               26 stages  median 11m
     559m  worker               3 stages  median 52m
 
+contested regions
+    6 findings                round 2  app/ui/src/App.tsx
+    4 findings  2 from a fix  round 3  services/control-plane/jobs_control_plane/control_plane.py
+
 overdue stages were doing
     3  exec poll loop
     1  unknown
@@ -393,6 +397,16 @@ different answer. The median is next to the total because those want different f
 expensive because it runs constantly is a graph problem, and one that is expensive because each run
 takes half an hour is a prompt or a tool problem. On the run above, escalation is both - twice the
 fixer's stage count at nearly three times its median.
+
+`contested regions` names files more than one finding landed on. Every other number in the report is
+per finding or per stage, so a run that spends all day arguing with itself about one file scores well
+on all of them: the finding ids are all different, each one is fixed, and the next round produces
+another. Grouping by the path in `evidence[].location` is what makes that visible, and it needs no
+model and no similarity threshold - two findings are about the same place when they cite the same
+place. `from a fix` is the sharp end. A finding whose origin is a previous fix, in a file that
+already had one, is a loop that will not settle by reviewing harder, because the question underneath
+it is a decision rather than a defect. That is the point to stop and ask the owner instead of
+spending another round.
 
 A rejected start is the most expensive thing that can happen: a whole dispatch billed for input,
 output and wall clock, and nothing kept. So the buckets are named for who could have prevented it.

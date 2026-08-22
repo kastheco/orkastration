@@ -34,6 +34,7 @@ from orkastrator.models import (
 )
 
 __all__ = [
+    "ContestedRegion",
     "FindingReport",
     "LaneReport",
     "LiveStage",
@@ -84,6 +85,31 @@ class RoleCost:
     stages: int
     minutes: int
     median_minutes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ContestedRegion:
+    """One file that more than one finding has landed on.
+
+    Findings are identified by id, and a review that keeps circling one design
+    question emits a differently named finding every round: fix the target
+    selection, then the fix over-corrects, then the over-correction is the next
+    round's finding. Counting by id reads that as steady progress. Counting by
+    the file the evidence names reads it as what it is - the same argument, had
+    again, in the same place.
+
+    The path comes straight out of `evidence[].location`, so grouping needs no
+    model and no similarity threshold. `introduced` is the sharp end: a finding
+    whose origin is a previous fix, in a file that already had one, is the exact
+    signature of a loop that cannot settle on its own. That is a question for
+    the owner, not another round.
+    """
+
+    path: str
+    findings: int
+    introduced: int
+    max_round: int
+    finding_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +172,10 @@ class RunReport:
     # dispatches a finding cost; this says which role the hours went to, which is
     # a different question and often a different answer.
     role_costs: tuple[RoleCost, ...] = ()
+    # Files more than one finding landed on, most contested first. Every other
+    # number here is per finding or per stage, so a run that argues with itself
+    # about one file scores well on all of them.
+    contested_regions: tuple[ContestedRegion, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -270,6 +300,14 @@ def build_report(
                 )
             )
 
+    regions: dict[str, list[FindingRecord]] = {}
+    for record in findings:
+        # A finding cites several locations; each names the file it implicates,
+        # and de-duplicating per finding keeps one finding with six hunks in the
+        # same file from reading as six.
+        for path in {evidence.location.path for evidence in record.effective_contract.evidence}:
+            regions.setdefault(path, []).append(record)
+
     rejected_total = sum(rejected.values())
     return RunReport(
         run_id=run_id,
@@ -303,6 +341,24 @@ def build_report(
                     for role, values in spans.items()
                 ),
                 key=lambda item: (-item.minutes, item.role),
+            )
+        ),
+        contested_regions=tuple(
+            sorted(
+                (
+                    ContestedRegion(
+                        path=path,
+                        findings=len(records),
+                        introduced=sum(
+                            1 for record in records if record.origin == "introduced_by_fix"
+                        ),
+                        max_round=max(record.round for record in records),
+                        finding_ids=tuple(sorted(record.finding_id for record in records)),
+                    )
+                    for path, records in regions.items()
+                    if len(records) > 1
+                ),
+                key=lambda item: (-item.findings, -item.introduced, item.path),
             )
         ),
     )
@@ -425,6 +481,14 @@ def render(report: RunReport) -> str:
             f"  {cost.minutes:>5}m  {cost.role:<18}"
             f" {cost.stages:>3} stages  median {cost.median_minutes}m"
             for cost in report.role_costs
+        ]
+    if report.contested_regions:
+        lines += ["", "contested regions"]
+        lines += [
+            f"  {region.findings:>3} findings"
+            + (f"  {region.introduced} from a fix" if region.introduced else " " * 14)
+            + f"  round {region.max_round}  {region.path}"
+            for region in report.contested_regions
         ]
     lines += _histogram("overdue stages were doing", report.overdue_by_activity)
     lines += _histogram("escalations", report.escalations_by_reason)

@@ -23,18 +23,19 @@ from orkastrator.report import build_report, render
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
 
 
-def _contract(finding_id: str) -> ReviewFinding:
+def _contract(finding_id: str, paths: tuple[str, ...] = ("a.py",)) -> ReviewFinding:
     return ReviewFinding(
         id=finding_id,
         evidence=[
             FindingEvidence(
-                location=FindingLocation(path="a.py", start_line=1, end_line=2),
+                location=FindingLocation(path=path, start_line=1, end_line=2),
                 claim="claim",
             )
+            for path in paths
         ],
         failure_mode="fails",
         required_outcome="passes",
-        allowed_write_scope=AllowedWriteScope(paths=["a.py"]),
+        allowed_write_scope=AllowedWriteScope(paths=list(dict.fromkeys(paths))),
     )
 
 
@@ -55,14 +56,22 @@ def _lane(lane_id: str, name: str) -> LaneRecord:
     )
 
 
-def _finding(lane_id: str, finding_id: str, *, phase: str = "resolved", round: int = 1):
+def _finding(
+    lane_id: str,
+    finding_id: str,
+    *,
+    phase: str = "resolved",
+    round: int = 1,
+    origin: str = "initial_review",
+    paths: tuple[str, ...] = ("a.py",),
+):
     return FindingRecord(
         finding_key=f"{lane_id}:{finding_id}",
         lane_id=lane_id,
         finding_id=finding_id,
-        origin="initial_review",
-        contract=_contract(finding_id),
-        effective_contract=_contract(finding_id),
+        origin=origin,
+        contract=_contract(finding_id, paths),
+        effective_contract=_contract(finding_id, paths),
         phase=phase,
         round=round,
         escalation_reason=None,
@@ -462,3 +471,70 @@ def test_the_rendered_report_leads_with_the_two_numbers_that_must_fall():
     assert "repeat rate" in text
     assert "findings past round 1    1 of 1" in text
     assert "finding-one" in text
+
+
+def test_a_file_argued_over_by_several_findings_is_named_once_not_per_finding():
+    """The signature of a loop that cannot settle: same file, new finding id."""
+
+    findings = [
+        # Three separate findings, three different ids, one file. Counted by id
+        # this is progress; counted by file it is the same argument three times.
+        _finding("lane", "finding-target-selection", paths=("upload.py",)),
+        _finding(
+            "lane",
+            "finding-target-overcorrected",
+            origin="introduced_by_fix",
+            paths=("upload.py",),
+            round=2,
+        ),
+        _finding(
+            "lane",
+            "finding-target-diverged",
+            origin="introduced_by_fix",
+            paths=("upload.py", "names.py"),
+            round=3,
+        ),
+        # A file only one finding touched is not contested and is left out.
+        _finding("lane", "finding-elsewhere", paths=("quiet.py",)),
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "alpha")],
+        stages=[],
+        findings=findings,
+        integrations=[],
+        publications=[],
+        events=[],
+        now=NOW,
+    )
+
+    assert [region.path for region in report.contested_regions] == ["upload.py"]
+    contested = report.contested_regions[0]
+    assert (contested.findings, contested.introduced, contested.max_round) == (3, 2, 3)
+    assert contested.finding_ids == (
+        "finding-target-diverged",
+        "finding-target-overcorrected",
+        "finding-target-selection",
+    )
+    rendered = render(report)
+    assert "contested regions" in rendered
+    assert "2 from a fix" in rendered
+    assert "quiet.py" not in rendered
+
+
+def test_one_finding_citing_a_file_six_times_is_not_six_findings():
+    """De-duplicated per finding, so a many-hunk finding cannot fake a dispute."""
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "alpha")],
+        stages=[],
+        findings=[_finding("lane", "finding-one", paths=("upload.py", "upload.py"))],
+        integrations=[],
+        publications=[],
+        events=[],
+        now=NOW,
+    )
+
+    assert report.contested_regions == ()
