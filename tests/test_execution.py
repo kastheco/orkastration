@@ -2973,6 +2973,23 @@ async def test_a_worker_that_cannot_be_read_reports_nothing_rather_than_idle(
     assert [item.activity for item in result.overdue] == [None]
 
 
+async def test_a_stage_calling_different_things_is_named_without_a_moving_count(
+    tmp_path: Path,
+) -> None:
+    """A count that moves every tick reprints the status line on noise."""
+
+    orca = FakeOrca()
+    orca.turns = ["exec:one", "read:two", "exec:three"]
+    value, store = controller(tmp_path, orca, graph_config=budgeted(soft=45, hard=None))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 50)
+
+    result = await value.monitor(run_id)
+
+    assert [item.activity for item in result.overdue] == ["exec"]
+
+
 async def test_a_stage_past_its_hard_budget_is_released_and_dispatched_again(
     tmp_path: Path,
 ) -> None:

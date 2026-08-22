@@ -1442,7 +1442,10 @@ class ExecutionController:
         tool = last.split(":", 1)[0]
         repeated = sum(1 for turn in turns if turn == last)
         if repeated < 3 or repeated * 2 <= len(turns):
-            return f"{tool} ({len(turns)} turns)"
+            # Deliberately not "n turns": the page size is fixed, so that number
+            # moves every tick without the stage changing, and a status line that
+            # reprints on noise stops being read.
+            return tool
         # The whole point of the reading: the same call, over and over, is a
         # stage spending the budget without moving.
         return f"{tool} repeated {repeated}/{len(turns)} turns unchanged"
