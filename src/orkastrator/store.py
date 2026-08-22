@@ -572,6 +572,7 @@ class StateStore:
         worktree_id: str,
         payload: object,
         terminal_handle: str | None = None,
+        start_head_sha: str | None = None,
     ) -> None:
         with self._session() as session:
             row = session.get(WorkflowStageRow, stage_id)
@@ -588,6 +589,9 @@ class StateStore:
             # it opened and the pane leaks for the life of the machine.
             row.orca_terminal_handle = terminal_handle
             row.worktree_id = worktree_id
+            # Written here rather than derived later, because the only moment
+            # this is knowable is before the agent has touched the worktree.
+            row.start_head_sha = start_head_sha
             row.updated_at = _now()
             if row.role == StageKind.WORKER.value:
                 lane = session.get(LaneRow, row.lane_id)
@@ -746,6 +750,10 @@ class StateStore:
             if row.orca_dispatch_id is None or row.result_json is not None:
                 return
             row.orca_dispatch_id = None
+            # The baseline belonged to the dispatch being released. The next one
+            # starts from wherever this dead worker left the worktree, and
+            # keeping the old value would measure the two dispatches together.
+            row.start_head_sha = None
             row.updated_at = _now()
             self._event(
                 session,
@@ -753,6 +761,61 @@ class StateStore:
                 row.lane_id,
                 "stage_dead_dispatch_released",
                 {"stage_id": stage.stage_id},
+            )
+
+    def hold_unreported_dispatch(self, run_id: str, stage: StageRecord) -> None:
+        """Keep a dead dispatch on a stage whose worktree holds unreported work.
+
+        The counterpart to `release_dead_dispatch`, for the case that method
+        reads as a crash and is not one: the worker finished, committed, and
+        died before reporting. Clearing the Dispatch id there sends a fresh
+        agent into a worktree that already contains the answer, and what comes
+        back is an empty result that fails the lane.
+
+        Holding it leaves the stage unstartable, which is the point. There is
+        no result to settle it with and no honest one to synthesise, so the
+        stage stays put and goes overdue on its own budget, which is a signal
+        the owner already watches. Doing nothing visible would be worse than
+        the re-dispatch, hence the event.
+
+        Emitted once per dispatch. Every tick re-observes the same READY task
+        and would otherwise write the same line again, burying the run's real
+        history under a repeated one.
+        """
+
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage.stage_id)
+            if row is None or row.phase != StagePhase.READY.value:
+                return
+            if row.orca_dispatch_id is None or row.result_json is not None:
+                return
+            held = session.exec(
+                select(EventRow).where(
+                    EventRow.run_id == run_id,
+                    EventRow.kind == "stage_unreported_work_held",
+                )
+            ).all()
+            for event in held:
+                payload = json.loads(event.payload_json)
+                if not isinstance(payload, dict):
+                    continue
+                if (payload.get("stage_id"), payload.get("dispatch_id")) == (
+                    stage.stage_id,
+                    row.orca_dispatch_id,
+                ):
+                    return
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "stage_unreported_work_held",
+                {
+                    "stage_id": stage.stage_id,
+                    "stage_key": row.stage_key,
+                    "role": row.role,
+                    "dispatch_id": row.orca_dispatch_id,
+                    "worktree_id": row.worktree_id,
+                },
             )
 
     def stage_clocks(self, run_id: str) -> dict[str, StageClock]:
@@ -2090,6 +2153,7 @@ class StateStore:
             "workflow_stages": (
                 ("worktree_id", "TEXT"),
                 ("orca_terminal_handle", "TEXT"),
+                ("start_head_sha", "TEXT"),
             ),
             "findings": (("dispatch_base_sha", "TEXT"),),
             "acceptance_authorizations": (("config_json", "TEXT"),),
@@ -2174,6 +2238,7 @@ def _stage(row: WorkflowStageRow) -> StageRecord:
         orca_dispatch_id=row.orca_dispatch_id,
         orca_terminal_handle=row.orca_terminal_handle,
         worktree_id=row.worktree_id,
+        start_head_sha=row.start_head_sha,
         result_json=row.result_json,
         processed=row.processed,
         released=row.released,

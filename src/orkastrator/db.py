@@ -96,6 +96,12 @@ class WorkflowStageRow(SQLModel, table=True):
     # agent Orca launched has none, and because rows predate the column.
     orca_terminal_handle: str | None = None
     worktree_id: str | None = None
+    # The worktree head at the moment this Dispatch started, so a stage that
+    # died without reporting can still be asked whether it committed anything.
+    # Null for a stage adopted after the fact, where the work has already
+    # happened and no honest baseline is left to read, and for rows that
+    # predate the column.
+    start_head_sha: str | None = None
     result_json: str | None = None
     processed: bool = False
     released: bool = False

@@ -656,6 +656,10 @@ class StageRecord(BaseModel):
     # one case where releasing the Dispatch reclaims nothing on its own.
     orca_terminal_handle: str | None = None
     worktree_id: str | None
+    # The worktree head this dispatch started from. Only a stage orkastrator
+    # launched itself has one; an adopted stage was already running when it was
+    # found, so there is no before to record.
+    start_head_sha: str | None = None
     result_json: str | None
     processed: bool
     released: bool

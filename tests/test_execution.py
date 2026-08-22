@@ -400,7 +400,13 @@ class FakeGit(LocalGit):
         for number in range(1, 10):
             if f"finding-{number}" in worktree_id:
                 return fixer_sha(f"finding-{number}", 2 if "r2" in worktree_id else 1)
-        raise AssertionError(f"unexpected fake worktree: {worktree_id}")
+        # A worktree no test has given a head to is one nothing has committed
+        # in, which is a fresh checkout sitting on the base `resolve_ref`
+        # reports. Every stage start now reads its worktree head to record the
+        # baseline it will later be measured against, so this is reached for
+        # any lane worktree a test never set up, and raising there would fail
+        # tests that have nothing to do with what is in the worktree.
+        return "a" * 40
 
     async def changed_paths(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
         if self.changed_override is not None and "finding-" in worktree_id:
@@ -1719,6 +1725,54 @@ async def test_a_stage_whose_worker_died_is_dispatched_again(tmp_path: Path) -> 
     assert [launch.role for launch in result.started] == [StageKind.WORKER]
     restarted = [stage for stage in store.stages(run_id) if stage.orca_dispatch_id is not None]
     assert restarted
+
+
+async def test_a_stage_that_committed_before_dying_is_not_dispatched_again(
+    tmp_path: Path,
+) -> None:
+    """Releasing is recovery only when there is nothing to recover.
+
+    `application-lifecycle-kas-580` is the case this exists for. The worker did
+    the whole job, opened the pull request that was merged three hours later,
+    and died before reporting. The stage was released, a fresh agent went into a
+    worktree that already held the finished work, found nothing to do, returned
+    no result, and the lane failed. Re-dispatching cost that run everything and
+    recovered nothing.
+    """
+
+    git = FakeGit()
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    worker = next(stage for stage in store.stages(run_id) if stage.role is StageKind.WORKER)
+    dispatch_id = worker.orca_dispatch_id
+    assert dispatch_id is not None
+    assert worker.worktree_id is not None
+    # The baseline is read at start, before the agent has touched anything.
+    assert worker.start_head_sha == git.heads[worker.worktree_id]
+
+    # What the dead worker left behind: a commit, and no result.
+    git.heads[worker.worktree_id] = "9" * 40
+    orca.abandon_dispatched()
+    result = await value.monitor(run_id)
+
+    assert result.started == []
+    held = next(stage for stage in store.stages(run_id) if stage.role is StageKind.WORKER)
+    assert held.orca_dispatch_id == dispatch_id
+    assert held.result_json is None
+    events = [item for item in store.events(run_id) if item["kind"] == "stage_unreported_work_held"]
+    assert len(events) == 1
+    assert events[0]["payload"]["dispatch_id"] == dispatch_id
+
+    # Every tick re-observes the same ready Task. Saying so once is a record;
+    # saying so forever buries the rest of the run's history.
+    await value.monitor(run_id)
+
+    repeated = [
+        item for item in store.events(run_id) if item["kind"] == "stage_unreported_work_held"
+    ]
+    assert len(repeated) == 1
 
 
 async def test_a_stage_that_reported_keeps_its_dispatch(tmp_path: Path) -> None:

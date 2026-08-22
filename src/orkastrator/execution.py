@@ -249,9 +249,14 @@ class ExecutionController:
             # crashed, or the supervisor exited while its workers were live.
             # The Dispatch id it still carries is dead, and `_start_ready`
             # refuses to start a stage that has one, so clear it and let the
-            # stage be dispatched again.
+            # stage be dispatched again - unless the worktree says the work was
+            # already done, because then re-dispatching destroys a run rather
+            # than recovering one.
             if phase is StagePhase.READY and stage.orca_dispatch_id is not None:
-                self._store.release_dead_dispatch(run_id, stage)
+                if await self._holds_unreported_work(stage):
+                    self._store.hold_unreported_dispatch(run_id, stage)
+                else:
+                    self._store.release_dead_dispatch(run_id, stage)
 
         overdue = await self._enforce_stage_budgets(run_id)
         await self._process_results(run_id)
@@ -1346,6 +1351,43 @@ class ExecutionController:
             self._store.bind_stage_task(run_id, stage.stage_id, task_id)
             locally_bound.add(task_id)
 
+    async def _holds_unreported_work(self, stage: StageRecord) -> bool:
+        """Whether this stage's worktree carries commits the stage never reported.
+
+        `release_dead_dispatch` treats "never reported a result" as "never got
+        anywhere", and for a worker that crashed on the way in that is right.
+        It is wrong for a worker that did the whole job and died on the way out.
+        `application-lifecycle-kas-580` is the second case: the stage was
+        released, a fresh agent was dispatched into a worktree already holding
+        the finished work, it found nothing to do and returned no result, and
+        the lane failed - three hours after the pull request that stage produced
+        had already been merged. Releasing recovered nothing there and cost the
+        run.
+
+        The worktree is the only witness, and the question has to be asked
+        against the head this dispatch started from, not against the lane base.
+        A lane worktree accumulates commits across its stages, so a later stage
+        that genuinely did nothing still sits well ahead of the base, and
+        measuring from there would hold every dispatch in a lane that had ever
+        produced a commit.
+
+        Fails toward releasing, in all three ways it can fail. A stage with no
+        recorded baseline was adopted rather than launched, so there is no
+        before to compare against. A worktree that cannot be read has usually
+        been removed, and its work is gone with it. Either way re-dispatching is
+        the right answer and the stage keeps today's recovery behaviour. Only a
+        stage that knows where it started, can still read where it is, and finds
+        the two different holds its dispatch.
+        """
+
+        if stage.worktree_id is None or stage.start_head_sha is None:
+            return False
+        try:
+            head = await self._git.head(stage.worktree_id)
+        except GitError:
+            return False
+        return head != stage.start_head_sha
+
     async def _enforce_stage_budgets(self, run_id: str) -> list[OverdueStage]:
         """Answer "has this stage been running longer than its budget" from the clock.
 
@@ -1539,8 +1581,22 @@ class ExecutionController:
             parent_worktree_id=placement.parent_worktree_id,
             profile=self._profile(stage),
         )
+        # Read before the agent has had a chance to commit. A stage that later
+        # dies without reporting is asked whether it moved this, which is the
+        # only way to tell a worker that crashed on the way in from one that
+        # finished and crashed on the way out.
+        try:
+            start_head_sha = await self._git.head(worktree_id)
+        except GitError:
+            start_head_sha = None
         self._store.mark_stage_started(
-            run_id, stage.stage_id, dispatch_id, worktree_id, payload, terminal_handle
+            run_id,
+            stage.stage_id,
+            dispatch_id,
+            worktree_id,
+            payload,
+            terminal_handle,
+            start_head_sha,
         )
         if stage.finding_id is not None:
             finding = self._finding_for_stage(run_id, stage)
