@@ -1,16 +1,37 @@
-"""SQLite correlation ledger for dynamic Kasgraph convergence workflows."""
+"""SQLModel correlation ledger for dynamic Kasgraph convergence workflows."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
+from sqlalchemy import event, func, inspect
+from sqlmodel import Session, SQLModel, col, create_engine, select
+
+from kasgraph.db import (
+    AcceptanceAuthorizationRow,
+    CiFailureRow,
+    CiReceiptRow,
+    EscalationRow,
+    EventRow,
+    FindingRow,
+    FixAttemptRow,
+    InitialReviewRow,
+    IntegrationRow,
+    LaneRow,
+    LegacyLaneStageRow,
+    LifecycleReceiptRow,
+    PublicationRow,
+    ReReviewRow,
+    SupervisorRunRow,
+    WorkerResultRow,
+    WorkflowStageRow,
+)
 from kasgraph.models import (
     AcceptanceAuthorization,
     AttemptKind,
@@ -49,6 +70,7 @@ class IntegrationBusyError(RuntimeError):
 
 
 FindingOrigin = Literal["initial_review", "introduced_by_fix", "unrelated", "ci_failure"]
+ContractRow = TypeVar("ContractRow", FixAttemptRow, ReReviewRow, EscalationRow)
 
 
 class StateStore:
@@ -56,165 +78,128 @@ class StateStore:
 
     def __init__(self, path: Path):
         self.path = path
+        self._engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+        event.listen(self._engine, "connect", _enable_sqlite_foreign_keys)
 
     def setup(self) -> None:
-        """Create the v2 schema and reject unsafe accepted fixed-DAG state."""
+        """Create current tables, add compatible columns, and reject v1 active state."""
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connection() as connection:
-            connection.executescript(_SCHEMA)
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(supervisor_runs)").fetchall()
-            }
-            if "orca_run_id" not in columns:
-                connection.execute("ALTER TABLE supervisor_runs ADD COLUMN orca_run_id TEXT")
-            lane_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(lanes)").fetchall()
-            }
-            for name, declaration in (
-                ("base_ref", "TEXT NOT NULL DEFAULT 'HEAD'"),
-                ("review_head_sha", "TEXT"),
-                ("integration_head_sha", "TEXT"),
-            ):
-                if name not in lane_columns:
-                    connection.execute(f"ALTER TABLE lanes ADD COLUMN {name} {declaration}")
-            stage_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(workflow_stages)").fetchall()
-            }
-            if "worktree_id" not in stage_columns:
-                connection.execute("ALTER TABLE workflow_stages ADD COLUMN worktree_id TEXT")
-            integration_columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(integrations)").fetchall()
-            }
-            for name in ("source_commits_json", "source_finding_ids_json"):
-                if name not in integration_columns:
-                    connection.execute(
-                        f"ALTER TABLE integrations ADD COLUMN {name} TEXT NOT NULL DEFAULT '[]'"
-                    )
-            accepted = connection.execute(
-                """
-                SELECT runs.run_id FROM supervisor_runs AS runs
-                WHERE runs.status IN ('proposed', 'active', 'blocked')
-                  AND EXISTS (
-                      SELECT 1 FROM lane_stages
-                      JOIN lanes USING (lane_id)
-                      WHERE lanes.run_id = runs.run_id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM workflow_stages
-                      JOIN lanes USING (lane_id)
-                      WHERE lanes.run_id = runs.run_id
-                  )
-                LIMIT 1
-                """
-            ).fetchone()
-            if accepted is not None:
-                raise UnsupportedStateError(
-                    "v1 fixed-stage state cannot resume in the v2 dynamic scheduler; "
-                    f"finish or archive run {accepted['run_id']} with the previous version"
+        SQLModel.metadata.create_all(self._engine)
+        self._migrate_additive_columns()
+        with self._session() as session:
+            active_runs = session.exec(
+                select(SupervisorRunRow).where(
+                    col(SupervisorRunRow.status).in_(["proposed", "active", "blocked"])
                 )
+            ).all()
+            for run in active_runs:
+                lane_ids = session.exec(
+                    select(LaneRow.lane_id).where(LaneRow.run_id == run.run_id)
+                ).all()
+                if not lane_ids:
+                    continue
+                has_legacy = session.exec(
+                    select(LegacyLaneStageRow.stage_id).where(
+                        col(LegacyLaneStageRow.lane_id).in_(lane_ids)
+                    )
+                ).first()
+                has_dynamic = session.exec(
+                    select(WorkflowStageRow.stage_id).where(
+                        col(WorkflowStageRow.lane_id).in_(lane_ids)
+                    )
+                ).first()
+                if has_legacy is not None and has_dynamic is None:
+                    raise UnsupportedStateError(
+                        "v1 fixed-stage state cannot resume in the v2 dynamic scheduler; "
+                        f"finish or archive run {run.run_id} with the previous version"
+                    )
 
     def record_proposal(self, proposal: SupervisorPlan) -> str:
-        """Record a proposal with only its first worker stage materialized."""
-
         run_id = str(uuid.uuid4())
         now = _now()
-        with self._connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO supervisor_runs
-                    (run_id, objective, status, plan_json, orca_run_id, created_at, updated_at)
-                VALUES (?, ?, 'proposed', ?, NULL, ?, ?)
-                """,
-                (run_id, proposal.objective, proposal.model_dump_json(), now, now),
+        with self._session() as session:
+            session.add(
+                SupervisorRunRow(
+                    run_id=run_id,
+                    objective=proposal.objective,
+                    status="proposed",
+                    plan_json=proposal.model_dump_json(),
+                    created_at=now,
+                    updated_at=now,
+                )
             )
+            session.flush()
             for lane in proposal.lanes:
                 lane_id = str(uuid.uuid4())
-                connection.execute(
-                    """
-                    INSERT INTO lanes
-                        (lane_id, run_id, name, issue_id, repo_selector, base_ref, agent_id, phase,
-                         worktree_id, review_head_sha, integration_head_sha, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'graph', ?, NULL, NULL, NULL, ?, ?)
-                    """,
-                    (
-                        lane_id,
-                        run_id,
-                        lane.name,
-                        lane.issue_id,
-                        lane.repo_selector,
-                        lane.base_ref,
-                        LanePhase.PROPOSED.value,
-                        now,
-                        now,
-                    ),
+                session.add(
+                    LaneRow(
+                        lane_id=lane_id,
+                        run_id=run_id,
+                        name=lane.name,
+                        issue_id=lane.issue_id,
+                        repo_selector=lane.repo_selector,
+                        base_ref=lane.base_ref,
+                        phase=LanePhase.PROPOSED.value,
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
+                session.flush()
                 self._insert_stage(
-                    connection,
+                    session,
                     lane_id=lane_id,
                     stage_key=f"{lane_id}:worker",
                     role=StageKind.WORKER,
                 )
-            self._event(connection, run_id, None, "proposal_recorded", proposal.model_dump())
+            session.flush()
+            self._event(session, run_id, None, "proposal_recorded", proposal.model_dump())
         return run_id
 
     def run(self, run_id: str) -> RunRecord:
-        """Return one recorded run."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM supervisor_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        if row is None:
-            raise KeyError(f"unknown run {run_id}")
-        return _run(row)
+        with self._session() as session:
+            row = session.get(SupervisorRunRow, run_id)
+            if row is None:
+                raise KeyError(f"unknown run {run_id}")
+            return _run(row)
 
     def lanes(self, run_id: str | None = None) -> list[LaneRecord]:
-        """Return lanes in stable creation order."""
-
-        query = "SELECT * FROM lanes"
-        arguments: tuple[str, ...] = ()
-        if run_id is not None:
-            query += " WHERE run_id = ?"
-            arguments = (run_id,)
-        query += " ORDER BY created_at, lane_id"
-        with self._connection() as connection:
-            rows = connection.execute(query, arguments).fetchall()
-        return [_lane(row) for row in rows]
+        with self._session() as session:
+            statement = select(LaneRow)
+            if run_id is not None:
+                statement = statement.where(LaneRow.run_id == run_id)
+            rows = session.exec(
+                statement.order_by(col(LaneRow.created_at), col(LaneRow.lane_id))
+            ).all()
+            return [_lane(row) for row in rows]
 
     def stages(self, run_id: str) -> list[StageRecord]:
-        """Return every dynamically materialized stage for a run."""
-
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT workflow_stages.* FROM workflow_stages JOIN lanes USING (lane_id)
-                WHERE lanes.run_id = ?
-                ORDER BY lanes.created_at, workflow_stages.created_at, workflow_stages.stage_id
-                """,
-                (run_id,),
-            ).fetchall()
-        return [_stage(row) for row in rows]
+        with self._session() as session:
+            rows = session.exec(
+                select(WorkflowStageRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(WorkflowStageRow.lane_id))
+                .where(LaneRow.run_id == run_id)
+                .order_by(
+                    col(LaneRow.created_at),
+                    col(WorkflowStageRow.created_at),
+                    col(WorkflowStageRow.stage_id),
+                )
+            ).all()
+            return [_stage(row) for row in rows]
 
     def findings(self, run_id: str, lane_id: str | None = None) -> list[FindingRecord]:
-        """Return persisted finding contracts in stable creation order."""
-
-        query = """
-            SELECT findings.* FROM findings JOIN lanes USING (lane_id)
-            WHERE lanes.run_id = ?
-        """
-        arguments: tuple[str, ...] = (run_id,)
-        if lane_id is not None:
-            query += " AND findings.lane_id = ?"
-            arguments = (run_id, lane_id)
-        query += " ORDER BY findings.created_at, findings.finding_key"
-        with self._connection() as connection:
-            rows = connection.execute(query, arguments).fetchall()
-        return [_finding(row) for row in rows]
+        with self._session() as session:
+            statement = (
+                select(FindingRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+                .where(LaneRow.run_id == run_id)
+            )
+            if lane_id is not None:
+                statement = statement.where(FindingRow.lane_id == lane_id)
+            rows = session.exec(
+                statement.order_by(col(FindingRow.created_at), col(FindingRow.finding_key))
+            ).all()
+            return [_finding(row) for row in rows]
 
     def ensure_stage(
         self,
@@ -228,231 +213,216 @@ class StateStore:
         round: int | None = None,
         attempt_kind: AttemptKind | None = None,
     ) -> StageRecord:
-        """Create one deterministic stage or return its existing row."""
-
-        with self._connection() as connection:
-            created = self._insert_stage(
-                connection,
-                lane_id=lane_id,
-                stage_key=stage_key,
-                role=role,
-                finding_key=finding_key,
-                finding_id=finding_id,
-                round=round,
-                attempt_kind=attempt_kind,
-            )
-            if created:
+        with self._session() as session:
+            row = session.exec(
+                select(WorkflowStageRow).where(WorkflowStageRow.stage_key == stage_key)
+            ).first()
+            if row is None:
+                self._insert_stage(
+                    session,
+                    lane_id=lane_id,
+                    stage_key=stage_key,
+                    role=role,
+                    finding_key=finding_key,
+                    finding_id=finding_id,
+                    round=round,
+                    attempt_kind=attempt_kind,
+                )
                 self._event(
-                    connection,
+                    session,
                     run_id,
                     lane_id,
                     "stage_created",
                     {"stage_key": stage_key, "role": role.value},
                 )
-            row = connection.execute(
-                "SELECT * FROM workflow_stages WHERE stage_key = ?", (stage_key,)
-            ).fetchone()
-        if row is None:
-            raise RuntimeError(f"stage {stage_key} was not persisted")
-        return _stage(row)
+                session.flush()
+                row = session.exec(
+                    select(WorkflowStageRow).where(WorkflowStageRow.stage_key == stage_key)
+                ).one()
+            return _stage(row)
 
     def mark_accepted(self, run_id: str, orca_run_id: str) -> None:
-        """Bind an accepted proposal to its authoritative Orca Run."""
-
-        now = _now()
-        with self._connection() as connection:
-            changed = connection.execute(
-                """
-                UPDATE supervisor_runs SET status = 'active', orca_run_id = ?, updated_at = ?
-                WHERE run_id = ? AND status = 'proposed'
-                """,
-                (orca_run_id, now, run_id),
-            ).rowcount
-            if changed != 1:
+        with self._session() as session:
+            row = session.get(SupervisorRunRow, run_id)
+            if row is None or row.status != "proposed":
                 raise ValueError(f"run {run_id} is not awaiting acceptance")
-            self._event(connection, run_id, None, "proposal_accepted", {"orca_run_id": orca_run_id})
+            row.status = "active"
+            row.orca_run_id = orca_run_id
+            row.updated_at = _now()
+            self._event(session, run_id, None, "proposal_accepted", {"orca_run_id": orca_run_id})
 
     def record_acceptance_authorization(
         self, run_id: str, authorization: AcceptanceAuthorization
     ) -> None:
-        """Freeze the exact proposal and graph policy accepted by the owner."""
-
         if authorization.run_id != run_id:
             raise ValueError("acceptance authorization does not match its run")
         payload = authorization.model_dump_json()
-        with self._connection() as connection:
-            existing = connection.execute(
-                "SELECT payload_json FROM acceptance_authorizations WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if existing is not None:
-                if str(existing["payload_json"]) != payload:
+        with self._session() as session:
+            row = session.get(AcceptanceAuthorizationRow, run_id)
+            if row is not None:
+                if row.payload_json != payload:
                     raise ValueError("accepted proposal or publication policy changed")
                 return
-            connection.execute(
-                "INSERT INTO acceptance_authorizations VALUES (?, ?, ?)",
-                (run_id, payload, _now()),
+            session.add(
+                AcceptanceAuthorizationRow(run_id=run_id, payload_json=payload, created_at=_now())
             )
-            self._event(
-                connection, run_id, None, "acceptance_authorized", authorization.model_dump()
-            )
+            self._event(session, run_id, None, "acceptance_authorized", authorization.model_dump())
 
     def acceptance_authorization(self, run_id: str) -> AcceptanceAuthorization | None:
-        """Return the frozen external-write authorization for a run."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM acceptance_authorizations WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        return (
-            None
-            if row is None
-            else AcceptanceAuthorization.model_validate_json(str(row["payload_json"]))
-        )
+        with self._session() as session:
+            row = session.get(AcceptanceAuthorizationRow, run_id)
+            return (
+                None
+                if row is None
+                else AcceptanceAuthorization.model_validate_json(row.payload_json)
+            )
 
     def record_publication(self, run_id: str, lane_id: str, receipt: PublicationReceipt) -> None:
-        """Persist or advance one exact-head publication receipt."""
-
         payload = receipt.model_dump_json()
         now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM publications WHERE lane_id = ? AND head_sha = ?",
-                (lane_id, receipt.head_sha),
-            ).fetchone()
+        with self._session() as session:
+            row = session.exec(
+                select(PublicationRow).where(
+                    PublicationRow.lane_id == lane_id,
+                    PublicationRow.head_sha == receipt.head_sha,
+                )
+            ).first()
             if row is None:
-                connection.execute(
-                    "INSERT INTO publications VALUES (?, ?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), lane_id, receipt.head_sha, payload, now, now),
+                session.add(
+                    PublicationRow(
+                        publication_id=str(uuid.uuid4()),
+                        lane_id=lane_id,
+                        head_sha=receipt.head_sha,
+                        payload_json=payload,
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
                 kind = "lane_published"
             else:
-                previous = PublicationReceipt.model_validate_json(str(row["payload_json"]))
+                previous = PublicationReceipt.model_validate_json(row.payload_json)
                 if previous.model_copy(update={"draft": receipt.draft}) != receipt:
                     raise ValueError("publication identity changed for an existing head")
-                connection.execute(
-                    "UPDATE publications SET payload_json = ?, updated_at = ? "
-                    "WHERE lane_id = ? AND head_sha = ?",
-                    (payload, now, lane_id, receipt.head_sha),
-                )
+                row.payload_json = payload
+                row.updated_at = now
                 kind = (
                     "pull_request_ready"
                     if previous.draft and not receipt.draft
                     else "lane_published"
                 )
-            self._event(connection, run_id, lane_id, kind, receipt.model_dump())
+            self._event(session, run_id, lane_id, kind, receipt.model_dump())
 
     def publications(self, run_id: str, lane_id: str | None = None) -> list[PublicationReceipt]:
-        """Return exact-head publication history in creation order."""
-
-        query = (
-            "SELECT publications.payload_json FROM publications "
-            "JOIN lanes USING (lane_id) WHERE lanes.run_id = ?"
-        )
-        arguments: tuple[str, ...] = (run_id,)
-        if lane_id is not None:
-            query += " AND publications.lane_id = ?"
-            arguments = (run_id, lane_id)
-        query += " ORDER BY publications.created_at, publications.publication_id"
-        with self._connection() as connection:
-            rows = connection.execute(query, arguments).fetchall()
-        return [PublicationReceipt.model_validate_json(str(row["payload_json"])) for row in rows]
+        with self._session() as session:
+            statement = (
+                select(PublicationRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(PublicationRow.lane_id))
+                .where(LaneRow.run_id == run_id)
+            )
+            if lane_id is not None:
+                statement = statement.where(PublicationRow.lane_id == lane_id)
+            rows = session.exec(
+                statement.order_by(
+                    col(PublicationRow.created_at), col(PublicationRow.publication_id)
+                )
+            ).all()
+            return [PublicationReceipt.model_validate_json(row.payload_json) for row in rows]
 
     def record_ci_receipt(self, run_id: str, lane_id: str, receipt: CiReceipt) -> None:
-        """Upsert the latest observation for one exact published head."""
-
         payload = receipt.model_dump_json()
         now = _now()
-        with self._connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO ci_receipts
-                    (receipt_id, lane_id, head_sha, payload_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(lane_id, head_sha) DO UPDATE SET payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
-                """,
-                (str(uuid.uuid4()), lane_id, receipt.head_sha, payload, now, now),
-            )
-            self._event(connection, run_id, lane_id, "ci_observed", receipt.model_dump())
+        with self._session() as session:
+            row = session.exec(
+                select(CiReceiptRow).where(
+                    CiReceiptRow.lane_id == lane_id,
+                    CiReceiptRow.head_sha == receipt.head_sha,
+                )
+            ).first()
+            if row is None:
+                session.add(
+                    CiReceiptRow(
+                        receipt_id=str(uuid.uuid4()),
+                        lane_id=lane_id,
+                        head_sha=receipt.head_sha,
+                        payload_json=payload,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                row.payload_json = payload
+                row.updated_at = now
+            self._event(session, run_id, lane_id, "ci_observed", receipt.model_dump())
 
     def ci_receipts(self, run_id: str, lane_id: str | None = None) -> list[CiReceipt]:
-        """Return the latest CI observation for every published head."""
-
-        query = (
-            "SELECT ci_receipts.payload_json FROM ci_receipts "
-            "JOIN lanes USING (lane_id) WHERE lanes.run_id = ?"
-        )
-        arguments: tuple[str, ...] = (run_id,)
-        if lane_id is not None:
-            query += " AND ci_receipts.lane_id = ?"
-            arguments = (run_id, lane_id)
-        query += " ORDER BY ci_receipts.created_at, ci_receipts.receipt_id"
-        with self._connection() as connection:
-            rows = connection.execute(query, arguments).fetchall()
-        return [CiReceipt.model_validate_json(str(row["payload_json"])) for row in rows]
+        with self._session() as session:
+            statement = (
+                select(CiReceiptRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(CiReceiptRow.lane_id))
+                .where(LaneRow.run_id == run_id)
+            )
+            if lane_id is not None:
+                statement = statement.where(CiReceiptRow.lane_id == lane_id)
+            rows = session.exec(
+                statement.order_by(col(CiReceiptRow.created_at), col(CiReceiptRow.receipt_id))
+            ).all()
+            return [CiReceipt.model_validate_json(row.payload_json) for row in rows]
 
     def record_ci_failure(self, run_id: str, lane_id: str, failure: CiFailureFinding) -> bool:
-        """Freeze one typed CI failure contract per exact head."""
-
         payload = failure.model_dump_json()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT payload_json FROM ci_failures WHERE lane_id = ? AND head_sha = ?",
-                (lane_id, failure.published_sha),
-            ).fetchone()
+        with self._session() as session:
+            row = session.exec(
+                select(CiFailureRow).where(
+                    CiFailureRow.lane_id == lane_id,
+                    CiFailureRow.head_sha == failure.published_sha,
+                )
+            ).first()
             if row is not None:
-                if str(row["payload_json"]) != payload:
+                if row.payload_json != payload:
                     raise ValueError("CI failure changed for an existing published head")
                 return False
-            connection.execute(
-                "INSERT INTO ci_failures VALUES (?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), lane_id, failure.published_sha, payload, _now()),
+            session.add(
+                CiFailureRow(
+                    failure_id=str(uuid.uuid4()),
+                    lane_id=lane_id,
+                    head_sha=failure.published_sha,
+                    payload_json=payload,
+                    created_at=_now(),
+                )
             )
-            self._event(connection, run_id, lane_id, "ci_failure_frozen", failure.model_dump())
-        return True
+            self._event(session, run_id, lane_id, "ci_failure_frozen", failure.model_dump())
+            return True
 
     def ci_failures(self, run_id: str, lane_id: str | None = None) -> list[CiFailureFinding]:
-        """Return typed CI failures in observed order."""
-
-        query = (
-            "SELECT ci_failures.payload_json FROM ci_failures "
-            "JOIN lanes USING (lane_id) WHERE lanes.run_id = ?"
-        )
-        arguments: tuple[str, ...] = (run_id,)
-        if lane_id is not None:
-            query += " AND ci_failures.lane_id = ?"
-            arguments = (run_id, lane_id)
-        query += " ORDER BY ci_failures.created_at, ci_failures.failure_id"
-        with self._connection() as connection:
-            rows = connection.execute(query, arguments).fetchall()
-        return [CiFailureFinding.model_validate_json(str(row["payload_json"])) for row in rows]
+        with self._session() as session:
+            statement = (
+                select(CiFailureRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(CiFailureRow.lane_id))
+                .where(LaneRow.run_id == run_id)
+            )
+            if lane_id is not None:
+                statement = statement.where(CiFailureRow.lane_id == lane_id)
+            rows = session.exec(
+                statement.order_by(col(CiFailureRow.created_at), col(CiFailureRow.failure_id))
+            ).all()
+            return [CiFailureFinding.model_validate_json(row.payload_json) for row in rows]
 
     def bind_stage_task(self, run_id: str, stage_id: str, task_id: str) -> None:
-        """Bind one local stage to its Orca Task idempotently."""
-
-        now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT lane_id, orca_task_id FROM workflow_stages WHERE stage_id = ?",
-                (stage_id,),
-            ).fetchone()
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage_id)
             if row is None:
                 raise KeyError(f"unknown stage {stage_id}")
-            if row["orca_task_id"] is not None:
-                if str(row["orca_task_id"]) != task_id:
+            if row.orca_task_id is not None:
+                if row.orca_task_id != task_id:
                     raise ValueError(f"stage {stage_id} is already bound")
                 return
-            connection.execute(
-                """
-                UPDATE workflow_stages SET orca_task_id = ?, phase = ?, updated_at = ?
-                WHERE stage_id = ?
-                """,
-                (task_id, StagePhase.READY.value, now, stage_id),
-            )
+            row.orca_task_id = task_id
+            row.phase = StagePhase.READY.value
+            row.updated_at = _now()
             self._event(
-                connection,
+                session,
                 run_id,
-                str(row["lane_id"]),
+                row.lane_id,
                 "stage_task_bound",
                 {"stage_id": stage_id, "task_id": task_id},
             )
@@ -465,36 +435,26 @@ class StateStore:
         worktree_id: str,
         payload: object,
     ) -> None:
-        """Record a started Dispatch and its lane worktree."""
-
-        now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT lane_id, role, orca_dispatch_id FROM workflow_stages WHERE stage_id = ?",
-                (stage_id,),
-            ).fetchone()
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage_id)
             if row is None:
                 raise KeyError(f"unknown stage {stage_id}")
-            existing = row["orca_dispatch_id"]
-            if existing is not None:
-                if str(existing) != dispatch_id:
+            if row.orca_dispatch_id is not None:
+                if row.orca_dispatch_id != dispatch_id:
                     raise ValueError(f"stage {stage_id} already has a dispatch")
                 return
-            lane_id = str(row["lane_id"])
-            connection.execute(
-                """
-                UPDATE workflow_stages SET phase = ?, orca_dispatch_id = ?, worktree_id = ?,
-                    updated_at = ?
-                WHERE stage_id = ?
-                """,
-                (StagePhase.DISPATCHED.value, dispatch_id, worktree_id, now, stage_id),
-            )
-            if str(row["role"]) == StageKind.WORKER.value:
-                connection.execute(
-                    "UPDATE lanes SET phase = ?, worktree_id = ?, updated_at = ? WHERE lane_id = ?",
-                    (LanePhase.ACTIVE.value, worktree_id, now, lane_id),
-                )
-            self._event(connection, run_id, lane_id, "stage_started", payload)
+            row.phase = StagePhase.DISPATCHED.value
+            row.orca_dispatch_id = dispatch_id
+            row.worktree_id = worktree_id
+            row.updated_at = _now()
+            if row.role == StageKind.WORKER.value:
+                lane = session.get(LaneRow, row.lane_id)
+                if lane is None:
+                    raise KeyError(f"unknown lane {row.lane_id}")
+                lane.phase = LanePhase.ACTIVE.value
+                lane.worktree_id = worktree_id
+                lane.updated_at = _now()
+            self._event(session, run_id, row.lane_id, "stage_started", payload)
 
     def reserve_stage_start(
         self,
@@ -506,147 +466,99 @@ class StateStore:
         max_lane_fixers: int,
         write_paths: tuple[str, ...] = (),
     ) -> bool:
-        """Atomically reserve global, lane, and fixer capacity before an external start."""
+        """Atomically reserve capacity before an external worker start."""
 
-        now = _now()
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            current = connection.execute(
-                "SELECT phase FROM workflow_stages WHERE stage_id = ?", (stage.stage_id,)
-            ).fetchone()
-            if current is None:
+        active = [StagePhase.STARTING.value, StagePhase.DISPATCHED.value]
+        with self._session(immediate=True) as session:
+            row = session.get(WorkflowStageRow, stage.stage_id)
+            if row is None:
                 raise KeyError(f"unknown stage {stage.stage_id}")
-            if str(current["phase"]) != StagePhase.READY.value:
+            if row.phase != StagePhase.READY.value:
                 return False
-            active_phases = (StagePhase.STARTING.value, StagePhase.DISPATCHED.value)
-            workers = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM workflow_stages WHERE phase IN (?, ?)",
-                    active_phases,
-                ).fetchone()[0]
-            )
+            workers = session.exec(
+                select(func.count())
+                .select_from(WorkflowStageRow)
+                .where(col(WorkflowStageRow.phase).in_(active))
+            ).one()
             if workers >= max_workers:
                 return False
-            active_lane_rows = connection.execute(
-                "SELECT DISTINCT lane_id FROM workflow_stages WHERE phase IN (?, ?)",
-                active_phases,
-            ).fetchall()
-            active_lanes = {str(row["lane_id"]) for row in active_lane_rows}
+            active_lanes = set(
+                session.exec(
+                    select(WorkflowStageRow.lane_id)
+                    .where(col(WorkflowStageRow.phase).in_(active))
+                    .distinct()
+                ).all()
+            )
             if stage.lane_id not in active_lanes and len(active_lanes) >= max_lanes:
                 return False
             if stage.role is StageKind.FIXER:
-                lane_fixers = int(
-                    connection.execute(
-                        """
-                        SELECT COUNT(*) FROM workflow_stages
-                        WHERE lane_id = ? AND role = ? AND phase IN (?, ?)
-                        """,
-                        (
-                            stage.lane_id,
-                            StageKind.FIXER.value,
-                            *active_phases,
-                        ),
-                    ).fetchone()[0]
-                )
-                if lane_fixers >= max_lane_fixers:
-                    return False
-                active_finders = connection.execute(
-                    """
-                    SELECT findings.effective_contract_json FROM workflow_stages
-                    JOIN findings USING (finding_key)
-                    WHERE workflow_stages.lane_id = ? AND workflow_stages.role = ?
-                      AND workflow_stages.phase IN (?, ?)
-                    """,
-                    (stage.lane_id, StageKind.FIXER.value, *active_phases),
-                ).fetchall()
-                for row in active_finders:
-                    contract = ReviewFinding.model_validate_json(
-                        str(row["effective_contract_json"])
+                fixers = session.exec(
+                    select(WorkflowStageRow).where(
+                        WorkflowStageRow.lane_id == stage.lane_id,
+                        WorkflowStageRow.role == StageKind.FIXER.value,
+                        col(WorkflowStageRow.phase).in_(active),
                     )
+                ).all()
+                if len(fixers) >= max_lane_fixers:
+                    return False
+                for fixer in fixers:
+                    if fixer.finding_key is None:
+                        continue
+                    finding = session.get(FindingRow, fixer.finding_key)
+                    if finding is None:
+                        continue
+                    contract = ReviewFinding.model_validate_json(finding.effective_contract_json)
                     if scopes_overlap(write_paths, tuple(contract.allowed_write_scope.paths)):
                         return False
             elif stage.lane_id in active_lanes:
                 return False
-            changed = connection.execute(
-                """
-                UPDATE workflow_stages SET phase = ?, updated_at = ?
-                WHERE stage_id = ? AND phase = ?
-                """,
-                (
-                    StagePhase.STARTING.value,
-                    now,
-                    stage.stage_id,
-                    StagePhase.READY.value,
-                ),
-            ).rowcount
-            if changed:
-                self._event(
-                    connection,
-                    run_id,
-                    stage.lane_id,
-                    "stage_start_reserved",
-                    {"stage_id": stage.stage_id},
-                )
-            return changed == 1
+            row.phase = StagePhase.STARTING.value
+            row.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                stage.lane_id,
+                "stage_start_reserved",
+                {"stage_id": stage.stage_id},
+            )
+            return True
 
     def reset_stage_reservation(self, run_id: str, stage: StageRecord) -> None:
-        """Return a crash-orphaned local reservation to ready when Orca has no Dispatch."""
-
-        now = _now()
-        with self._connection() as connection:
-            changed = connection.execute(
-                """
-                UPDATE workflow_stages SET phase = ?, updated_at = ?
-                WHERE stage_id = ? AND phase = ? AND orca_dispatch_id IS NULL
-                """,
-                (
-                    StagePhase.READY.value,
-                    now,
-                    stage.stage_id,
-                    StagePhase.STARTING.value,
-                ),
-            ).rowcount
-            if changed:
-                self._event(
-                    connection,
-                    run_id,
-                    stage.lane_id,
-                    "stage_start_reservation_reset",
-                    {"stage_id": stage.stage_id},
-                )
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage.stage_id)
+            if (
+                row is None
+                or row.phase != StagePhase.STARTING.value
+                or row.orca_dispatch_id is not None
+            ):
+                return
+            row.phase = StagePhase.READY.value
+            row.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                stage.lane_id,
+                "stage_start_reservation_reset",
+                {"stage_id": stage.stage_id},
+            )
 
     def sync_stage(
-        self,
-        run_id: str,
-        stage_id: str,
-        phase: StagePhase,
-        result_json: str | None,
+        self, run_id: str, stage_id: str, phase: StagePhase, result_json: str | None
     ) -> None:
-        """Idempotently reconcile a stage from authoritative Orca Task state."""
-
-        now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT lane_id, phase, result_json FROM workflow_stages WHERE stage_id = ?",
-                (stage_id,),
-            ).fetchone()
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage_id)
             if row is None:
                 raise KeyError(f"unknown stage {stage_id}")
-            current_result = row["result_json"]
-            next_result = current_result if result_json is None else result_json
-            if str(row["phase"]) == phase.value and current_result == next_result:
+            next_result = row.result_json if result_json is None else result_json
+            if row.phase == phase.value and row.result_json == next_result:
                 return
-            connection.execute(
-                """
-                UPDATE workflow_stages SET phase = ?, result_json = ?, updated_at = ?
-                WHERE stage_id = ?
-                """,
-                (phase.value, next_result, now, stage_id),
-            )
+            row.phase = phase.value
+            row.result_json = next_result
+            row.updated_at = _now()
             self._event(
-                connection,
+                session,
                 run_id,
-                str(row["lane_id"]),
+                row.lane_id,
                 "stage_reconciled",
                 {"stage_id": stage_id, "phase": phase.value},
             )
@@ -654,135 +566,124 @@ class StateStore:
     def record_lifecycle_receipt(
         self, run_id: str, stage: StageRecord, result: OrcaWorkerResult
     ) -> None:
-        """Persist a validated worker report and mark its stage processed once."""
-
         if stage.orca_task_id is None:
             raise ValueError(f"stage {stage.stage_id} has no Orca task")
         payload = result.model_dump_json(by_alias=True)
-        now = _now()
-        with self._connection() as connection:
-            existing = connection.execute(
-                "SELECT payload_json FROM lifecycle_receipts WHERE orca_task_id = ?",
-                (stage.orca_task_id,),
-            ).fetchone()
-            if existing is not None and str(existing["payload_json"]) != payload:
+        with self._session() as session:
+            existing = session.exec(
+                select(LifecycleReceiptRow).where(
+                    LifecycleReceiptRow.orca_task_id == stage.orca_task_id
+                )
+            ).first()
+            if existing is not None and existing.payload_json != payload:
                 raise ValueError(f"Orca task {stage.orca_task_id} changed its lifecycle result")
             if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO lifecycle_receipts
-                        (receipt_id, stage_id, orca_task_id, payload_json, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (str(uuid.uuid4()), stage.stage_id, stage.orca_task_id, payload, now),
+                session.add(
+                    LifecycleReceiptRow(
+                        receipt_id=str(uuid.uuid4()),
+                        stage_id=stage.stage_id,
+                        orca_task_id=stage.orca_task_id,
+                        payload_json=payload,
+                        created_at=_now(),
+                    )
                 )
                 self._event(
-                    connection,
+                    session,
                     run_id,
                     stage.lane_id,
                     "lifecycle_receipt_recorded",
                     {"stage_id": stage.stage_id, "task_id": stage.orca_task_id},
                 )
-            connection.execute(
-                "UPDATE workflow_stages SET processed = 1, updated_at = ? WHERE stage_id = ?",
-                (now, stage.stage_id),
-            )
+            row = session.get(WorkflowStageRow, stage.stage_id)
+            if row is None:
+                raise KeyError(f"unknown stage {stage.stage_id}")
+            row.processed = True
+            row.updated_at = _now()
 
     def mark_stage_processed(self, run_id: str, stage: StageRecord, reason: str) -> None:
-        """Settle an invalid or failed stage so restart reconciliation stays idempotent."""
-
-        now = _now()
-        with self._connection() as connection:
-            changed = connection.execute(
-                """
-                UPDATE workflow_stages SET processed = 1, updated_at = ?
-                WHERE stage_id = ? AND processed = 0
-                """,
-                (now, stage.stage_id),
-            ).rowcount
-            if changed:
-                self._event(
-                    connection,
-                    run_id,
-                    stage.lane_id,
-                    "stage_result_rejected",
-                    {"stage_id": stage.stage_id, "reason": reason},
-                )
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage.stage_id)
+            if row is None or row.processed:
+                return
+            row.processed = True
+            row.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                stage.lane_id,
+                "stage_result_rejected",
+                {"stage_id": stage.stage_id, "reason": reason},
+            )
 
     def record_initial_review(self, run_id: str, lane_id: str, report: InitialReviewReport) -> None:
-        """Freeze one immutable initial review and all of its findings."""
-
         payload = report.model_dump_json()
         now = _now()
-        with self._connection() as connection:
-            existing = connection.execute(
-                "SELECT report_json FROM initial_reviews WHERE lane_id = ?", (lane_id,)
-            ).fetchone()
-            if existing is not None and str(existing["report_json"]) != payload:
-                raise ValueError(f"lane {lane_id} initial review is already frozen")
-            if existing is None:
-                connection.execute(
-                    "INSERT INTO initial_reviews VALUES (?, ?, ?, ?)",
-                    (str(uuid.uuid4()), lane_id, payload, now),
+        with self._session() as session:
+            existing = session.exec(
+                select(InitialReviewRow).where(InitialReviewRow.lane_id == lane_id)
+            ).first()
+            if existing is not None:
+                if existing.report_json != payload:
+                    raise ValueError(f"lane {lane_id} initial review is already frozen")
+                return
+            session.add(
+                InitialReviewRow(
+                    review_id=str(uuid.uuid4()),
+                    lane_id=lane_id,
+                    report_json=payload,
+                    created_at=now,
                 )
-                for finding in report.findings:
-                    self._insert_finding(
-                        connection, lane_id, finding, origin="initial_review", now=now
-                    )
-                self._event(
-                    connection,
-                    run_id,
-                    lane_id,
-                    "initial_review_frozen",
-                    {"finding_ids": [finding.id for finding in report.findings]},
-                )
+            )
+            for finding in report.findings:
+                self._insert_finding(session, lane_id, finding, origin="initial_review", now=now)
+            self._event(
+                session,
+                run_id,
+                lane_id,
+                "initial_review_frozen",
+                {"finding_ids": [finding.id for finding in report.findings]},
+            )
 
     def record_worker_result(self, run_id: str, lane_id: str, result: WorkerResult) -> None:
-        """Persist the immutable changeset identity produced by the lane worker."""
-
         payload = result.model_dump_json()
-        now = _now()
-        with self._connection() as connection:
-            existing = connection.execute(
-                "SELECT result_json FROM worker_results WHERE lane_id = ?", (lane_id,)
-            ).fetchone()
-            if existing is not None and str(existing["result_json"]) != payload:
-                raise ValueError(f"lane {lane_id} worker result changed after persistence")
-            if existing is None:
-                connection.execute(
-                    "INSERT INTO worker_results VALUES (?, ?, ?, ?)",
-                    (str(uuid.uuid4()), lane_id, payload, now),
+        with self._session() as session:
+            existing = session.exec(
+                select(WorkerResultRow).where(WorkerResultRow.lane_id == lane_id)
+            ).first()
+            if existing is not None:
+                if existing.result_json != payload:
+                    raise ValueError(f"lane {lane_id} worker result changed after persistence")
+                return
+            session.add(
+                WorkerResultRow(
+                    result_id=str(uuid.uuid4()),
+                    lane_id=lane_id,
+                    result_json=payload,
+                    created_at=_now(),
                 )
-                self._event(
-                    connection,
-                    run_id,
-                    lane_id,
-                    "worker_result_frozen",
-                    result.model_dump(mode="json"),
-                )
-                connection.execute(
-                    """
-                    UPDATE lanes SET review_head_sha = ?, integration_head_sha = ?, updated_at = ?
-                    WHERE lane_id = ?
-                    """,
-                    (
-                        result.review_revision.head_sha,
-                        result.review_revision.head_sha,
-                        now,
-                        lane_id,
-                    ),
-                )
+            )
+            lane = session.get(LaneRow, lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {lane_id}")
+            lane.review_head_sha = result.review_revision.head_sha
+            lane.integration_head_sha = result.review_revision.head_sha
+            lane.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                lane_id,
+                "worker_result_frozen",
+                result.model_dump(mode="json"),
+            )
 
     def worker_result(self, lane_id: str) -> WorkerResult:
-        """Return the exact worker changeset contract for initial-review pinning."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT result_json FROM worker_results WHERE lane_id = ?", (lane_id,)
-            ).fetchone()
-        if row is None:
-            raise KeyError(f"lane {lane_id} has no worker result")
-        return WorkerResult.model_validate_json(str(row["result_json"]))
+        with self._session() as session:
+            row = session.exec(
+                select(WorkerResultRow).where(WorkerResultRow.lane_id == lane_id)
+            ).first()
+            if row is None:
+                raise KeyError(f"lane {lane_id} has no worker result")
+            return WorkerResult.model_validate_json(row.result_json)
 
     def add_finding(
         self,
@@ -792,26 +693,22 @@ class StateStore:
         *,
         origin: FindingOrigin,
     ) -> FindingRecord:
-        """Persist an introduced or deferred finding without changing prior contracts."""
-
-        now = _now()
-        with self._connection() as connection:
-            created = self._insert_finding(connection, lane_id, finding, origin=origin, now=now)
+        with self._session() as session:
+            created = self._insert_finding(session, lane_id, finding, origin=origin, now=_now())
             if created:
                 self._event(
-                    connection,
+                    session,
                     run_id,
                     lane_id,
                     "finding_recorded",
                     {"finding_id": finding.id, "origin": origin},
                 )
-            row = connection.execute(
-                "SELECT * FROM findings WHERE lane_id = ? AND finding_id = ?",
-                (lane_id, finding.id),
-            ).fetchone()
-        if row is None:
-            raise RuntimeError(f"finding {finding.id} was not persisted")
-        return _finding(row)
+            row = session.exec(
+                select(FindingRow).where(
+                    FindingRow.lane_id == lane_id, FindingRow.finding_id == finding.id
+                )
+            ).one()
+            return _finding(row)
 
     def set_finding_state(
         self,
@@ -823,131 +720,127 @@ class StateStore:
         escalation_reason: FindingReason | None = None,
         effective_contract: ReviewFinding | None = None,
     ) -> None:
-        """Advance a finding while keeping its original contract immutable."""
-
-        now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM findings WHERE finding_key = ?", (finding_key,)
-            ).fetchone()
+        with self._session() as session:
+            row = session.get(FindingRow, finding_key)
             if row is None:
                 raise KeyError(f"unknown finding {finding_key}")
-            next_round = int(row["round"]) if round is None else round
+            next_round = row.round if round is None else round
             contract_json = (
-                str(row["effective_contract_json"])
+                row.effective_contract_json
                 if effective_contract is None
                 else effective_contract.model_dump_json()
             )
+            reason = escalation_reason.value if escalation_reason is not None else None
             if (
-                str(row["phase"]) == phase.value
-                and int(row["round"]) == next_round
-                and row["escalation_reason"]
-                == (escalation_reason.value if escalation_reason is not None else None)
-                and str(row["effective_contract_json"]) == contract_json
+                row.phase == phase.value
+                and row.round == next_round
+                and row.escalation_reason == reason
+                and row.effective_contract_json == contract_json
             ):
                 return
-            connection.execute(
-                """
-                UPDATE findings SET phase = ?, round = ?, escalation_reason = ?,
-                    effective_contract_json = ?, updated_at = ? WHERE finding_key = ?
-                """,
-                (
-                    phase.value,
-                    next_round,
-                    escalation_reason.value if escalation_reason is not None else None,
-                    contract_json,
-                    now,
-                    finding_key,
-                ),
-            )
+            row.phase = phase.value
+            row.round = next_round
+            row.escalation_reason = reason
+            row.effective_contract_json = contract_json
+            row.updated_at = _now()
             self._event(
-                connection,
+                session,
                 run_id,
-                str(row["lane_id"]),
+                row.lane_id,
                 "finding_transitioned",
                 {
-                    "finding_id": str(row["finding_id"]),
+                    "finding_id": row.finding_id,
                     "phase": phase.value,
                     "round": next_round,
-                    "reason": escalation_reason.value if escalation_reason is not None else None,
+                    "reason": reason,
                 },
             )
 
     def record_fix_attempt(
-        self,
-        run_id: str,
-        finding: FindingRecord,
-        stage: StageRecord,
-        attempt: FixAttempt,
+        self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
     ) -> None:
-        """Persist one primary or fallback fixer result exactly once."""
-
         if stage.attempt_kind is None:
             raise ValueError("fixer stage omitted attempt kind")
-        created = self._record_contract(
-            table="fix_attempts",
-            id_column="attempt_id",
-            unique_columns=("finding_key", "round", "attempt_kind"),
-            unique_values=(finding.finding_key, attempt.round, stage.attempt_kind.value),
-            extra_columns=("stage_id",),
-            extra_values=(stage.stage_id,),
-            payload=attempt.model_dump_json(),
-        )
-        if created:
-            self._append_event(
-                run_id,
-                finding.lane_id,
-                "fix_attempt_recorded",
-                {
-                    "finding_id": finding.finding_id,
-                    "round": attempt.round,
-                    "attempt_kind": stage.attempt_kind.value,
-                    "status": attempt.status,
-                },
+        with self._session() as session:
+            existing = session.exec(
+                select(FixAttemptRow).where(
+                    FixAttemptRow.finding_key == finding.finding_key,
+                    FixAttemptRow.round == attempt.round,
+                    FixAttemptRow.attempt_kind == stage.attempt_kind.value,
+                )
+            ).first()
+            created = self._record_contract(
+                session,
+                existing,
+                FixAttemptRow(
+                    attempt_id=str(uuid.uuid4()),
+                    finding_key=finding.finding_key,
+                    round=attempt.round,
+                    attempt_kind=stage.attempt_kind.value,
+                    stage_id=stage.stage_id,
+                    payload_json=attempt.model_dump_json(),
+                    created_at=_now(),
+                ),
+                "fix_attempts",
             )
+            if created:
+                self._event(
+                    session,
+                    run_id,
+                    finding.lane_id,
+                    "fix_attempt_recorded",
+                    {
+                        "finding_id": finding.finding_id,
+                        "round": attempt.round,
+                        "attempt_kind": stage.attempt_kind.value,
+                        "status": attempt.status,
+                    },
+                )
 
     def record_re_review(
-        self,
-        run_id: str,
-        finding: FindingRecord,
-        stage: StageRecord,
-        result: ReReviewResult,
+        self, run_id: str, finding: FindingRecord, stage: StageRecord, result: ReReviewResult
     ) -> None:
-        """Persist one scoped re-review verdict exactly once."""
-
-        created = self._record_contract(
-            table="re_reviews",
-            id_column="review_id",
-            unique_columns=("finding_key", "round"),
-            unique_values=(finding.finding_key, result.round),
-            extra_columns=("stage_id",),
-            extra_values=(stage.stage_id,),
-            payload=result.model_dump_json(),
-        )
-        if created:
-            self._append_event(
-                run_id,
-                finding.lane_id,
-                "re_review_recorded",
-                {
-                    "finding_id": finding.finding_id,
-                    "round": result.round,
-                    "verdict": result.verdict,
-                },
+        with self._session() as session:
+            existing = session.exec(
+                select(ReReviewRow).where(
+                    ReReviewRow.finding_key == finding.finding_key,
+                    ReReviewRow.round == result.round,
+                )
+            ).first()
+            created = self._record_contract(
+                session,
+                existing,
+                ReReviewRow(
+                    review_id=str(uuid.uuid4()),
+                    finding_key=finding.finding_key,
+                    round=result.round,
+                    stage_id=stage.stage_id,
+                    payload_json=result.model_dump_json(),
+                    created_at=_now(),
+                ),
+                "re_reviews",
             )
+            if created:
+                self._event(
+                    session,
+                    run_id,
+                    finding.lane_id,
+                    "re_review_recorded",
+                    {
+                        "finding_id": finding.finding_id,
+                        "round": result.round,
+                        "verdict": result.verdict,
+                    },
+                )
 
     def re_review(self, finding_key: str, round: int) -> ReReviewResult | None:
-        """Return a persisted verdict so partial result application can replay safely."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json FROM re_reviews
-                WHERE finding_key = ? AND round = ?
-                """,
-                (finding_key, round),
-            ).fetchone()
-        return None if row is None else ReReviewResult.model_validate_json(str(row["payload_json"]))
+        with self._session() as session:
+            row = session.exec(
+                select(ReReviewRow).where(
+                    ReReviewRow.finding_key == finding_key, ReReviewRow.round == round
+                )
+            ).first()
+            return None if row is None else ReReviewResult.model_validate_json(row.payload_json)
 
     def record_escalation(
         self,
@@ -956,57 +849,70 @@ class StateStore:
         stage: StageRecord,
         decision: EscalationDecision,
     ) -> None:
-        """Persist one bounded escalation decision exactly once."""
-
-        created = self._record_contract(
-            table="escalations",
-            id_column="escalation_id",
-            unique_columns=("finding_key", "round", "reason"),
-            unique_values=(finding.finding_key, decision.round, decision.reason),
-            extra_columns=("stage_id",),
-            extra_values=(stage.stage_id,),
-            payload=decision.model_dump_json(),
-        )
-        if created:
-            self._append_event(
-                run_id,
-                finding.lane_id,
-                "escalation_recorded",
-                {
-                    "finding_id": finding.finding_id,
-                    "round": decision.round,
-                    "reason": decision.reason,
-                    "action": decision.action,
-                },
+        with self._session() as session:
+            existing = session.exec(
+                select(EscalationRow).where(
+                    EscalationRow.finding_key == finding.finding_key,
+                    EscalationRow.round == decision.round,
+                    EscalationRow.reason == decision.reason,
+                )
+            ).first()
+            created = self._record_contract(
+                session,
+                existing,
+                EscalationRow(
+                    escalation_id=str(uuid.uuid4()),
+                    finding_key=finding.finding_key,
+                    round=decision.round,
+                    reason=decision.reason,
+                    stage_id=stage.stage_id,
+                    payload_json=decision.model_dump_json(),
+                    created_at=_now(),
+                ),
+                "escalations",
             )
+            if created:
+                self._event(
+                    session,
+                    run_id,
+                    finding.lane_id,
+                    "escalation_recorded",
+                    {
+                        "finding_id": finding.finding_id,
+                        "round": decision.round,
+                        "reason": decision.reason,
+                        "action": decision.action,
+                    },
+                )
 
     def latest_fix_attempt(self, finding_key: str) -> FixAttempt | None:
-        """Return the newest persisted fixer contract for re-review context."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json FROM fix_attempts WHERE finding_key = ?
-                ORDER BY round DESC,
-                    CASE attempt_kind WHEN 'fallback' THEN 1 ELSE 0 END DESC LIMIT 1
-                """,
-                (finding_key,),
-            ).fetchone()
-        return None if row is None else FixAttempt.model_validate_json(str(row["payload_json"]))
+        with self._session() as session:
+            rows = list(
+                session.exec(
+                    select(FixAttemptRow)
+                    .where(FixAttemptRow.finding_key == finding_key)
+                    .order_by(col(FixAttemptRow.round).desc())
+                ).all()
+            )
+            if not rows:
+                return None
+            rows.sort(key=lambda row: (row.round, row.attempt_kind == "fallback"), reverse=True)
+            return FixAttempt.model_validate_json(rows[0].payload_json)
 
     def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
-        """Return the effective primary or fallback attempt for one semantic round."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json FROM fix_attempts
-                WHERE finding_key = ? AND round = ?
-                ORDER BY CASE attempt_kind WHEN 'fallback' THEN 1 ELSE 0 END DESC LIMIT 1
-                """,
-                (finding_key, round),
-            ).fetchone()
-        return None if row is None else FixAttempt.model_validate_json(str(row["payload_json"]))
+        with self._session() as session:
+            rows = list(
+                session.exec(
+                    select(FixAttemptRow).where(
+                        FixAttemptRow.finding_key == finding_key,
+                        FixAttemptRow.round == round,
+                    )
+                ).all()
+            )
+            if not rows:
+                return None
+            rows.sort(key=lambda row: row.attempt_kind == "fallback", reverse=True)
+            return FixAttempt.model_validate_json(rows[0].payload_json)
 
     def record_scope_check(
         self,
@@ -1017,8 +923,6 @@ class StateStore:
         actual_paths: list[str],
         accepted: bool,
     ) -> None:
-        """Persist deterministic path-scope evidence for a fixer result."""
-
         self._append_event(
             run_id,
             finding.lane_id,
@@ -1033,27 +937,23 @@ class StateStore:
         )
 
     def integration(self, finding_key: str, round: int) -> IntegrationRecord | None:
-        """Return serial integration state for restart reconciliation."""
-
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM integrations WHERE finding_key = ? AND round = ?",
-                (finding_key, round),
-            ).fetchone()
-        return None if row is None else _integration(row)
+        with self._session() as session:
+            row = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.finding_key == finding_key, IntegrationRow.round == round
+                )
+            ).first()
+            return None if row is None else _integration(row)
 
     def integrations(self, run_id: str) -> list[IntegrationRecord]:
-        """Return every integration receipt for one run in stable order."""
-
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT integrations.* FROM integrations JOIN lanes USING (lane_id)
-                WHERE lanes.run_id = ? ORDER BY integrations.created_at, integration_id
-                """,
-                (run_id,),
-            ).fetchall()
-        return [_integration(row) for row in rows]
+        with self._session() as session:
+            rows = session.exec(
+                select(IntegrationRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(IntegrationRow.lane_id))
+                .where(LaneRow.run_id == run_id)
+                .order_by(col(IntegrationRow.created_at), col(IntegrationRow.integration_id))
+            ).all()
+            return [_integration(row) for row in rows]
 
     def begin_integration(
         self,
@@ -1065,15 +965,13 @@ class StateStore:
         source_finding_ids: list[str],
         base_sha: str,
     ) -> IntegrationRecord:
-        """Reserve one approved commit for serial lane integration."""
-
-        now = _now()
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT * FROM integrations WHERE finding_key = ? AND round = ?",
-                (finding.finding_key, finding.round),
-            ).fetchone()
+        with self._session(immediate=True) as session:
+            existing = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.finding_key == finding.finding_key,
+                    IntegrationRow.round == finding.round,
+                )
+            ).first()
             if existing is not None:
                 record = _integration(existing)
                 if record.fixer_commit_sha != fixer_commit_sha or record.base_sha != base_sha:
@@ -1084,49 +982,38 @@ class StateStore:
                 ):
                     raise ValueError("integration sources changed after reservation")
                 return record
-            active = connection.execute(
-                """
-                SELECT finding_key FROM integrations
-                WHERE lane_id = ? AND status = 'starting' LIMIT 1
-                """,
-                (finding.lane_id,),
-            ).fetchone()
+            active = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.lane_id == finding.lane_id,
+                    IntegrationRow.status == "starting",
+                )
+            ).first()
             if active is not None:
                 raise IntegrationBusyError(f"lane {finding.lane_id} is integrating another finding")
-            integration_id = str(uuid.uuid4())
-            connection.execute(
-                """
-                INSERT INTO integrations
-                    (integration_id, finding_key, lane_id, round, fixer_commit_sha,
-                     source_commits_json, source_finding_ids_json, base_sha, integrated_sha,
-                     status, validation_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'starting', '[]', ?, ?)
-                """,
-                (
-                    integration_id,
-                    finding.finding_key,
-                    finding.lane_id,
-                    finding.round,
-                    fixer_commit_sha,
-                    json.dumps(source_commits),
-                    json.dumps(source_finding_ids),
-                    base_sha,
-                    now,
-                    now,
-                ),
+            row = IntegrationRow(
+                integration_id=str(uuid.uuid4()),
+                finding_key=finding.finding_key,
+                lane_id=finding.lane_id,
+                round=finding.round,
+                fixer_commit_sha=fixer_commit_sha,
+                source_commits_json=json.dumps(source_commits),
+                source_finding_ids_json=json.dumps(source_finding_ids),
+                base_sha=base_sha,
+                status="starting",
+                validation_json="[]",
+                created_at=_now(),
+                updated_at=_now(),
             )
+            session.add(row)
             self._event(
-                connection,
+                session,
                 run_id,
                 finding.lane_id,
                 "integration_started",
                 {"finding_id": finding.finding_id, "commit_sha": fixer_commit_sha},
             )
-            row = connection.execute(
-                "SELECT * FROM integrations WHERE integration_id = ?", (integration_id,)
-            ).fetchone()
-        assert row is not None
-        return _integration(row)
+            session.flush()
+            return _integration(row)
 
     def finish_integration(
         self,
@@ -1137,41 +1024,33 @@ class StateStore:
         integrated_sha: str | None,
         validation_results: list[ValidationResult],
     ) -> None:
-        """Settle an integration and advance the auditable lane head when accepted."""
-
-        now = _now()
-        with self._connection() as connection:
-            changed = connection.execute(
-                """
-                UPDATE integrations SET status = ?, integrated_sha = ?, validation_json = ?,
-                    updated_at = ? WHERE finding_key = ? AND round = ? AND status = 'starting'
-                """,
-                (
-                    status,
-                    integrated_sha,
-                    json.dumps([item.model_dump(mode="json") for item in validation_results]),
-                    now,
-                    finding.finding_key,
-                    finding.round,
-                ),
-            ).rowcount
-            if not changed:
-                existing = connection.execute(
-                    "SELECT * FROM integrations WHERE finding_key = ? AND round = ?",
-                    (finding.finding_key, finding.round),
-                ).fetchone()
-                if existing is None or _integration(existing).status != status:
+        with self._session() as session:
+            row = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.finding_key == finding.finding_key,
+                    IntegrationRow.round == finding.round,
+                )
+            ).first()
+            if row is None or row.status != "starting":
+                if row is None or row.status != status:
                     raise ValueError("integration changed after settlement")
                 return
+            row.status = status
+            row.integrated_sha = integrated_sha
+            row.validation_json = json.dumps(
+                [item.model_dump(mode="json") for item in validation_results]
+            )
+            row.updated_at = _now()
             if status in {"integrated", "validation_failed"}:
                 if integrated_sha is None:
                     raise ValueError("applied integration receipt requires a head SHA")
-                connection.execute(
-                    "UPDATE lanes SET integration_head_sha = ?, updated_at = ? WHERE lane_id = ?",
-                    (integrated_sha, now, finding.lane_id),
-                )
+                lane = session.get(LaneRow, finding.lane_id)
+                if lane is None:
+                    raise KeyError(f"unknown lane {finding.lane_id}")
+                lane.integration_head_sha = integrated_sha
+                lane.updated_at = _now()
             self._event(
-                connection,
+                session,
                 run_id,
                 finding.lane_id,
                 "integration_settled",
@@ -1183,165 +1062,115 @@ class StateStore:
             )
 
     def mark_released(self, run_id: str, stage_id: str) -> None:
-        """Record that Orca released a settled worker terminal."""
-
-        now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT lane_id, released FROM workflow_stages WHERE stage_id = ?", (stage_id,)
-            ).fetchone()
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage_id)
             if row is None:
                 raise KeyError(f"unknown stage {stage_id}")
-            if bool(row["released"]):
+            if row.released:
                 return
-            connection.execute(
-                "UPDATE workflow_stages SET released = 1, updated_at = ? WHERE stage_id = ?",
-                (now, stage_id),
-            )
+            row.released = True
+            row.updated_at = _now()
             self._event(
-                connection,
+                session,
                 run_id,
-                str(row["lane_id"]),
+                row.lane_id,
                 "worker_released",
                 {"stage_id": stage_id},
             )
 
     def set_lane_phase(self, run_id: str, lane_id: str, phase: LanePhase) -> None:
-        """Persist one derived lane phase idempotently."""
-
-        now = _now()
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT phase FROM lanes WHERE lane_id = ?", (lane_id,)
-            ).fetchone()
+        with self._session() as session:
+            row = session.get(LaneRow, lane_id)
             if row is None:
                 raise KeyError(f"unknown lane {lane_id}")
-            if str(row["phase"]) == phase.value:
+            if row.phase == phase.value:
                 return
-            connection.execute(
-                "UPDATE lanes SET phase = ?, updated_at = ? WHERE lane_id = ?",
-                (phase.value, now, lane_id),
-            )
-            self._event(connection, run_id, lane_id, "lane_transitioned", {"phase": phase.value})
+            row.phase = phase.value
+            row.updated_at = _now()
+            self._event(session, run_id, lane_id, "lane_transitioned", {"phase": phase.value})
 
     def block_lane(self, run_id: str, lane_id: str, reason: str) -> None:
-        """Stop one lane and retain an actionable publication or CI reason."""
-
         self.set_lane_phase(run_id, lane_id, LanePhase.BLOCKED)
         self._append_event(run_id, lane_id, "lane_blocked", {"reason": reason[:4_000]})
 
     def set_terminal_status(self, run_id: str, status: str) -> None:
-        """Set the run terminal state without erasing per-lane evidence."""
-
         if status not in {"complete", "failed", "blocked"}:
             raise ValueError(f"invalid terminal status {status}")
-        now = _now()
-        with self._connection() as connection:
-            current = connection.execute(
-                "SELECT status FROM supervisor_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if current is None:
+        with self._session() as session:
+            row = session.get(SupervisorRunRow, run_id)
+            if row is None:
                 raise KeyError(f"unknown run {run_id}")
-            if str(current["status"]) == status:
+            if row.status == status:
                 return
-            connection.execute(
-                "UPDATE supervisor_runs SET status = ?, updated_at = ? WHERE run_id = ?",
-                (status, now, run_id),
-            )
-            self._event(connection, run_id, None, "run_terminal", {"status": status})
+            row.status = status
+            row.updated_at = _now()
+            self._event(session, run_id, None, "run_terminal", {"status": status})
 
     def events(self, run_id: str) -> list[dict[str, object]]:
-        """Return transition evidence for tests and diagnostics."""
-
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT kind, payload_json FROM events
-                WHERE run_id = ? ORDER BY created_at, event_id
-                """,
-                (run_id,),
-            ).fetchall()
-        return [
-            {"kind": str(row["kind"]), "payload": json.loads(str(row["payload_json"]))}
-            for row in rows
-        ]
+        with self._session() as session:
+            rows = session.exec(
+                select(EventRow)
+                .where(EventRow.run_id == run_id)
+                .order_by(col(EventRow.created_at), col(EventRow.event_id))
+            ).all()
+            return [{"kind": row.kind, "payload": json.loads(row.payload_json)} for row in rows]
 
     def counts(self) -> dict[str, int]:
-        """Return small diagnostics for doctor output."""
-
-        with self._connection() as connection:
+        with self._session() as session:
             return {
-                "runs": int(
-                    connection.execute("SELECT COUNT(*) FROM supervisor_runs").fetchone()[0]
-                ),
-                "lanes": int(connection.execute("SELECT COUNT(*) FROM lanes").fetchone()[0]),
-                "stages": int(
-                    connection.execute("SELECT COUNT(*) FROM workflow_stages").fetchone()[0]
-                ),
-                "findings": int(connection.execute("SELECT COUNT(*) FROM findings").fetchone()[0]),
+                "runs": session.exec(select(func.count()).select_from(SupervisorRunRow)).one(),
+                "lanes": session.exec(select(func.count()).select_from(LaneRow)).one(),
+                "stages": session.exec(select(func.count()).select_from(WorkflowStageRow)).one(),
+                "findings": session.exec(select(func.count()).select_from(FindingRow)).one(),
             }
 
     def active_worker_count(self) -> int:
-        """Count dispatched workers across every accepted local run."""
-
-        with self._connection() as connection:
-            return int(
-                connection.execute(
-                    """
-                    SELECT COUNT(*) FROM workflow_stages
-                    WHERE phase IN ('starting', 'dispatched')
-                    """
-                ).fetchone()[0]
-            )
+        with self._session() as session:
+            return session.exec(
+                select(func.count())
+                .select_from(WorkflowStageRow)
+                .where(
+                    col(WorkflowStageRow.phase).in_(
+                        [StagePhase.STARTING.value, StagePhase.DISPATCHED.value]
+                    )
+                )
+            ).one()
 
     def active_lane_ids(self) -> set[str]:
-        """Return lanes with at least one currently dispatched worker."""
-
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT DISTINCT lane_id FROM workflow_stages
-                WHERE phase IN ('starting', 'dispatched')
-                """
-            ).fetchall()
-        return {str(row["lane_id"]) for row in rows}
-
-    def _record_contract(
-        self,
-        *,
-        table: str,
-        id_column: str,
-        unique_columns: tuple[str, ...],
-        unique_values: tuple[object, ...],
-        extra_columns: tuple[str, ...],
-        extra_values: tuple[object, ...],
-        payload: str,
-    ) -> bool:
-        where = " AND ".join(f"{column} = ?" for column in unique_columns)
-        columns = (id_column, *unique_columns, *extra_columns, "payload_json", "created_at")
-        placeholders = ", ".join("?" for _ in columns)
-        with self._connection() as connection:
-            row = connection.execute(
-                f"SELECT payload_json FROM {table} WHERE {where}",
-                unique_values,
-            ).fetchone()
-            if row is not None:
-                if str(row["payload_json"]) != payload:
-                    raise ValueError(f"{table} contract changed after persistence")
-                return False
-            connection.execute(
-                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-                (str(uuid.uuid4()), *unique_values, *extra_values, payload, _now()),
+        with self._session() as session:
+            return set(
+                session.exec(
+                    select(WorkflowStageRow.lane_id)
+                    .where(
+                        col(WorkflowStageRow.phase).in_(
+                            [StagePhase.STARTING.value, StagePhase.DISPATCHED.value]
+                        )
+                    )
+                    .distinct()
+                ).all()
             )
+
+    @staticmethod
+    def _record_contract(
+        session: Session,
+        existing: ContractRow | None,
+        row: ContractRow,
+        table_name: str,
+    ) -> bool:
+        if existing is not None:
+            if existing.payload_json != row.payload_json:
+                raise ValueError(f"{table_name} contract changed after persistence")
+            return False
+        session.add(row)
         return True
 
     def _append_event(self, run_id: str, lane_id: str | None, kind: str, payload: object) -> None:
-        with self._connection() as connection:
-            self._event(connection, run_id, lane_id, kind, payload)
+        with self._session() as session:
+            self._event(session, run_id, lane_id, kind, payload)
 
     @staticmethod
     def _insert_stage(
-        connection: sqlite3.Connection,
+        session: Session,
         *,
         lane_id: str,
         stage_key: str,
@@ -1350,300 +1179,214 @@ class StateStore:
         finding_id: str | None = None,
         round: int | None = None,
         attempt_kind: AttemptKind | None = None,
-    ) -> bool:
+    ) -> None:
         now = _now()
-        changed = connection.execute(
-            """
-            INSERT OR IGNORE INTO workflow_stages
-                (stage_id, stage_key, lane_id, role, finding_key, finding_id, round,
-                 attempt_kind, phase, orca_task_id, orca_dispatch_id, result_json,
-                 processed, released, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, 0, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                stage_key,
-                lane_id,
-                role.value,
-                finding_key,
-                finding_id,
-                round,
-                attempt_kind.value if attempt_kind is not None else None,
-                StagePhase.PENDING.value,
-                now,
-                now,
-            ),
-        ).rowcount
-        return changed == 1
+        session.add(
+            WorkflowStageRow(
+                stage_id=str(uuid.uuid4()),
+                stage_key=stage_key,
+                lane_id=lane_id,
+                role=role.value,
+                finding_key=finding_key,
+                finding_id=finding_id,
+                round=round,
+                attempt_kind=attempt_kind.value if attempt_kind is not None else None,
+                phase=StagePhase.PENDING.value,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
     @staticmethod
     def _insert_finding(
-        connection: sqlite3.Connection,
+        session: Session,
         lane_id: str,
         finding: ReviewFinding,
         *,
         origin: FindingOrigin,
-        now: str,
+        now: datetime,
     ) -> bool:
         payload = finding.model_dump_json()
-        existing = connection.execute(
-            "SELECT contract_json, origin FROM findings WHERE lane_id = ? AND finding_id = ?",
-            (lane_id, finding.id),
-        ).fetchone()
+        existing = session.exec(
+            select(FindingRow).where(
+                FindingRow.lane_id == lane_id, FindingRow.finding_id == finding.id
+            )
+        ).first()
         if existing is not None:
-            if str(existing["contract_json"]) != payload or str(existing["origin"]) != origin:
+            if existing.contract_json != payload or existing.origin != origin:
                 raise ValueError(f"finding {finding.id} changed after it was frozen")
             return False
         phase = FindingPhase.DEFERRED if origin == "unrelated" else FindingPhase.PENDING_FIX
-        connection.execute(
-            """
-            INSERT INTO findings
-                (finding_key, lane_id, finding_id, origin, contract_json,
-                 effective_contract_json, phase, round, escalation_reason, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                lane_id,
-                finding.id,
-                origin,
-                payload,
-                payload,
-                phase.value,
-                now,
-                now,
-            ),
+        session.add(
+            FindingRow(
+                finding_key=str(uuid.uuid4()),
+                lane_id=lane_id,
+                finding_id=finding.id,
+                origin=origin,
+                contract_json=payload,
+                effective_contract_json=payload,
+                phase=phase.value,
+                round=1,
+                created_at=now,
+                updated_at=now,
+            )
         )
         return True
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+    def _session(self, *, immediate: bool = False) -> Iterator[Session]:
+        with Session(self._engine, expire_on_commit=False) as session:
+            if immediate:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+
+    def _migrate_additive_columns(self) -> None:
+        """Keep existing v2 databases readable without destructive migration."""
+
+        columns = {
+            "supervisor_runs": (("orca_run_id", "TEXT"),),
+            "lanes": (
+                ("base_ref", "TEXT NOT NULL DEFAULT 'HEAD'"),
+                ("review_head_sha", "TEXT"),
+                ("integration_head_sha", "TEXT"),
+            ),
+            "workflow_stages": (("worktree_id", "TEXT"),),
+            "integrations": (
+                ("source_commits_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("source_finding_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ),
+        }
+        inspector = inspect(self._engine)
+        with self._engine.begin() as connection:
+            for table, additions in columns.items():
+                if not inspector.has_table(table):
+                    continue
+                existing = {item["name"] for item in inspector.get_columns(table)}
+                for name, declaration in additions:
+                    if name not in existing:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                        )
 
     @staticmethod
     def _event(
-        connection: sqlite3.Connection,
+        session: Session,
         run_id: str,
         lane_id: str | None,
         kind: str,
         payload: object,
     ) -> None:
-        connection.execute(
-            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                run_id,
-                lane_id,
-                kind,
-                json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
-                _now(),
-            ),
+        session.add(
+            EventRow(
+                event_id=str(uuid.uuid4()),
+                run_id=run_id,
+                lane_id=lane_id,
+                kind=kind,
+                payload_json=json.dumps(
+                    payload, sort_keys=True, separators=(",", ":"), default=str
+                ),
+                created_at=_now(),
+            )
         )
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS supervisor_runs (
-    run_id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL,
-    plan_json TEXT NOT NULL, orca_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS lanes (
-    lane_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES supervisor_runs(run_id),
-    name TEXT NOT NULL, issue_id TEXT NOT NULL, repo_selector TEXT NOT NULL,
-    base_ref TEXT NOT NULL DEFAULT 'HEAD', agent_id TEXT NOT NULL DEFAULT 'graph',
-    phase TEXT NOT NULL, worktree_id TEXT, review_head_sha TEXT, integration_head_sha TEXT,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, name)
-);
-CREATE TABLE IF NOT EXISTS lane_stages (
-    stage_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
-    role TEXT NOT NULL, phase TEXT NOT NULL, orca_task_id TEXT, orca_dispatch_id TEXT,
-    released INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    UNIQUE(lane_id, role)
-);
-CREATE TABLE IF NOT EXISTS findings (
-    finding_key TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
-    finding_id TEXT NOT NULL, origin TEXT NOT NULL, contract_json TEXT NOT NULL,
-    effective_contract_json TEXT NOT NULL, phase TEXT NOT NULL, round INTEGER NOT NULL,
-    escalation_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    UNIQUE(lane_id, finding_id)
-);
-CREATE TABLE IF NOT EXISTS workflow_stages (
-    stage_id TEXT PRIMARY KEY, stage_key TEXT NOT NULL UNIQUE,
-    lane_id TEXT NOT NULL REFERENCES lanes(lane_id), role TEXT NOT NULL,
-    finding_key TEXT REFERENCES findings(finding_key), finding_id TEXT, round INTEGER,
-    attempt_kind TEXT, phase TEXT NOT NULL, orca_task_id TEXT UNIQUE,
-    orca_dispatch_id TEXT UNIQUE, worktree_id TEXT, result_json TEXT,
-    processed INTEGER NOT NULL DEFAULT 0,
-    released INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS initial_reviews (
-    review_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL UNIQUE REFERENCES lanes(lane_id),
-    report_json TEXT NOT NULL, created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS worker_results (
-    result_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL UNIQUE REFERENCES lanes(lane_id),
-    result_json TEXT NOT NULL, created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS fix_attempts (
-    attempt_id TEXT PRIMARY KEY, finding_key TEXT NOT NULL REFERENCES findings(finding_key),
-    round INTEGER NOT NULL, attempt_kind TEXT NOT NULL,
-    stage_id TEXT NOT NULL REFERENCES workflow_stages(stage_id), payload_json TEXT NOT NULL,
-    created_at TEXT NOT NULL, UNIQUE(finding_key, round, attempt_kind)
-);
-CREATE TABLE IF NOT EXISTS re_reviews (
-    review_id TEXT PRIMARY KEY, finding_key TEXT NOT NULL REFERENCES findings(finding_key),
-    round INTEGER NOT NULL, stage_id TEXT NOT NULL REFERENCES workflow_stages(stage_id),
-    payload_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(finding_key, round)
-);
-CREATE TABLE IF NOT EXISTS escalations (
-    escalation_id TEXT PRIMARY KEY, finding_key TEXT NOT NULL REFERENCES findings(finding_key),
-    round INTEGER NOT NULL, reason TEXT NOT NULL,
-    stage_id TEXT NOT NULL REFERENCES workflow_stages(stage_id), payload_json TEXT NOT NULL,
-    created_at TEXT NOT NULL, UNIQUE(finding_key, round, reason)
-);
-CREATE TABLE IF NOT EXISTS lifecycle_receipts (
-    receipt_id TEXT PRIMARY KEY, stage_id TEXT NOT NULL UNIQUE REFERENCES workflow_stages(stage_id),
-    orca_task_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS integrations (
-    integration_id TEXT PRIMARY KEY,
-    finding_key TEXT NOT NULL REFERENCES findings(finding_key),
-    lane_id TEXT NOT NULL REFERENCES lanes(lane_id), round INTEGER NOT NULL,
-    fixer_commit_sha TEXT NOT NULL, base_sha TEXT NOT NULL, integrated_sha TEXT,
-    source_commits_json TEXT NOT NULL DEFAULT '[]',
-    source_finding_ids_json TEXT NOT NULL DEFAULT '[]',
-    status TEXT NOT NULL, validation_json TEXT NOT NULL,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    UNIQUE(finding_key, round)
-);
-CREATE TABLE IF NOT EXISTS acceptance_authorizations (
-    run_id TEXT PRIMARY KEY REFERENCES supervisor_runs(run_id),
-    payload_json TEXT NOT NULL, created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS publications (
-    publication_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
-    head_sha TEXT NOT NULL, payload_json TEXT NOT NULL,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(lane_id, head_sha)
-);
-CREATE TABLE IF NOT EXISTS ci_receipts (
-    receipt_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
-    head_sha TEXT NOT NULL, payload_json TEXT NOT NULL,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(lane_id, head_sha)
-);
-CREATE TABLE IF NOT EXISTS ci_failures (
-    failure_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
-    head_sha TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
-    UNIQUE(lane_id, head_sha)
-);
-CREATE TABLE IF NOT EXISTS events (
-    event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES supervisor_runs(run_id),
-    lane_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
-);
-"""
-
-
-def _run(row: sqlite3.Row) -> RunRecord:
+def _run(row: SupervisorRunRow) -> RunRecord:
     return RunRecord(
-        run_id=str(row["run_id"]),
-        status=str(row["status"]),
-        orca_run_id=str(row["orca_run_id"]) if row["orca_run_id"] is not None else None,
-        proposal=SupervisorPlan.model_validate_json(str(row["plan_json"])),
-        created_at=datetime.fromisoformat(str(row["created_at"])),
-        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        run_id=row.run_id,
+        status=row.status,
+        orca_run_id=row.orca_run_id,
+        proposal=SupervisorPlan.model_validate_json(row.plan_json),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
-def _lane(row: sqlite3.Row) -> LaneRecord:
+def _lane(row: LaneRow) -> LaneRecord:
     return LaneRecord(
-        lane_id=str(row["lane_id"]),
-        run_id=str(row["run_id"]),
-        name=str(row["name"]),
-        issue_id=str(row["issue_id"]),
-        repo_selector=str(row["repo_selector"]),
-        base_ref=str(row["base_ref"]),
-        phase=LanePhase(str(row["phase"])),
-        worktree_id=str(row["worktree_id"]) if row["worktree_id"] is not None else None,
-        review_head_sha=(
-            str(row["review_head_sha"]) if row["review_head_sha"] is not None else None
-        ),
-        integration_head_sha=(
-            str(row["integration_head_sha"]) if row["integration_head_sha"] is not None else None
-        ),
-        created_at=datetime.fromisoformat(str(row["created_at"])),
-        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        lane_id=row.lane_id,
+        run_id=row.run_id,
+        name=row.name,
+        issue_id=row.issue_id,
+        repo_selector=row.repo_selector,
+        base_ref=row.base_ref,
+        phase=LanePhase(row.phase),
+        worktree_id=row.worktree_id,
+        review_head_sha=row.review_head_sha,
+        integration_head_sha=row.integration_head_sha,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
-def _stage(row: sqlite3.Row) -> StageRecord:
-    attempt = row["attempt_kind"]
+def _stage(row: WorkflowStageRow) -> StageRecord:
     return StageRecord(
-        stage_id=str(row["stage_id"]),
-        stage_key=str(row["stage_key"]),
-        lane_id=str(row["lane_id"]),
-        role=StageKind(str(row["role"])),
-        finding_id=str(row["finding_id"]) if row["finding_id"] is not None else None,
-        round=int(row["round"]) if row["round"] is not None else None,
-        attempt_kind=AttemptKind(str(attempt)) if attempt is not None else None,
-        phase=StagePhase(str(row["phase"])),
-        orca_task_id=str(row["orca_task_id"]) if row["orca_task_id"] is not None else None,
-        orca_dispatch_id=(
-            str(row["orca_dispatch_id"]) if row["orca_dispatch_id"] is not None else None
-        ),
-        worktree_id=str(row["worktree_id"]) if row["worktree_id"] is not None else None,
-        result_json=str(row["result_json"]) if row["result_json"] is not None else None,
-        processed=bool(row["processed"]),
-        released=bool(row["released"]),
-        created_at=datetime.fromisoformat(str(row["created_at"])),
-        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        stage_id=row.stage_id,
+        stage_key=row.stage_key,
+        lane_id=row.lane_id,
+        role=StageKind(row.role),
+        finding_id=row.finding_id,
+        round=row.round,
+        attempt_kind=AttemptKind(row.attempt_kind) if row.attempt_kind is not None else None,
+        phase=StagePhase(row.phase),
+        orca_task_id=row.orca_task_id,
+        orca_dispatch_id=row.orca_dispatch_id,
+        worktree_id=row.worktree_id,
+        result_json=row.result_json,
+        processed=row.processed,
+        released=row.released,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
-def _finding(row: sqlite3.Row) -> FindingRecord:
+def _finding(row: FindingRow) -> FindingRecord:
     return FindingRecord(
-        finding_key=str(row["finding_key"]),
-        lane_id=str(row["lane_id"]),
-        finding_id=str(row["finding_id"]),
-        origin=str(row["origin"]),
-        contract=ReviewFinding.model_validate_json(str(row["contract_json"])),
-        effective_contract=ReviewFinding.model_validate_json(str(row["effective_contract_json"])),
-        phase=FindingPhase(str(row["phase"])),
-        round=int(row["round"]),
+        finding_key=row.finding_key,
+        lane_id=row.lane_id,
+        finding_id=row.finding_id,
+        origin=row.origin,
+        contract=ReviewFinding.model_validate_json(row.contract_json),
+        effective_contract=ReviewFinding.model_validate_json(row.effective_contract_json),
+        phase=FindingPhase(row.phase),
+        round=row.round,
         escalation_reason=(
-            FindingReason(str(row["escalation_reason"]))
-            if row["escalation_reason"] is not None
-            else None
+            FindingReason(row.escalation_reason) if row.escalation_reason is not None else None
         ),
-        created_at=datetime.fromisoformat(str(row["created_at"])),
-        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
-def _integration(row: sqlite3.Row) -> IntegrationRecord:
+def _integration(row: IntegrationRow) -> IntegrationRecord:
     return IntegrationRecord(
-        integration_id=str(row["integration_id"]),
-        finding_key=str(row["finding_key"]),
-        lane_id=str(row["lane_id"]),
-        round=int(row["round"]),
-        fixer_commit_sha=str(row["fixer_commit_sha"]),
-        source_commits=[str(item) for item in json.loads(str(row["source_commits_json"]))],
-        source_finding_ids=[str(item) for item in json.loads(str(row["source_finding_ids_json"]))],
-        base_sha=str(row["base_sha"]),
-        integrated_sha=(str(row["integrated_sha"]) if row["integrated_sha"] is not None else None),
-        status=str(row["status"]),
+        integration_id=row.integration_id,
+        finding_key=row.finding_key,
+        lane_id=row.lane_id,
+        round=row.round,
+        fixer_commit_sha=row.fixer_commit_sha,
+        source_commits=[str(item) for item in json.loads(row.source_commits_json)],
+        source_finding_ids=[str(item) for item in json.loads(row.source_finding_ids_json)],
+        base_sha=row.base_sha,
+        integrated_sha=row.integrated_sha,
+        status=row.status,
         validation_results=[
-            ValidationResult.model_validate(item)
-            for item in json.loads(str(row["validation_json"]))
+            ValidationResult.model_validate(item) for item in json.loads(row.validation_json)
         ],
-        created_at=datetime.fromisoformat(str(row["created_at"])),
-        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _enable_sqlite_foreign_keys(dbapi_connection: object, _: object) -> None:
+    cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()

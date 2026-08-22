@@ -42,8 +42,10 @@ planner invokes either the installed Codex CLI or Claude Code CLI using their
 saved authentication, supplies `SupervisorPlan.model_json_schema()`, and
 validates the final JSON with Pydantic. It is one non-persistent subprocess per
 planning cycle. Orca remains the execution and worker-lifecycle authority.
-SQLite stores proposals, immutable finding contracts, attempts, verdicts,
-escalation decisions, validated lifecycle receipts, and transition evidence.
+SQLModel provides the typed persistence layer over SQLite for proposals,
+immutable finding contracts, attempts, verdicts, escalation decisions, validated
+lifecycle receipts, publication/CI receipts, and transition evidence. Raw SQL is
+limited to SQLite locking and additive compatibility migrations.
 
 ## Configuration
 
