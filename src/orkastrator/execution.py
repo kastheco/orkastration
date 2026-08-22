@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from pydantic import ValidationError
 
@@ -30,6 +30,7 @@ from orkastrator.models import (
     LaneProposal,
     LaneRecord,
     OrcaWorkerResult,
+    PendingQuestion,
     ProposalReceipt,
     PublicationReceipt,
     ReReviewResult,
@@ -57,6 +58,8 @@ class OrcaGraphController(Protocol):
     async def runs(self) -> list[JsonObject]: ...
 
     async def use_run(self, orca_run_id: str) -> JsonObject: ...
+
+    async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]: ...
 
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]: ...
 
@@ -249,7 +252,57 @@ class ExecutionController:
             findings=self._store.findings(run_id),
             publications=self._store.publications(run_id),
             ci=self._store.ci_receipts(run_id),
+            questions=await self._pending_questions(run_id, run.orca_run_id),
         )
+
+    async def _pending_questions(self, run_id: str, orca_run_id: str) -> list[PendingQuestion]:
+        """Report every unanswered question or escalation raised inside this run.
+
+        Task state calls a blocked agent dispatched, because it is: sitting in its
+        terminal waiting on a decision nobody knows it asked for. Orca already types
+        that traffic, so read it here instead of leaving the supervisor to notice by
+        accident. Attribution to a stage is best-effort - a message that names no
+        known dispatch is still reported, because an unattributable blocked agent is
+        the one most worth seeing.
+        """
+
+        stages = {
+            stage.orca_dispatch_id: stage
+            for stage in self._store.stages(run_id)
+            if stage.orca_dispatch_id is not None
+        }
+        lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
+        messages = await self._orca.messages(orca_run_id)
+        answered = {
+            thread
+            for message in messages
+            if isinstance(thread := message.get("thread_id"), str) and thread != message.get("id")
+        }
+        pending: list[PendingQuestion] = []
+        for message in messages:
+            kind = message.get("type")
+            message_id = message.get("id")
+            if kind not in {"question", "escalation"} or not isinstance(message_id, str):
+                continue
+            if message_id in answered:
+                continue
+            handle = str(message.get("from_handle") or "")
+            stage = next((found for dispatch, found in stages.items() if dispatch in handle), None)
+            pending.append(
+                PendingQuestion(
+                    message_id=message_id,
+                    kind=cast(Literal["question", "escalation"], kind),
+                    from_handle=handle,
+                    lane=lanes[stage.lane_id].name if stage else None,
+                    role=stage.role if stage else None,
+                    dispatch_id=stage.orca_dispatch_id if stage else None,
+                    asked_at=str(message.get("created_at") or ""),
+                    subject=str(message.get("subject") or ""),
+                    body=str(message.get("body") or ""),
+                )
+            )
+        pending.sort(key=lambda question: question.asked_at)
+        return pending
 
     async def _process_results(self, run_id: str) -> None:
         for stage in self._store.stages(run_id):

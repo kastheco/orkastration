@@ -180,6 +180,7 @@ class FakeOrca:
         self.runs_by_id: dict[str, JsonObject] = {}
         self.bound_runs: list[str] = []
         self.unreadable_dispatches: set[str] = set()
+        self.messages_by_run: dict[str, list[JsonObject]] = {}
         self.fail_after_run_create = False
         self.fail_after_task_create = False
         self.fail_after_worker_start = False
@@ -199,6 +200,9 @@ class FakeOrca:
     async def use_run(self, orca_run_id: str) -> JsonObject:
         self.bound_runs.append(orca_run_id)
         return {"ok": True}
+
+    async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]:
+        return list(self.messages_by_run.get(orca_run_id, []))
 
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         task_id = f"task-{len(self.tasks_by_id) + 1}"
@@ -534,6 +538,77 @@ async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Pat
 
     assert result.status == "failed"
     assert result.findings == []
+
+
+def _message(
+    message_id: str,
+    kind: str,
+    *,
+    from_handle: str,
+    thread_id: str | None = None,
+    created_at: str = "2026-08-22T10:16:56Z",
+) -> JsonObject:
+    return {
+        "id": message_id,
+        "type": kind,
+        "from_handle": from_handle,
+        "to_handle": "run:orca-run-1",
+        "thread_id": thread_id if thread_id is not None else message_id,
+        "subject": "Question",
+        "body": "Choose fix or approve.",
+        "created_at": created_at,
+    }
+
+
+async def test_monitor_reports_an_unanswered_question_against_its_stage(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    dispatch_id = accepted.started[0].dispatch_id
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{dispatch_id}"),
+        _message("msg-2", "heartbeat", from_handle=f"dispatch:{dispatch_id}"),
+    ]
+
+    result = await value.monitor(run_id)
+
+    assert [(q.message_id, q.kind, q.lane, q.role) for q in result.questions] == [
+        ("msg-1", "question", "issue-100", StageKind.WORKER)
+    ]
+    assert result.questions[0].dispatch_id == dispatch_id
+
+
+async def test_monitor_drops_a_question_once_it_has_a_reply(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    dispatch_id = accepted.started[0].dispatch_id
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{dispatch_id}"),
+        _message("msg-2", "status", from_handle="run:orca-run-1", thread_id="msg-1"),
+    ]
+
+    result = await value.monitor(run_id)
+
+    assert result.questions == []
+
+
+async def test_monitor_reports_an_escalation_it_cannot_attribute(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-9", "escalation", from_handle="term_unknown"),
+    ]
+
+    result = await value.monitor(run_id)
+
+    assert [(q.message_id, q.lane, q.role, q.dispatch_id) for q in result.questions] == [
+        ("msg-9", None, None, None)
+    ]
 
 
 async def test_initial_review_normalizes_a_differently_computed_diff_digest(

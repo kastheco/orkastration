@@ -135,7 +135,9 @@ def monitor(
         controller = _controller()
         while True:
             result = await controller.monitor(run_id)
-            if not watch or result.status in {"complete", "failed", "blocked"}:
+            # An unanswered question means an agent is parked waiting on a decision
+            # the graph cannot make for it, so watching past it just burns ticks.
+            if not watch or result.questions or result.status in {"complete", "failed", "blocked"}:
                 return result
             await asyncio.sleep(interval)
 

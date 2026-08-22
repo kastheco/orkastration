@@ -136,6 +136,25 @@ class OrcaClient:
             raise OrcaError("Orca task-list response omitted result.tasks")
         return cast(list[JsonObject], tasks)
 
+    async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]:
+        """Read the Run's message log so blocked agents cannot go unnoticed.
+
+        Orca already types a stage's out-of-band traffic: `question` when an agent
+        is waiting on a decision, `escalation` when it gave up waiting. Reconciling
+        Tasks alone reports such a stage as healthily dispatched forever.
+        """
+
+        response = await self._ok("orchestration", "inbox", "--limit", str(limit), "--json")
+        result = _object(response.get("result"), "result")
+        messages = result.get("messages")
+        if not isinstance(messages, list) or not all(isinstance(row, dict) for row in messages):
+            raise OrcaError("Orca inbox response omitted result.messages")
+        return [
+            cast(JsonObject, row)
+            for row in messages
+            if cast(JsonObject, row).get("run_id") == orca_run_id
+        ]
+
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
         """Recover the supervised Dispatch and worktree already attached to a Task."""
 

@@ -450,3 +450,32 @@ async def test_use_run_binds_the_coordinator_terminal() -> None:
     await OrcaClient(runner).use_run("run-1")
 
     assert runner.calls[0] == ("orchestration", "run-use", "--id", "run-1", "--json")
+
+
+async def test_messages_returns_only_the_requested_run() -> None:
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "messages": [
+                        {"id": "msg-1", "run_id": "run-1", "type": "question"},
+                        {"id": "msg-2", "run_id": "run-2", "type": "question"},
+                    ]
+                },
+            }
+        ]
+    )
+    client = OrcaClient(runner)
+
+    messages = await client.messages("run-1")
+
+    assert [message["id"] for message in messages] == ["msg-1"]
+    assert runner.calls[0] == ("orchestration", "inbox", "--limit", "200", "--json")
+
+
+async def test_messages_rejects_a_response_without_a_message_list() -> None:
+    client = OrcaClient(FakeRunner([{"ok": True, "result": {"messages": "none"}}]))
+
+    with pytest.raises(OrcaError, match=r"omitted result\.messages"):
+        await client.messages("run-1")

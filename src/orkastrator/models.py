@@ -622,6 +622,22 @@ class IntegrationRecord(BaseModel):
     updated_at: datetime
 
 
+class PendingQuestion(BaseModel):
+    """One unanswered agent question or escalation raised against a live stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str
+    kind: Literal["question", "escalation"]
+    from_handle: str
+    lane: str | None
+    role: StageKind | None
+    dispatch_id: str | None
+    asked_at: str
+    subject: str
+    body: str
+
+
 class GraphResult(BaseModel):
     """Machine-readable result of accepting or monitoring a graph."""
 
@@ -636,3 +652,4 @@ class GraphResult(BaseModel):
     findings: list[FindingRecord]
     publications: list[PublicationReceipt] = Field(default_factory=list)
     ci: list[CiReceipt] = Field(default_factory=list)
+    questions: list[PendingQuestion] = Field(default_factory=list)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import yaml
@@ -61,6 +62,9 @@ class FakeOrca:
 
 
 class FakeController:
+    parked_question: ClassVar[list[str]] = []
+    monitor_status: ClassVar[str] = "complete"
+
     def propose(self, value: SupervisorPlan) -> ProposalReceipt:
         return ProposalReceipt(run_id="run-1", proposal=value)
 
@@ -68,12 +72,17 @@ class FakeController:
         return StatusResult(run_id=run_id, status="active")
 
     async def monitor(self, run_id: str) -> StatusResult:
-        return StatusResult(run_id=run_id, status="complete")
+        return StatusResult(
+            run_id=run_id,
+            status=type(self).monitor_status,
+            questions=list(type(self).parked_question),
+        )
 
 
 class StatusResult(BaseModel):
     run_id: str
     status: str
+    questions: list[str] = []
 
 
 @pytest.fixture
@@ -180,3 +189,16 @@ def test_controller_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setenv("ORKASTRATOR_DB_PATH", str(tmp_path / "state.sqlite3"))
     monkeypatch.setenv("ORCA_CLI_COMMAND", "orca-ide")
     assert cli._controller() is not None
+
+
+def test_watch_stops_on_a_parked_question(fake_wiring: None) -> None:
+    FakeController.monitor_status = "active"
+    FakeController.parked_question = ["msg-1"]
+    try:
+        result = runner.invoke(cli.app, ["monitor", "run-1", "--watch", "--json"])
+    finally:
+        FakeController.monitor_status = "complete"
+        FakeController.parked_question = []
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["questions"] == ["msg-1"]
