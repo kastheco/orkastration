@@ -491,3 +491,63 @@ def test_a_round_level_contract_constraint_is_rebuilt_around_the_stage(tmp_path:
         rows = connection.execute("SELECT stage_id FROM escalations ORDER BY created_at").fetchall()
     # The first verdict survived the rebuild, and the second round-mate records.
     assert [item[0] for item in rows] == [stage.stage_id, second.stage_id]
+
+
+def test_a_rebuild_interrupted_before_the_copy_is_finished_on_the_next_setup(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "interrupted.sqlite3"
+    store = StateStore(path)
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    stage = store.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key="fix:1",
+        role=StageKind.FIXER,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=1,
+        attempt_kind=AttemptKind.PRIMARY,
+    )
+    store.record_fix_attempt(
+        run_id,
+        finding,
+        stage,
+        FixAttempt(
+            finding_id=finding.finding_id,
+            round=1,
+            status="fixed",
+            base_sha="b" * 40,
+            commit_sha="c" * 40,
+            changed_paths=["src/app.py"],
+            validation_results=[],
+            scope_expansion_required=None,
+        ),
+    )
+    # A rename that landed while the copy did not leaves the rows behind a table
+    # whose shape is already current, so the shape alone cannot detect it.
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = OFF;
+            DROP INDEX ix_fix_attempts_finding_key;
+            ALTER TABLE fix_attempts RENAME TO fix_attempts_superseded;
+            """
+        )
+
+    StateStore(path).setup()
+
+    assert store.latest_fix_attempt(finding.finding_key) is not None
+    with sqlite3.connect(path) as connection:
+        left = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'fix_attempts_superseded'"
+        ).fetchall()
+    assert left == []

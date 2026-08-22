@@ -1416,24 +1416,31 @@ class StateStore:
         for table in self._CONTRACT_TABLES:
             if not inspector.has_table(table):
                 continue
+            superseded = f"{table}_superseded"
             constraints = inspector.get_unique_constraints(table)
-            if all(item["column_names"] == ["stage_id"] for item in constraints):
+            rebuilt = all(item["column_names"] == ["stage_id"] for item in constraints)
+            if rebuilt and not inspector.has_table(superseded):
                 continue
             columns = [item["name"] for item in inspector.get_columns(table)]
             names = ", ".join(columns)
-            indexes = [item["name"] for item in inspector.get_indexes(table) if item["name"]]
-            with self._engine.begin() as connection:
-                # A renamed table keeps its indexes, and create_all would then
-                # refuse to build the replacement's own.
-                for index in indexes:
-                    connection.exec_driver_sql(f"DROP INDEX {index}")
-                connection.exec_driver_sql(f"ALTER TABLE {table} RENAME TO {table}_superseded")
-            SQLModel.metadata.create_all(self._engine)
+            if not rebuilt:
+                indexes = [item["name"] for item in inspector.get_indexes(table) if item["name"]]
+                with self._engine.begin() as connection:
+                    # A renamed table keeps its indexes, and create_all would
+                    # then refuse to build the replacement's own.
+                    for index in indexes:
+                        connection.exec_driver_sql(f"DROP INDEX {index}")
+                    connection.exec_driver_sql(f"ALTER TABLE {table} RENAME TO {superseded}")
+                SQLModel.metadata.create_all(self._engine)
+            # Finish a rebuild that was interrupted between the rename and the
+            # copy, and never overwrite a row the rebuilt table already holds.
             with self._engine.begin() as connection:
                 connection.exec_driver_sql(
-                    f"INSERT INTO {table} ({names}) SELECT {names} FROM {table}_superseded"
+                    f"INSERT INTO {table} ({names}) SELECT {names} FROM {superseded} old "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {table} new "
+                    f"WHERE new.stage_id = old.stage_id)"
                 )
-                connection.exec_driver_sql(f"DROP TABLE {table}_superseded")
+                connection.exec_driver_sql(f"DROP TABLE {superseded}")
 
     def _migrate_additive_columns(self) -> None:
         """Keep existing v2 databases readable without destructive migration."""
