@@ -158,3 +158,34 @@ async def test_a_missing_workdir_fails_the_finding_not_the_tick(tmp_path: Path) 
 
     assert [item.status for item in results] == ["failed"]
     assert "workdir does not exist" in results[0].output
+
+
+async def test_an_absence_check_passes_on_its_own_expected_exit(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "absence"
+    lane_id = add_worktree(repo, lane, "absence", base)
+    git = LocalGit()
+
+    gone = await git.validate(
+        lane_id,
+        [
+            ValidationRequirement(
+                command="rg -c removed_symbol src/shared.py",
+                expected="no match (exit status 1)",
+                expect_exit=1,
+            )
+        ],
+    )
+    still_there = await git.validate(
+        lane_id,
+        [
+            ValidationRequirement(
+                command="rg -c base src/shared.py",
+                expected="no match (exit status 1)",
+                expect_exit=1,
+            )
+        ],
+    )
+
+    assert [item.status for item in gone] == ["passed"]
+    assert [item.status for item in still_there] == ["failed"]

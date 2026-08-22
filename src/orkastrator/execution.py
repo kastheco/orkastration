@@ -1578,7 +1578,9 @@ class ExecutionController:
                 "without a shell, so name one executable per requirement: no `cd`, `&&`, pipes or "
                 "redirection. Split a chain into one requirement each and set that requirement's "
                 "workdir instead of `cd`. This review is rejected outright if any command uses "
-                "that syntax. Send worker_done with body set to only the JSON "
+                "that syntax. A check is satisfied by its exit status alone, so set expect_exit "
+                "when the passing outcome is a non-zero one, as an absence check with rg is. "
+                "Send worker_done with body set to only the JSON "
                 f"contract matching this schema: {schema}\n\n{context}"
             )
         finding = self._finding_for_stage(run_id, stage)

@@ -219,14 +219,15 @@ class LocalGit:
                 break
             stdout, stderr = await process.communicate()
             output = (stdout + stderr).decode(errors="replace")[-8_000:]
+            satisfied = process.returncode == requirement.expect_exit
             results.append(
                 ValidationResult(
                     command=requirement.command,
-                    status="passed" if process.returncode == 0 else "failed",
+                    status="passed" if satisfied else "failed",
                     output=output,
                 )
             )
-            if process.returncode != 0:
+            if not satisfied:
                 break
         return results
 

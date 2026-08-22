@@ -222,6 +222,14 @@ class ValidationRequirement(WorkflowContract):
     expected: str = Field(min_length=1, max_length=2_000)
     workdir: str | None = Field(default=None, max_length=500)
     """Directory under the worktree to run the command in, in place of `cd`."""
+    expect_exit: int = Field(default=0, ge=0, le=255)
+    """Exit status that satisfies this check.
+
+    An absence check passes by failing: `rg PATTERN path` exits 1 when the
+    pattern is gone, which is exactly the outcome a finding about a removed
+    symbol requires. Without this the reviewer can only write the command and
+    say what it means in prose, and the runner reads the prose as a failure.
+    """
 
     @model_validator(mode="after")
     def _contained_workdir(self) -> ValidationRequirement:
