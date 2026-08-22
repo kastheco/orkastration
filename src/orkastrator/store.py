@@ -964,6 +964,7 @@ class StateStore:
         phase: FindingPhase,
         round: int | None = None,
         escalation_reason: FindingReason | None = None,
+        force: bool = False,
         note: str,
     ) -> FindingRecord:
         """Send one settled finding back to an earlier phase and clear what follows it.
@@ -994,6 +995,17 @@ class StateStore:
             ).first()
             if row is None:
                 raise KeyError(f"run {run_id} has no finding {finding_id}")
+            # A finding that settled on the merits is not what this exists for.
+            # Reopen is a recovery hatch for work a supervisor bug stranded, and
+            # the id it takes is typed by hand: without this, one transposed
+            # character silently undoes a correctly resolved finding and sends an
+            # agent to re-fix it. `blocked` is deliberately not covered, because a
+            # blocked finding is precisely the case reopen exists for.
+            settled = FindingPhase(row.phase)
+            if settled in _SETTLEABLE_PHASES and not force:
+                raise ValueError(
+                    f"finding {finding_id} is {settled.value}; pass force to reopen it anyway"
+                )
             target = row.round if round is None else round
             stages = session.exec(
                 select(WorkflowStageRow).where(
@@ -1032,6 +1044,8 @@ class StateStore:
                     "round": target,
                     "reason": None if escalation_reason is None else escalation_reason.value,
                     "retired_stages": retired,
+                    "from_phase": settled.value,
+                    "forced": force,
                     "note": note[:4_000],
                 },
             )

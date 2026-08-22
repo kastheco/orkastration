@@ -171,6 +171,12 @@ uv run --project /home/kas/dev/orkastrator orkas reopen <run-id> \
 `--phase` accepts `pending_fix`, `pending_re_review`, or `pending_escalation`. The round defaults to
 the finding's current one.
 
+A finding that already settled on the merits - `resolved` or `deferred` - is refused unless you pass
+`--force`. The finding id is typed by hand, and without that guard one transposed character silently
+undoes work an agent got right and sends another one to redo it. A `blocked` finding needs no force,
+because that is the case reopen exists for. The event records the phase it came from and whether the
+reopen was forced.
+
 Acceptance freezes the proposal and the graph configuration together, so editing
 `orkastrator.yaml` while a run is in flight fails every tick after it with `proposal or graph policy
 changed after acceptance`. That refusal is right by default: a graph must not silently start running

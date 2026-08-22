@@ -698,3 +698,63 @@ def test_advancing_a_fix_base_leaves_the_review_revision_alone(tmp_path: Path) -
     # fill the log with a move that did not happen.
     store.advance_fix_base(run_id, finding.finding_key, "e" * 40)
     assert len([item for item in store.events(run_id) if item["kind"] == "fix_base_advanced"]) == 1
+
+
+def test_reopening_a_finding_that_settled_on_the_merits_needs_force(tmp_path: Path) -> None:
+    """Reopen takes a hand-typed id, and one transposed character must not undo
+    a finding an agent got right."""
+
+    store = StateStore(tmp_path / "reopen-settled.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data(1))),
+    )
+    finding = store.findings(run_id)[0]
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.RESOLVED)
+
+    with pytest.raises(ValueError, match="pass force"):
+        store.reopen_finding(
+            run_id, finding.finding_id, phase=FindingPhase.PENDING_FIX, note="typo"
+        )
+    assert store.findings(run_id)[0].phase is FindingPhase.RESOLVED
+
+    reopened = store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_FIX,
+        force=True,
+        note="the fix regressed something the review missed",
+    )
+
+    assert reopened.phase is FindingPhase.PENDING_FIX
+    event = [item for item in store.events(run_id) if item["kind"] == "finding_reopened"][-1]
+    payload = event["payload"]
+    assert isinstance(payload, dict)
+    assert payload["from_phase"] == "resolved"
+    assert payload["forced"] is True
+
+
+def test_reopening_a_blocked_finding_still_needs_no_force(tmp_path: Path) -> None:
+    """A blocked finding is exactly the case reopen exists for."""
+
+    store = StateStore(tmp_path / "reopen-blocked.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data(1))),
+    )
+    finding = store.findings(run_id)[0]
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+
+    reopened = store.reopen_finding(
+        run_id, finding.finding_id, phase=FindingPhase.PENDING_FIX, note="the contract bug is fixed"
+    )
+
+    assert reopened.phase is FindingPhase.PENDING_FIX

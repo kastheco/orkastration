@@ -172,6 +172,10 @@ def reopen(
     note: Annotated[
         str, typer.Option("--note", help="Why this finding is being reopened.")
     ] = "reopened by the supervisor",
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Reopen a finding that is already resolved or deferred."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
     """Send a settled finding back to an earlier phase and clear what superseded it."""
@@ -184,6 +188,7 @@ def reopen(
             phase=phase,
             round=round,
             escalation_reason=reason,
+            force=force,
             note=note,
         )
     except (ConfigError, KeyError, ValueError) as exc:
