@@ -223,12 +223,21 @@ class ExecutionController:
                     worktree_id,
                     {"recovered": True, "dispatchId": dispatch_id},
                 )
+            result_json = _task_result_json(task)
             self._store.sync_stage(
                 run_id,
                 stage.stage_id,
                 phase,
-                _task_result_json(task),
+                result_json,
             )
+            # Orca hands a Task back to READY once its worker terminal is gone.
+            # For a stage that never reported, that worker died: the agent
+            # crashed, or the supervisor exited while its workers were live.
+            # The Dispatch id it still carries is dead, and `_start_ready`
+            # refuses to start a stage that has one, so clear it and let the
+            # stage be dispatched again.
+            if phase is StagePhase.READY and stage.orca_dispatch_id is not None:
+                self._store.release_dead_dispatch(run_id, stage)
 
         await self._process_results(run_id)
         await self._release_settled(run_id)

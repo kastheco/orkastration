@@ -596,6 +596,33 @@ class StateStore:
                 {"stage_id": stage.stage_id},
             )
 
+    def release_dead_dispatch(self, run_id: str, stage: StageRecord) -> None:
+        """Free a stage whose supervised worker died before it reported anything.
+
+        Orca returns a Task to READY when the worker terminal goes away, but the
+        stage keeps the Dispatch id that proved a worker was started, and
+        `_start_ready` skips any stage that already holds one. A crashed agent,
+        or a supervisor that exited while its workers were live, would otherwise
+        leave the stage unstartable for the rest of the run. A stage that did
+        report a result is settled by its result, not by this, so leave it alone.
+        """
+
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage.stage_id)
+            if row is None or row.phase != StagePhase.READY.value:
+                return
+            if row.orca_dispatch_id is None or row.result_json is not None:
+                return
+            row.orca_dispatch_id = None
+            row.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "stage_dead_dispatch_released",
+                {"stage_id": stage.stage_id},
+            )
+
     def sync_stage(
         self, run_id: str, stage_id: str, phase: StagePhase, result_json: str | None
     ) -> None:
@@ -880,6 +907,13 @@ class StateStore:
                 if stage.phase in _SETTLED_STAGE_PHASES or stage.processed:
                     continue
                 stage.processed = True
+                # Take it out of the phase the scheduler starts from as well.
+                # Marking it processed and renaming its key only stops
+                # `ensure_stage` recreating it; the dispatch loop starts any
+                # stage that is still READY, so a retired stage sat waiting for
+                # a free slot and adjudicated a finding the owner had already
+                # closed the moment one opened up.
+                stage.phase = StagePhase.BLOCKED.value
                 stage.stage_key = f"{stage.stage_key}:settled{_now():%Y%m%d%H%M%S}"
                 stage.updated_at = _now()
                 retired += 1

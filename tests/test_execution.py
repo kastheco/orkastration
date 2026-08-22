@@ -299,6 +299,14 @@ class FakeOrca:
             )
         self._refresh_ready()
 
+    def abandon_dispatched(self) -> None:
+        """Send every dispatched Task back to ready with no result, as Orca does
+        when the supervised worker's terminal goes away without reporting."""
+
+        for task in self.tasks_by_id.values():
+            if task["status"] == "dispatched":
+                task["status"] = "ready"
+
     def complete_task(self, task_id: str, body: str) -> None:
         task = self.tasks_by_id[task_id]
         task["status"] = "completed"
@@ -1516,6 +1524,40 @@ async def test_accepting_a_fix_rechecks_it_instead_of_replaying_the_stored_verdi
 
     assert store.integrations(run_id)[0].status == "integrated"
     assert result.findings[0].phase is not FindingPhase.BLOCKED
+
+
+async def test_a_stage_whose_worker_died_is_dispatched_again(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    first = [stage for stage in store.stages(run_id) if stage.orca_dispatch_id is not None]
+    assert first
+
+    # Killing the supervisor while its workers are live leaves every dispatched
+    # Task back at ready with no result. The stage still holds the Dispatch id
+    # that proved a worker started, and nothing else clears it, so without this
+    # the run can never start that stage again.
+    orca.abandon_dispatched()
+    result = await value.monitor(run_id)
+
+    assert [launch.role for launch in result.started] == [StageKind.WORKER]
+    restarted = [stage for stage in store.stages(run_id) if stage.orca_dispatch_id is not None]
+    assert restarted
+
+
+async def test_a_stage_that_reported_keeps_its_dispatch(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched()
+    await value.monitor(run_id)
+
+    # A completed stage is settled by its result. Releasing its dispatch would
+    # offer finished work back to the scheduler.
+    worker = next(stage for stage in store.stages(run_id) if stage.role is StageKind.WORKER)
+    assert worker.orca_dispatch_id is not None
 
 
 async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:
