@@ -93,6 +93,7 @@ def fake_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         claude_command=("claude",),
         orca_command=("orca-ide",),
         codex_command=("codex",),
+        github_command=("gh",),
     )
     monkeypatch.setattr(cli, "_components", lambda: (settings, FakeStore(), FakeOrca()))
     monkeypatch.setattr(cli, "_controller", FakeController)

@@ -419,6 +419,14 @@ class CiFailureFinding(WorkflowContract):
     round: int = Field(ge=1, le=2)
 
 
+class AcceptanceAuthorization(WorkflowContract):
+    """Exact proposal and policy identity authorized by graph acceptance."""
+
+    run_id: str = Field(min_length=1, max_length=128)
+    proposal_sha256: Sha256Digest
+    config_sha256: Sha256Digest
+
+
 class PublicationReceipt(WorkflowContract):
     """Auditable external mutations authorized by one accepted run."""
 
@@ -583,7 +591,7 @@ class FindingRecord(BaseModel):
     finding_key: str
     lane_id: str
     finding_id: str
-    origin: Literal["initial_review", "introduced_by_fix", "unrelated"]
+    origin: Literal["initial_review", "introduced_by_fix", "unrelated", "ci_failure"]
     contract: ReviewFinding
     effective_contract: ReviewFinding
     phase: FindingPhase
@@ -625,3 +633,5 @@ class GraphResult(BaseModel):
     lanes: list[LaneRecord]
     stages: list[StageRecord]
     findings: list[FindingRecord]
+    publications: list[PublicationReceipt] = Field(default_factory=list)
+    ci: list[CiReceipt] = Field(default_factory=list)

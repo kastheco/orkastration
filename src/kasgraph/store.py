@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Literal
 
 from kasgraph.models import (
+    AcceptanceAuthorization,
     AttemptKind,
+    CiFailureFinding,
+    CiReceipt,
     EscalationDecision,
     FindingPhase,
     FindingReason,
@@ -23,6 +26,7 @@ from kasgraph.models import (
     LanePhase,
     LaneRecord,
     OrcaWorkerResult,
+    PublicationReceipt,
     ReReviewResult,
     ReviewFinding,
     RunRecord,
@@ -44,7 +48,7 @@ class IntegrationBusyError(RuntimeError):
     """Raised when another approved commit owns a lane's integration lock."""
 
 
-FindingOrigin = Literal["initial_review", "introduced_by_fix", "unrelated"]
+FindingOrigin = Literal["initial_review", "introduced_by_fix", "unrelated", "ci_failure"]
 
 
 class StateStore:
@@ -267,6 +271,161 @@ class StateStore:
             if changed != 1:
                 raise ValueError(f"run {run_id} is not awaiting acceptance")
             self._event(connection, run_id, None, "proposal_accepted", {"orca_run_id": orca_run_id})
+
+    def record_acceptance_authorization(
+        self, run_id: str, authorization: AcceptanceAuthorization
+    ) -> None:
+        """Freeze the exact proposal and graph policy accepted by the owner."""
+
+        if authorization.run_id != run_id:
+            raise ValueError("acceptance authorization does not match its run")
+        payload = authorization.model_dump_json()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT payload_json FROM acceptance_authorizations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["payload_json"]) != payload:
+                    raise ValueError("accepted proposal or publication policy changed")
+                return
+            connection.execute(
+                "INSERT INTO acceptance_authorizations VALUES (?, ?, ?)",
+                (run_id, payload, _now()),
+            )
+            self._event(
+                connection, run_id, None, "acceptance_authorized", authorization.model_dump()
+            )
+
+    def acceptance_authorization(self, run_id: str) -> AcceptanceAuthorization | None:
+        """Return the frozen external-write authorization for a run."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM acceptance_authorizations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else AcceptanceAuthorization.model_validate_json(str(row["payload_json"]))
+        )
+
+    def record_publication(self, run_id: str, lane_id: str, receipt: PublicationReceipt) -> None:
+        """Persist or advance one exact-head publication receipt."""
+
+        payload = receipt.model_dump_json()
+        now = _now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM publications WHERE lane_id = ? AND head_sha = ?",
+                (lane_id, receipt.head_sha),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO publications VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), lane_id, receipt.head_sha, payload, now, now),
+                )
+                kind = "lane_published"
+            else:
+                previous = PublicationReceipt.model_validate_json(str(row["payload_json"]))
+                if previous.model_copy(update={"draft": receipt.draft}) != receipt:
+                    raise ValueError("publication identity changed for an existing head")
+                connection.execute(
+                    "UPDATE publications SET payload_json = ?, updated_at = ? "
+                    "WHERE lane_id = ? AND head_sha = ?",
+                    (payload, now, lane_id, receipt.head_sha),
+                )
+                kind = (
+                    "pull_request_ready"
+                    if previous.draft and not receipt.draft
+                    else "lane_published"
+                )
+            self._event(connection, run_id, lane_id, kind, receipt.model_dump())
+
+    def publications(self, run_id: str, lane_id: str | None = None) -> list[PublicationReceipt]:
+        """Return exact-head publication history in creation order."""
+
+        query = (
+            "SELECT publications.payload_json FROM publications "
+            "JOIN lanes USING (lane_id) WHERE lanes.run_id = ?"
+        )
+        arguments: tuple[str, ...] = (run_id,)
+        if lane_id is not None:
+            query += " AND publications.lane_id = ?"
+            arguments = (run_id, lane_id)
+        query += " ORDER BY publications.created_at, publications.publication_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, arguments).fetchall()
+        return [PublicationReceipt.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def record_ci_receipt(self, run_id: str, lane_id: str, receipt: CiReceipt) -> None:
+        """Upsert the latest observation for one exact published head."""
+
+        payload = receipt.model_dump_json()
+        now = _now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ci_receipts
+                    (receipt_id, lane_id, head_sha, payload_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lane_id, head_sha) DO UPDATE SET payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (str(uuid.uuid4()), lane_id, receipt.head_sha, payload, now, now),
+            )
+            self._event(connection, run_id, lane_id, "ci_observed", receipt.model_dump())
+
+    def ci_receipts(self, run_id: str, lane_id: str | None = None) -> list[CiReceipt]:
+        """Return the latest CI observation for every published head."""
+
+        query = (
+            "SELECT ci_receipts.payload_json FROM ci_receipts "
+            "JOIN lanes USING (lane_id) WHERE lanes.run_id = ?"
+        )
+        arguments: tuple[str, ...] = (run_id,)
+        if lane_id is not None:
+            query += " AND ci_receipts.lane_id = ?"
+            arguments = (run_id, lane_id)
+        query += " ORDER BY ci_receipts.created_at, ci_receipts.receipt_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, arguments).fetchall()
+        return [CiReceipt.model_validate_json(str(row["payload_json"])) for row in rows]
+
+    def record_ci_failure(self, run_id: str, lane_id: str, failure: CiFailureFinding) -> bool:
+        """Freeze one typed CI failure contract per exact head."""
+
+        payload = failure.model_dump_json()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM ci_failures WHERE lane_id = ? AND head_sha = ?",
+                (lane_id, failure.published_sha),
+            ).fetchone()
+            if row is not None:
+                if str(row["payload_json"]) != payload:
+                    raise ValueError("CI failure changed for an existing published head")
+                return False
+            connection.execute(
+                "INSERT INTO ci_failures VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), lane_id, failure.published_sha, payload, _now()),
+            )
+            self._event(connection, run_id, lane_id, "ci_failure_frozen", failure.model_dump())
+        return True
+
+    def ci_failures(self, run_id: str, lane_id: str | None = None) -> list[CiFailureFinding]:
+        """Return typed CI failures in observed order."""
+
+        query = (
+            "SELECT ci_failures.payload_json FROM ci_failures "
+            "JOIN lanes USING (lane_id) WHERE lanes.run_id = ?"
+        )
+        arguments: tuple[str, ...] = (run_id,)
+        if lane_id is not None:
+            query += " AND ci_failures.lane_id = ?"
+            arguments = (run_id, lane_id)
+        query += " ORDER BY ci_failures.created_at, ci_failures.failure_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, arguments).fetchall()
+        return [CiFailureFinding.model_validate_json(str(row["payload_json"])) for row in rows]
 
     def bind_stage_task(self, run_id: str, stage_id: str, task_id: str) -> None:
         """Bind one local stage to its Orca Task idempotently."""
@@ -1065,6 +1224,12 @@ class StateStore:
             )
             self._event(connection, run_id, lane_id, "lane_transitioned", {"phase": phase.value})
 
+    def block_lane(self, run_id: str, lane_id: str, reason: str) -> None:
+        """Stop one lane and retain an actionable publication or CI reason."""
+
+        self.set_lane_phase(run_id, lane_id, LanePhase.BLOCKED)
+        self._append_event(run_id, lane_id, "lane_blocked", {"reason": reason[:4_000]})
+
     def set_terminal_status(self, run_id: str, status: str) -> None:
         """Set the run terminal state without erasing per-lane evidence."""
 
@@ -1356,6 +1521,25 @@ CREATE TABLE IF NOT EXISTS integrations (
     status TEXT NOT NULL, validation_json TEXT NOT NULL,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE(finding_key, round)
+);
+CREATE TABLE IF NOT EXISTS acceptance_authorizations (
+    run_id TEXT PRIMARY KEY REFERENCES supervisor_runs(run_id),
+    payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS publications (
+    publication_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
+    head_sha TEXT NOT NULL, payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(lane_id, head_sha)
+);
+CREATE TABLE IF NOT EXISTS ci_receipts (
+    receipt_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
+    head_sha TEXT NOT NULL, payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(lane_id, head_sha)
+);
+CREATE TABLE IF NOT EXISTS ci_failures (
+    failure_id TEXT PRIMARY KEY, lane_id TEXT NOT NULL REFERENCES lanes(lane_id),
+    head_sha TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(lane_id, head_sha)
 );
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES supervisor_runs(run_id),
