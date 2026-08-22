@@ -209,6 +209,27 @@ def settle(
     _emit(record.model_dump(mode="json"), json_output=json_output)
 
 
+@app.command()
+def reauthorize(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    note: Annotated[str, typer.Option("--note", help="Why this policy change is authorized.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Re-freeze a live run against a configuration the owner changed on purpose.
+
+    Acceptance digests the proposal and the config together, so editing
+    `orkastrator.yaml` mid-run fails every subsequent tick. Use this when only
+    the policy moved. If the proposal itself changed, this refuses and the
+    honest answer is a new proposal.
+    """
+
+    try:
+        authorization = _controller().reauthorize(run_id, note)
+    except (ConfigError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(authorization.model_dump(mode="json"), json_output=json_output)
+
+
 @app.command(name="show")
 def show_graph(
     run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],

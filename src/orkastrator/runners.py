@@ -149,7 +149,7 @@ def _tsc(output: str, *, satisfied: bool) -> str | None:
     if not errors and not count:
         return None
     if satisfied and not errors:
-        return (count[-1].strip() if count else "no type errors")
+        return count[-1].strip() if count else "no type errors"
     kept = errors[:_KEEP_FAILURES]
     header = count[-1].strip() if count else f"{len(errors)} type errors"
     if len(errors) > len(kept):

@@ -1500,6 +1500,26 @@ class ExecutionController:
             item.phase in {FindingPhase.RESOLVED, FindingPhase.DEFERRED} for item in findings
         )
 
+    def reauthorize(self, run_id: str, note: str) -> AcceptanceAuthorization:
+        """Re-freeze a live run against the policy it is now configured with.
+
+        The authorization digests the proposal and the config together, so
+        editing `orkastrator.yaml` while a run is in flight fails every tick
+        afterwards. Recording a new proposal is the honest answer when the
+        *plan* changed. When only the policy changed, and the owner meant it,
+        this is the answer: same lanes, same findings, same worktrees, one
+        audited note saying which policy the rest of the run ran under.
+        """
+
+        run = self._store.run(run_id)
+        authorization = AcceptanceAuthorization(
+            run_id=run_id,
+            proposal_sha256=_sha256_json(run.proposal.model_dump(mode="json")),
+            config_sha256=_sha256_json(self._config.model_dump(mode="json")),
+        )
+        self._store.reauthorize_acceptance(run_id, authorization, note)
+        return authorization
+
     def _require_authorization(self, run_id: str) -> AcceptanceAuthorization:
         """Reject resumed work when its frozen proposal or graph policy changed."""
 

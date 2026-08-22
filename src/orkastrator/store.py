@@ -312,6 +312,50 @@ class StateStore:
             )
             self._event(session, run_id, None, "acceptance_authorized", authorization.model_dump())
 
+    def reauthorize_acceptance(
+        self, run_id: str, authorization: AcceptanceAuthorization, note: str
+    ) -> None:
+        """Re-freeze one run's authorization against a policy the owner changed on purpose.
+
+        `record_acceptance_authorization` refuses to move, which is the point: a
+        graph must not silently start running under a policy nobody accepted.
+        But the supervisor is edited while runs are live, and a config change
+        then fails every tick with nothing but an instruction to throw the run
+        away. That is not a recovery, and the recovery people actually performed
+        was editing this table by hand.
+
+        So the move is supported, and separate, and audited. It carries the
+        owner's reason and the digests on both sides, so `orkas show` can say
+        which policy each stage ran under rather than leaving the change
+        invisible.
+        """
+
+        if authorization.run_id != run_id:
+            raise ValueError("acceptance authorization does not match its run")
+        with self._session() as session:
+            row = session.get(AcceptanceAuthorizationRow, run_id)
+            if row is None:
+                raise KeyError(f"run {run_id} has no frozen acceptance authorization")
+            previous = AcceptanceAuthorization.model_validate_json(row.payload_json)
+            if previous.proposal_sha256 != authorization.proposal_sha256:
+                raise ValueError(
+                    "the accepted proposal itself changed, not just the policy; "
+                    "record and accept a new proposal"
+                )
+            row.payload_json = authorization.model_dump_json()
+            self._event(
+                session,
+                run_id,
+                None,
+                "supervisor_reauthorized_policy",
+                {
+                    "from_config_sha256": previous.config_sha256,
+                    "to_config_sha256": authorization.config_sha256,
+                    "note": note[:4_000],
+                },
+            )
+            session.commit()
+
     def acceptance_authorization(self, run_id: str) -> AcceptanceAuthorization | None:
         with self._session() as session:
             row = session.get(AcceptanceAuthorizationRow, run_id)

@@ -171,6 +171,21 @@ uv run --project /home/kas/dev/orkastrator orkas reopen <run-id> \
 `--phase` accepts `pending_fix`, `pending_re_review`, or `pending_escalation`. The round defaults to
 the finding's current one.
 
+Acceptance freezes the proposal and the graph configuration together, so editing
+`orkastrator.yaml` while a run is in flight fails every tick after it with `proposal or graph policy
+changed after acceptance`. That refusal is right by default: a graph must not silently start running
+under a policy nobody accepted. When only the policy moved and you meant it, re-freeze the run rather
+than throwing it away:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas reauthorize <run-id> \
+  --note "why this policy change is authorized" --json
+```
+
+The same lanes, findings and worktrees continue under the new policy, and the change is recorded as a
+`supervisor_reauthorized_policy` event carrying both digests and the note. If the *proposal* changed
+rather than the config, this refuses, because that is a different plan and wants a new proposal.
+
 Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
 so it is a separate command from `reopen` and it records the note as evidence:
 

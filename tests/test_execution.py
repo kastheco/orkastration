@@ -2000,6 +2000,78 @@ async def test_resumed_run_rejects_changed_graph_policy(tmp_path: Path) -> None:
     assert publisher.publish_calls == []
 
 
+async def test_reauthorizing_a_policy_change_lets_the_same_run_continue(
+    tmp_path: Path,
+) -> None:
+    """A config edit mid-run must be recoverable without discarding the run.
+
+    Everything the run has done is still valid: the same lanes, the same frozen
+    findings, the same worktrees. Only the policy the next stage will run under
+    moved. Telling the owner to record a new proposal throws all of that away,
+    and what people did instead was edit the authorization row by hand.
+    """
+
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    before = store.acceptance_authorization(run_id)
+    assert before is not None
+
+    changed = ExecutionController(
+        config=config(max_workers=3),
+        orca=orca,
+        store=store,
+        git=FakeGit(),
+        publisher=publisher,
+    )
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await changed.monitor(run_id)
+
+    after = changed.reauthorize(run_id, "raised max_workers on purpose")
+
+    assert after.config_sha256 != before.config_sha256
+    assert after.proposal_sha256 == before.proposal_sha256
+    await changed.monitor(run_id)
+    # The original controller is now the one out of date, in the same way.
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await value.monitor(run_id)
+
+
+async def test_reauthorizing_refuses_when_the_proposal_itself_changed(
+    tmp_path: Path,
+) -> None:
+    """A changed plan is not a changed policy, and must not be waved through."""
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    authorization = store.acceptance_authorization(run_id)
+    assert authorization is not None
+
+    with pytest.raises(ValueError, match="proposal itself changed"):
+        store.reauthorize_acceptance(
+            run_id,
+            authorization.model_copy(update={"proposal_sha256": "0" * 64}),
+            "different lanes",
+        )
+
+    assert store.acceptance_authorization(run_id) == authorization
+
+
+async def test_reauthorizing_an_unaccepted_run_is_a_missing_authorization(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+
+    with pytest.raises(KeyError, match="no frozen acceptance authorization"):
+        value.reauthorize(run_id, "nothing to re-freeze yet")
+
+
 async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     tmp_path: Path,
 ) -> None:
