@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from pydantic import ValidationError
 
@@ -30,6 +30,7 @@ from orkastrator.models import (
     LaneProposal,
     LaneRecord,
     OrcaWorkerResult,
+    PendingQuestion,
     ProposalReceipt,
     PublicationReceipt,
     ReReviewResult,
@@ -41,9 +42,10 @@ from orkastrator.models import (
     StageRecord,
     SupervisorPlan,
     ValidationRequirement,
+    WorkerBlocked,
     WorkerResult,
 )
-from orkastrator.orca import JsonObject
+from orkastrator.orca import JsonObject, OrcaError
 from orkastrator.publication import GitHubPublisher, LanePublisher, PublicationError
 from orkastrator.scope import path_allowed
 from orkastrator.store import IntegrationBusyError, StateStore
@@ -55,6 +57,10 @@ class OrcaGraphController(Protocol):
     async def create_run(self, objective: str) -> tuple[str, JsonObject]: ...
 
     async def runs(self) -> list[JsonObject]: ...
+
+    async def use_run(self, orca_run_id: str) -> JsonObject: ...
+
+    async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]: ...
 
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]: ...
 
@@ -140,6 +146,13 @@ class ExecutionController:
             raise ValueError(f"run {run_id} cannot be accepted from status {run.status}")
         else:
             self._require_authorization(run_id)
+            orca_run_id = self._store.run(run_id).orca_run_id
+            if orca_run_id is None:
+                raise ValueError(f"run {run_id} was accepted without an Orca Run")
+        # Task and worker commands resolve against the Run bound to this coordinator
+        # terminal. Recovering an existing Run, or accepting from a later process,
+        # leaves that binding pointing elsewhere, so rebind before touching Tasks.
+        await self._orca.use_run(orca_run_id)
         await self._ensure_tasks(run_id)
         return await self.monitor(run_id)
 
@@ -150,6 +163,7 @@ class ExecutionController:
         if run.orca_run_id is None:
             raise ValueError(f"run {run_id} has not been accepted")
         self._require_authorization(run_id)
+        await self._orca.use_run(run.orca_run_id)
         tasks = await self._orca.tasks(run.orca_run_id)
         by_id = {_task_id(task): task for task in tasks}
         lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
@@ -217,6 +231,7 @@ class ExecutionController:
 
         await self._process_results(run_id)
         await self._release_settled(run_id)
+        await self._reclaim_foreign_reservations(run_id)
         self._ensure_dynamic_stages(run_id)
         await self._ensure_tasks(run_id)
         started = await self._start_ready(run_id)
@@ -238,7 +253,57 @@ class ExecutionController:
             findings=self._store.findings(run_id),
             publications=self._store.publications(run_id),
             ci=self._store.ci_receipts(run_id),
+            questions=await self._pending_questions(run_id, run.orca_run_id),
         )
+
+    async def _pending_questions(self, run_id: str, orca_run_id: str) -> list[PendingQuestion]:
+        """Report every unanswered question or escalation raised inside this run.
+
+        Task state calls a blocked agent dispatched, because it is: sitting in its
+        terminal waiting on a decision nobody knows it asked for. Orca already types
+        that traffic, so read it here instead of leaving the supervisor to notice by
+        accident. Attribution to a stage is best-effort - a message that names no
+        known dispatch is still reported, because an unattributable blocked agent is
+        the one most worth seeing.
+        """
+
+        stages = {
+            stage.orca_dispatch_id: stage
+            for stage in self._store.stages(run_id)
+            if stage.orca_dispatch_id is not None
+        }
+        lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
+        messages = await self._orca.messages(orca_run_id)
+        answered = {
+            thread
+            for message in messages
+            if isinstance(thread := message.get("thread_id"), str) and thread != message.get("id")
+        }
+        pending: list[PendingQuestion] = []
+        for message in messages:
+            kind = message.get("type")
+            message_id = message.get("id")
+            if kind not in {"question", "escalation"} or not isinstance(message_id, str):
+                continue
+            if message_id in answered:
+                continue
+            handle = str(message.get("from_handle") or "")
+            stage = next((found for dispatch, found in stages.items() if dispatch in handle), None)
+            pending.append(
+                PendingQuestion(
+                    message_id=message_id,
+                    kind=cast(Literal["question", "escalation"], kind),
+                    from_handle=handle,
+                    lane=lanes[stage.lane_id].name if stage else None,
+                    role=stage.role if stage else None,
+                    dispatch_id=stage.orca_dispatch_id if stage else None,
+                    asked_at=str(message.get("created_at") or ""),
+                    subject=str(message.get("subject") or ""),
+                    body=str(message.get("body") or ""),
+                )
+            )
+        pending.sort(key=lambda question: question.asked_at)
+        return pending
 
     async def _process_results(self, run_id: str) -> None:
         for stage in self._store.stages(run_id):
@@ -263,20 +328,19 @@ class ExecutionController:
         self, run_id: str, stage: StageRecord, lifecycle: OrcaWorkerResult
     ) -> None:
         if stage.role is StageKind.WORKER:
-            result = WorkerResult.model_validate_json(lifecycle.body)
+            payload = json.loads(lifecycle.body)
+            if isinstance(payload, dict) and payload.get("status") == "blocked":
+                await self._apply_worker_block(run_id, stage, WorkerBlocked.model_validate(payload))
+                return
+            result = WorkerResult.model_validate(payload)
             await self._validate_worker_result(run_id, stage, result)
             self._store.record_worker_result(run_id, stage.lane_id, result)
             return
         if stage.role is StageKind.INITIAL_REVIEWER:
             report = InitialReviewReport.model_validate_json(lifecycle.body)
             worker = self._store.worker_result(stage.lane_id)
-            if report.review_revision != worker.review_revision:
-                raise ValueError("initial review revision does not match the worker changeset")
-            if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
-                raise ValueError("initial review checkout contains uncommitted changes")
-            if await self._git.head(stage.worktree_id) != report.review_revision.head_sha:
-                raise ValueError("initial review checkout drifted from the frozen worker head")
-            self._store.record_initial_review(run_id, stage.lane_id, report)
+            verified = await self._verified_review(stage, report, worker.review_revision)
+            self._store.record_initial_review(run_id, stage.lane_id, verified)
             return
         finding = self._finding_for_stage(run_id, stage)
         if stage.round != finding.round:
@@ -292,17 +356,106 @@ class ExecutionController:
                 run_id, finding, stage, ReReviewResult.model_validate_json(lifecycle.body)
             )
         elif stage.role is StageKind.ESCALATION:
-            self._apply_escalation(
+            await self._apply_escalation(
                 run_id, finding, stage, EscalationDecision.model_validate_json(lifecycle.body)
             )
+
+    async def _verified_review(
+        self,
+        stage: StageRecord,
+        report: InitialReviewReport,
+        frozen: ReviewRevision,
+    ) -> InitialReviewReport:
+        """Bind one review to the worker changeset Git can prove it read.
+
+        Which changeset a reviewer read is a question for Git, not for the
+        reviewer: its checkout either sits on the frozen head and reproduces the
+        frozen diff or it does not, and that proof holds whatever the reviewer
+        typed. Asking it to also transcribe the revision only added a way to fail
+        - a digest retyped with its middle elided is not a different review - so
+        take the reviewer's copy as a hint, verify the checkout, and restate the
+        report on the frozen revision so every downstream contract carries one.
+        """
+
+        reported = report.review_revision
+        if reported is not None and (reported.base_sha, reported.head_sha) != (
+            frozen.base_sha,
+            frozen.head_sha,
+        ):
+            raise ValueError("initial review revision does not match the worker changeset")
+        if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("initial review checkout contains uncommitted changes")
+        if await self._git.head(stage.worktree_id) != frozen.head_sha:
+            raise ValueError("initial review checkout drifted from the frozen worker head")
+        observed = await self._git.diff_sha256(stage.worktree_id, frozen.base_sha, frozen.head_sha)
+        if observed != frozen.diff_sha256:
+            raise ValueError("initial review checkout does not reproduce the frozen worker diff")
+        if reported == frozen:
+            return report
+        return report.model_copy(
+            update={
+                "review_revision": frozen,
+                "findings": [
+                    finding.model_copy(update={"review_revision": frozen})
+                    for finding in report.findings
+                ],
+            }
+        )
+
+    async def _apply_worker_block(
+        self, run_id: str, stage: StageRecord, blocked: WorkerBlocked
+    ) -> None:
+        """Route a worker's undecidable choice through the graph's own adjudicator.
+
+        A decision the lane contract does not answer is exactly the shape the
+        finding machinery already carries: escalate it, let the configured
+        escalation role adjudicate, and let an approved revision come back as a
+        bounded fixer rather than as an unbounded worker resumed by hand.
+        """
+
+        if stage.worktree_id is None:
+            raise ValueError("blocked worker omitted its isolated worktree")
+        if not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("blocked worker left uncommitted changes in its lane")
+        if await self._git.head(stage.worktree_id) != blocked.head_sha:
+            raise ValueError("blocked worker head does not match its reported head")
+        lane = next(item for item in self._store.lanes(run_id) if item.lane_id == stage.lane_id)
+        finding_id = f"worker-decision-{len(self._store.findings(run_id, lane.lane_id)) + 1}"
+        detail = "\n".join(
+            [blocked.decision.question, *(f"- {option}" for option in blocked.decision.options)]
+        )
+        contract = ReviewFinding(
+            id=finding_id,
+            review_revision=ReviewRevision(
+                base_sha=blocked.base_sha,
+                head_sha=blocked.head_sha,
+                diff_sha256=await self._git.diff_sha256(
+                    stage.worktree_id, blocked.base_sha, blocked.head_sha
+                ),
+            ),
+            evidence=[
+                FindingEvidence(
+                    location=FindingLocation(path=path, start_line=1, end_line=1),
+                    claim=blocked.decision.consequence,
+                )
+                for path in blocked.decision.allowed_write_scope.paths[:64]
+            ],
+            failure_mode=f"{blocked.summary}\n\n{blocked.decision.consequence}"[:8_000],
+            required_outcome=detail[:8_000],
+            allowed_write_scope=blocked.decision.allowed_write_scope,
+        )
+        finding = self._store.add_finding(run_id, lane.lane_id, contract, origin="worker_blocked")
+        self._escalate(run_id, finding, FindingReason.WORKER_DECISION)
 
     async def _apply_fix(
         self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
     ) -> None:
-        if attempt.finding_id != finding.finding_id or attempt.round != finding.round:
-            raise ValueError("fix attempt does not match its persisted finding and round")
+        attempt = await self._bound_fix_attempt(finding, stage, attempt)
         self._store.record_fix_attempt(run_id, finding, stage, attempt)
         if attempt.status == "fixed":
+            if not _validation_satisfied(finding, attempt):
+                self._escalate(run_id, finding, FindingReason.VALIDATION_FAILED)
+                return
             if not await self._validate_fixer_commit(run_id, finding, stage, attempt):
                 self._escalate(run_id, finding, FindingReason.SCOPE_ESCAPE)
                 return
@@ -328,6 +481,32 @@ class ExecutionController:
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
 
+    @staticmethod
+    def _bind_revision(finding: FindingRecord, contract: ReviewFinding) -> ReviewFinding:
+        """Stamp the frozen revision onto a contract that omitted or mangled it."""
+
+        return contract.model_copy(
+            update={"review_revision": finding.effective_contract.review_revision}
+        )
+
+    async def _bound_fix_attempt(
+        self, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
+    ) -> FixAttempt:
+        """Restate one fixer report on the identity the supervisor assigned it.
+
+        A fixer is the authority on what it did, never on which finding, round,
+        or base it was handed: the supervisor chose all three and Git holds the
+        resulting head. Rejecting an otherwise sound fix because an agent mistyped
+        one of them threw away real work, so overwrite them and spend the rigour
+        on `_validate_fixer_commit`, where Git can actually settle the question.
+        """
+
+        bound: dict[str, object] = {"finding_id": finding.finding_id, "round": finding.round}
+        if attempt.status == "fixed" and stage.worktree_id is not None:
+            bound["base_sha"] = self._fix_base_sha(finding)
+            bound["commit_sha"] = await self._git.head(stage.worktree_id)
+        return attempt.model_copy(update=bound)
+
     async def _apply_re_review(
         self,
         run_id: str,
@@ -335,17 +514,46 @@ class ExecutionController:
         stage: StageRecord,
         result: ReReviewResult,
     ) -> None:
-        if result.finding_id != finding.finding_id or result.round != finding.round:
-            raise ValueError("re-review does not match its persisted finding and round")
         attempt = self._store.latest_fix_attempt(finding.finding_key)
-        if attempt is None or attempt.commit_sha != result.reviewed_commit_sha:
-            raise ValueError("re-review is not pinned to the persisted fixer commit")
+        if attempt is None or attempt.commit_sha is None:
+            raise ValueError("re-review has no persisted fixer commit to review")
         if stage.worktree_id is None:
             raise ValueError("re-review stage omitted its isolated fixer worktree")
         if not await self._git.is_clean(stage.worktree_id):
             raise ValueError("re-review worktree contains uncommitted changes")
-        if await self._git.head(stage.worktree_id) != result.reviewed_commit_sha:
+        # The persisted attempt names the commit under review and the checkout
+        # either sits on it or does not; a re-reviewer's transcription of any of
+        # this decides nothing, so restate the verdict on what is already known.
+        if await self._git.head(stage.worktree_id) != attempt.commit_sha:
             raise ValueError("re-review worktree is not pinned to the persisted fixer commit")
+        # A finding discovered here is a fact about the fixer commit, not about
+        # the lane's original review, so bind it to that commit rather than to
+        # the parent's frozen revision - that range is what a later fixer must
+        # start from, and it is what chains a composite integration together.
+        discovered_revision = ReviewRevision(
+            base_sha=self._fix_base_sha(finding),
+            head_sha=attempt.commit_sha,
+            diff_sha256=await self._git.diff_sha256(
+                stage.worktree_id, self._fix_base_sha(finding), attempt.commit_sha
+            ),
+        )
+        result = result.model_copy(
+            update={
+                "finding_id": finding.finding_id,
+                "round": finding.round,
+                "reviewed_commit_sha": attempt.commit_sha,
+                "new_findings": [
+                    discovered.model_copy(
+                        update={
+                            "finding": discovered.finding.model_copy(
+                                update={"review_revision": discovered_revision}
+                            )
+                        }
+                    )
+                    for discovered in result.new_findings
+                ],
+            }
+        )
         existing = self._store.findings(run_id, finding.lane_id)
         _validate_discovered_findings(existing, result)
         existing_ids = {item.finding_id for item in existing}
@@ -395,23 +603,73 @@ class ExecutionController:
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
 
-    def _apply_escalation(
+    async def _apply_escalation(
         self,
         run_id: str,
         finding: FindingRecord,
         stage: StageRecord,
         decision: EscalationDecision,
     ) -> None:
-        if decision.finding_id != finding.finding_id or decision.round != finding.round:
-            raise ValueError("escalation does not match its persisted finding and round")
-        if finding.escalation_reason is None or decision.reason != finding.escalation_reason.value:
-            raise ValueError("escalation reason does not match the persisted trigger")
+        if finding.escalation_reason is None:
+            raise ValueError("escalation has no persisted trigger to adjudicate")
+        # The supervisor chose the finding, the round, and the trigger before it
+        # dispatched this adjudication, and a revised contract is a revision of a
+        # frozen one. Take the verdict from the adjudicator and the identity from
+        # the record, so a mistyped id or an elided digest cannot kill a finding.
+        revised = decision.revised_finding
+        decision = decision.model_copy(
+            update={
+                "finding_id": finding.finding_id,
+                "round": finding.round,
+                "reason": finding.escalation_reason.value,
+                "revised_finding": (
+                    None
+                    if revised is None
+                    else self._bind_revision(
+                        finding, revised.model_copy(update={"id": finding.finding_id})
+                    )
+                ),
+            }
+        )
         self._store.record_escalation(run_id, finding, stage, decision)
-        if decision.action == "approve_scope_revision":
-            assert decision.revised_finding is not None
-            if decision.revised_finding.id != finding.finding_id:
-                raise ValueError("scope revision must preserve the finding ID")
-            if finding.round >= self._config.review_cycle.max_fix_rounds_per_finding:
+        if decision.action == "accept_fix":
+            # The escalation questioned the evidence for a fix, not the fix, and
+            # the adjudicator went and established that evidence itself. Settling
+            # it here is the same integration the re-reviewer would have driven;
+            # sending it back for another round would re-fix working code, and at
+            # the final round would block it outright.
+            attempt = self._store.latest_fix_attempt(finding.finding_key)
+            if attempt is None or attempt.status != "fixed" or attempt.commit_sha is None:
+                self._store.set_finding_state(
+                    run_id, finding.finding_key, phase=FindingPhase.BLOCKED
+                )
+                self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
+                return
+            await self._integrate_fix(run_id, finding, attempt)
+        elif decision.action in {"approve_unchanged", "approve_scope_revision"}:
+            limit = self._config.review_cycle.max_fix_rounds_per_finding
+            # A conflict is a fact about the lane head moving, not about the fix,
+            # which re-review already approved. Re-landing it is a rebase, so it
+            # retries the same round: the ceiling is there to stop a fixer
+            # thrashing on one defect, and that is not what happened. Its own
+            # bound is how many times the same finding has conflicted.
+            if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
+                conflicts = sum(
+                    1
+                    for receipt in self._store.integrations(run_id)
+                    if receipt.finding_key == finding.finding_key and receipt.status == "conflict"
+                )
+                retry_round = finding.round if conflicts < limit else finding.round + 1
+            else:
+                retry_round = finding.round + 1
+            if retry_round > limit and self._first_adjudicated_retry(finding, limit):
+                # An adjudicator that inspected the head itself and asked for one
+                # more attempt is supervising, not watching a fixer thrash on one
+                # defect, so it gets a retry at the ceiling round rather than
+                # having verified work thrown away under it. One grant per
+                # finding: a second would make the ceiling mean nothing.
+                retry_round = finding.round
+            if retry_round > limit:
                 self._store.set_finding_state(
                     run_id, finding.finding_key, phase=FindingPhase.BLOCKED
                 )
@@ -420,8 +678,8 @@ class ExecutionController:
                     run_id,
                     finding.finding_key,
                     phase=FindingPhase.PENDING_FIX,
-                    round=finding.round + 1,
-                    effective_contract=decision.revised_finding,
+                    round=retry_round,
+                    effective_contract=decision.revised_finding or finding.effective_contract,
                 )
         elif decision.action == "defer":
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.DEFERRED)
@@ -429,6 +687,21 @@ class ExecutionController:
         else:
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
             self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
+
+    def _first_adjudicated_retry(self, finding: FindingRecord, limit: int) -> bool:
+        """Say whether this finding still holds its one supervised retry at the ceiling.
+
+        Spend the grant against the attempts the ledger accepted, not against the
+        decisions that asked for them and not against the stages that ran. An
+        adjudicator repeating itself verbatim records no second verdict, so
+        counting verdicts would hand out the same retry forever; and a stage that
+        only re-landed an existing commit after a conflict did no new fix work,
+        so counting stages would spend the grant on a rebase.
+        """
+
+        if finding.round != limit:
+            return False
+        return self._store.fix_attempt_count(finding.finding_key, limit) == 1
 
     def _reject_stage(self, run_id: str, stage: StageRecord, reason: str) -> None:
         if stage.finding_id is None:
@@ -459,16 +732,19 @@ class ExecutionController:
         stage: StageRecord,
         attempt: FixAttempt,
     ) -> bool:
-        """Verify the exact fixer head and enforce portable literal path boundaries."""
+        """Verify the exact fixer head and enforce portable literal path boundaries.
+
+        Every question here is one Git answers about the lane checkout, so none of
+        it depends on the fixer having transcribed a sha correctly: `_bound_fix_attempt`
+        has already restated the attempt on the assigned base and the observed head.
+        What still has to hold is that the head descends from that base by exactly
+        one commit and touches nothing outside the finding's scope.
+        """
 
         if stage.worktree_id is None or attempt.commit_sha is None:
             raise ValueError("fixed attempt omitted its isolated worktree or commit")
-        expected_base = self._fix_base_sha(finding)
-        actual_head = await self._git.head(stage.worktree_id)
         if not await self._git.is_clean(stage.worktree_id):
             raise ValueError("fixer worktree contains uncommitted changes")
-        if attempt.base_sha != expected_base or actual_head != attempt.commit_sha:
-            raise ValueError("fixer result is not pinned to its assigned base and exact head")
         if not await self._git.is_ancestor(stage.worktree_id, attempt.base_sha, attempt.commit_sha):
             raise ValueError("fixer commit does not descend from its assigned base")
         if (
@@ -482,7 +758,10 @@ class ExecutionController:
         declared_paths = sorted(set(attempt.changed_paths))
         allowed = finding.effective_contract.allowed_write_scope.paths
         forbidden = finding.effective_contract.forbidden_scope
-        accepted = actual_paths == declared_paths and all(
+        # Scope is a property of the commit, so judge the paths Git reports. The
+        # fixer's own list is still recorded, because a fixer that cannot say what
+        # it touched is worth seeing in the audit - but it is not the boundary.
+        accepted = all(
             path_allowed(path, allowed) and not path_allowed(path, forbidden)
             for path in actual_paths
         )
@@ -654,7 +933,7 @@ class ExecutionController:
             raise ValueError("integration source omitted its fixer commit")
         findings = self._store.findings(run_id, finding.lane_id)
         source_findings = [finding]
-        source_base = finding.effective_contract.review_revision.head_sha
+        source_base = self._fix_base_sha(finding)
         visited = {finding.finding_key}
         while True:
             predecessor = next(
@@ -671,7 +950,7 @@ class ExecutionController:
                 break
             visited.add(predecessor.finding_key)
             source_findings.insert(0, predecessor)
-            source_base = predecessor.effective_contract.review_revision.head_sha
+            source_base = self._fix_base_sha(predecessor)
         commits = await self._git.commits_between(fixer_worktree, source_base, attempt.commit_sha)
         if not commits or commits[-1] != attempt.commit_sha:
             raise ValueError("accepted integration source chain does not end at the fixer commit")
@@ -718,7 +997,7 @@ class ExecutionController:
     ) -> None:
         """Settle unresolved composite predecessors when their correction cannot integrate."""
 
-        source_head = finding.effective_contract.review_revision.head_sha
+        source_head = self._fix_base_sha(finding)
         findings = self._store.findings(run_id, finding.lane_id)
         visited: set[str] = set()
         while True:
@@ -737,7 +1016,7 @@ class ExecutionController:
                 return
             visited.add(predecessor.finding_key)
             self._store.set_finding_state(run_id, predecessor.finding_key, phase=phase)
-            source_head = predecessor.effective_contract.review_revision.head_sha
+            source_head = self._fix_base_sha(predecessor)
 
     def _settle_source_findings(
         self,
@@ -754,16 +1033,28 @@ class ExecutionController:
                 self._store.set_finding_state(run_id, item.finding_key, phase=phase)
 
     def _fix_base_sha(self, finding: FindingRecord) -> str:
-        return finding.effective_contract.review_revision.head_sha
+        revision = finding.effective_contract.review_revision
+        if revision is None:
+            raise ValueError(f"finding {finding.finding_id} was persisted without a revision")
+        return revision.head_sha
 
     def _ensure_dynamic_stages(self, run_id: str) -> None:
         stages = self._store.stages(run_id)
+        # Every round can be re-run: a fix rebased after a conflict, a re-review
+        # of that rebase, an adjudication of a fix that conflicted again. Each
+        # such stage names work already settled under its own key, and
+        # `ensure_stage` keys off `stage_key`, so a repeat needs a fresh one or
+        # the graph silently never dispatches it. Count the settled keys of the
+        # same shape and let the base key carry that ordinal.
+        settled = {stage.stage_key for stage in stages if stage.phase in _SETTLED_STAGES}
         by_lane: dict[str, list[StageRecord]] = {}
         for stage in stages:
             by_lane.setdefault(stage.lane_id, []).append(stage)
         for lane in self._store.lanes(run_id):
             lane_stages = by_lane.get(lane.lane_id, [])
-            worker_done = any(
+            # A blocked worker is processed but produced no changeset, so review
+            # only what the lane actually recorded a worker result for.
+            worker_done = lane.review_head_sha is not None and any(
                 stage.role is StageKind.WORKER and stage.processed for stage in lane_stages
             )
             reviewer_exists = any(stage.role is StageKind.INITIAL_REVIEWER for stage in lane_stages)
@@ -787,13 +1078,14 @@ class ExecutionController:
                         if finding.escalation_reason is FindingReason.CAPABILITY_FALLBACK
                         else AttemptKind.PRIMARY
                     )
+                    base = (
+                        f"{lane.lane_id}:{finding.finding_id}:fix:"
+                        f"{finding.round}:{attempt_kind.value}"
+                    )
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:fix:"
-                            f"{finding.round}:{attempt_kind.value}"
-                        ),
+                        stage_key=_next_key(settled, base),
                         role=StageKind.FIXER,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -801,12 +1093,11 @@ class ExecutionController:
                         attempt_kind=attempt_kind,
                     )
                 elif finding.phase is FindingPhase.PENDING_RE_REVIEW:
+                    base = f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}"
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}"
-                        ),
+                        stage_key=_next_key(settled, base),
                         role=StageKind.RE_REVIEWER,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -814,13 +1105,14 @@ class ExecutionController:
                     )
                 elif finding.phase is FindingPhase.PENDING_ESCALATION:
                     reason = finding.escalation_reason or FindingReason.AMBIGUOUS_RESULT
+                    base = (
+                        f"{lane.lane_id}:{finding.finding_id}:escalate:"
+                        f"{finding.round}:{reason.value}"
+                    )
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:escalate:"
-                            f"{finding.round}:{reason.value}"
-                        ),
+                        stage_key=_next_key(settled, base),
                         role=StageKind.ESCALATION,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -871,6 +1163,28 @@ class ExecutionController:
             ):
                 await self._orca.release_worker(stage.orca_dispatch_id)
                 self._store.mark_released(run_id, stage.stage_id)
+
+    async def _reclaim_foreign_reservations(self, run_id: str) -> None:
+        """Release start reservations another run abandoned before Orca confirmed them.
+
+        A worker start that crashes between reserving capacity and recording its
+        Dispatch leaves the stage STARTING. Capacity is counted across every run, so
+        an abandoned reservation blocks this run's wave until its own run is
+        monitored again, which may never happen. Ask Orca whether a Dispatch exists
+        and reset the ones that were never really started.
+        """
+
+        for owner_run_id, stage in self._store.foreign_reservations(run_id):
+            if stage.orca_task_id is None:
+                continue
+            try:
+                recovered = await self._orca.worker_dispatch(stage.orca_task_id)
+            except OrcaError:
+                # The other run's Task may be gone entirely; leave its reservation
+                # alone rather than guessing, and keep reconciling this run.
+                continue
+            if recovered is None:
+                self._store.reset_stage_reservation(owner_run_id, stage)
 
     async def _start_ready(self, run_id: str) -> list[StageLaunch]:
         lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
@@ -1201,19 +1515,27 @@ class ExecutionController:
         )
         if stage.role is StageKind.WORKER:
             schema = json.dumps(WorkerResult.model_json_schema(), sort_keys=True)
+            blocked = json.dumps(WorkerBlocked.model_json_schema(), sort_keys=True)
             return (
                 "Implement the scoped issue, verify it, and commit the result. Compute "
                 "diff_sha256 over the raw output of `git diff --binary --full-index "
                 "<base>..<head> --` and report the exact sorted changed paths. Send worker_done "
                 "with an explicit outcome and body set to only the changeset JSON matching "
-                f"this schema: {schema}\n\n{context}"
+                f"this schema: {schema}\n"
+                "If you reach a decision this contract does not answer, do not ask anyone and do "
+                "not wait. Commit what you have, then send worker_done with body set to only the "
+                f"blocked JSON matching this schema: {blocked}\n\n{context}"
             )
         if stage.role is StageKind.INITIAL_REVIEWER:
             schema = json.dumps(InitialReviewReport.model_json_schema(), sort_keys=True)
             return (
                 "Review the exact worker changeset once, read-only. Freeze every actionable "
-                "finding. Send worker_done with body set to only the JSON contract matching this "
-                f"schema: {schema}\n\n{context}"
+                "finding. Omit review_revision everywhere: the supervisor binds it and verifies "
+                "your checkout itself. Every validation command you write is executed directly "
+                "without a shell, so name one executable and pass its working directory as an "
+                "argument: no `cd`, `&&`, pipes or redirection, and a command that needs them "
+                "fails the finding it belongs to. Send worker_done with body set to only the JSON "
+                f"contract matching this schema: {schema}\n\n{context}"
             )
         finding = self._finding_for_stage(run_id, stage)
         contract = finding.effective_contract.model_dump_json()
@@ -1224,9 +1546,13 @@ class ExecutionController:
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
                 "Start from the assigned frozen review head and produce exactly one commit that "
-                "fully resolves the finding. Do not widen scope. Send worker_done with body set "
-                "to only the JSON contract "
-                f"matching this schema: {schema}\n\n{context}"
+                "fully resolves the finding. Do not widen scope. Run exactly the validation "
+                "commands this finding names and report each one; they are the whole obligation, "
+                "so do not re-run the lane's wider suite. finding_id, round, base_sha and "
+                "commit_sha are read from the record and from Git, so send any placeholder there "
+                "and spend your effort on status, changed_paths and validation_results. Send "
+                f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
+                f"{context}"
             )
         if stage.role is StageKind.RE_REVIEWER:
             attempt = self._store.latest_fix_attempt(finding.finding_key)
@@ -1235,15 +1561,62 @@ class ExecutionController:
                 f"Re-review only this finding at round {finding.round}: {contract}\n"
                 f"Fixer evidence: {attempt.model_dump_json() if attempt else 'missing'}\n"
                 "Unrelated findings must be returned with origin unrelated so they are deferred. "
-                "Send worker_done with body set to only the JSON contract matching this schema: "
-                f"{schema}\n\n{context}"
+                "finding_id, round, reviewed_commit_sha and every review_revision are read from "
+                "the record and from Git, so send any placeholder there and spend your effort on "
+                "the verdict. Send worker_done with body set to only the JSON matching this "
+                f"schema: {schema}\n\n{context}"
             )
         schema = json.dumps(EscalationDecision.model_json_schema(), sort_keys=True)
         return (
             f"Adjudicate this finding without silently widening it: {contract}\n"
-            f"Trigger: {finding.escalation_reason}. Send worker_done with body set to only the "
-            f"JSON contract matching this schema: {schema}\n\n{context}"
+            f"Trigger: {finding.escalation_reason}. Choose accept_fix when you established "
+            "yourself that the committed fix resolves the finding and only its evidence was "
+            "missing, approve_unchanged when the finding stands as frozen and wants another "
+            "attempt, approve_scope_revision only when the scope itself must change, and defer "
+            "when the finding belongs to another run or its own premise is invalid: a deferred "
+            "finding is dismissed and its lane lands without it. Choose block only when the lane "
+            "must not land at all until an owner has looked, because every other finding in the "
+            "lane stops with it. finding_id, round, reason and every "
+            "review_revision are read from the record, so send any placeholder there. Send "
+            f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
+            f"{context}"
         )
+
+
+_SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})
+"""Stage phases that will never advance again, so a retry needs a new key."""
+
+_RETRY_MARKER = ":retry"
+"""Separates a stage key from the ordinal that makes a repeat of it dispatchable."""
+
+
+def _next_key(settled: set[str], base: str) -> str:
+    """Name the next stage under `base`, keeping the first attempt's key intact.
+
+    Only keys still under `base` count. A stage retired by a reopen was renamed
+    out of this family on purpose, which frees the base key again.
+    """
+
+    retried = sum(1 for key in settled if key == base or key.startswith(f"{base}{_RETRY_MARKER}"))
+    return f"{base}{_RETRY_MARKER}{retried}" if retried else base
+
+
+def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
+    """Require the finding's own validation list, and treat it as the whole obligation.
+
+    The finding names the checks that prove it resolved, so a fix that skips one
+    has not been shown to work. Nothing here demands more: re-running a whole lane
+    suite to close one bounded finding is the cost this workflow exists to avoid.
+    """
+
+    observed = {
+        result.command: result.status
+        for result in attempt.validation_results
+        if result.status == "passed"
+    }
+    return all(
+        requirement.command in observed for requirement in finding.effective_contract.validation
+    )
 
 
 def _task_id(task: JsonObject) -> str:

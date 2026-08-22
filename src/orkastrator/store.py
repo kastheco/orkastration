@@ -69,8 +69,26 @@ class IntegrationBusyError(RuntimeError):
     """Raised when another approved commit owns a lane's integration lock."""
 
 
-FindingOrigin = Literal["initial_review", "introduced_by_fix", "unrelated", "ci_failure"]
+FindingOrigin = Literal[
+    "initial_review", "introduced_by_fix", "unrelated", "ci_failure", "worker_blocked"
+]
 ContractRow = TypeVar("ContractRow", FixAttemptRow, ReReviewRow, EscalationRow)
+
+_SETTLED_STAGE_PHASES = frozenset(
+    {StagePhase.COMPLETED.value, StagePhase.FAILED.value, StagePhase.BLOCKED.value}
+)
+"""Stage phases `ensure_stage` will never dispatch again under the same key."""
+
+_REOPENABLE_PHASES = (
+    FindingPhase.PENDING_FIX,
+    FindingPhase.PENDING_RE_REVIEW,
+    FindingPhase.PENDING_ESCALATION,
+)
+"""The phases a settled finding may be sent back to.
+
+Every other phase either names work already in flight or is itself terminal, and
+reopening into one would hand the graph a state no stage can advance.
+"""
 
 
 class StateStore:
@@ -87,6 +105,7 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         SQLModel.metadata.create_all(self._engine)
         self._migrate_additive_columns()
+        self._migrate_contract_uniqueness()
         with self._session() as session:
             active_runs = session.exec(
                 select(SupervisorRunRow).where(
@@ -186,6 +205,24 @@ class StateStore:
                 )
             ).all()
             return [_stage(row) for row in rows]
+
+    def foreign_reservations(self, run_id: str) -> list[tuple[str, StageRecord]]:
+        """Return unconfirmed start reservations held by every other run.
+
+        Capacity is counted across the whole store, so a reservation abandoned by a
+        run nobody monitors any more would otherwise spend that budget forever.
+        """
+
+        with self._session() as session:
+            rows = session.exec(
+                select(LaneRow.run_id, WorkflowStageRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(WorkflowStageRow.lane_id))
+                .where(LaneRow.run_id != run_id)
+                .where(WorkflowStageRow.phase == StagePhase.STARTING.value)
+                .where(col(WorkflowStageRow.orca_dispatch_id).is_(None))
+                .order_by(col(WorkflowStageRow.created_at), col(WorkflowStageRow.stage_id))
+            ).all()
+            return [(owner, _stage(row)) for owner, row in rows]
 
     def findings(self, run_id: str, lane_id: str | None = None) -> list[FindingRecord]:
         with self._session() as session:
@@ -710,6 +747,123 @@ class StateStore:
             ).one()
             return _finding(row)
 
+    def reopen_finding(
+        self,
+        run_id: str,
+        finding_id: str,
+        *,
+        phase: FindingPhase,
+        round: int | None = None,
+        escalation_reason: FindingReason | None = None,
+        note: str,
+    ) -> FindingRecord:
+        """Send one settled finding back to an earlier phase and clear what follows it.
+
+        A finding settles wrongly when the supervisor lacked a word for what an
+        agent meant, and until now the only way back was five hand-written UPDATE
+        statements against the state file. Two of those statements encode
+        implementation detail nobody should have to remember: `ensure_stage` keys
+        off `stage_key`, so a settled stage has to be renamed or the graph never
+        dispatches a replacement, and every contract row is frozen against its own
+        replay, so a stale verdict at the reopened round rejects the fresh one as
+        "contract changed after persistence".
+
+        So retire the stages at and after the reopened round, drop exactly the
+        contract classes that come after `phase`, and leave everything before it
+        alone - a fix that is already committed is evidence a re-adjudication may
+        still need.
+        """
+
+        if phase not in _REOPENABLE_PHASES:
+            raise ValueError(f"cannot reopen a finding into {phase.value}")
+        retired = 0
+        with self._session() as session:
+            row = session.exec(
+                select(FindingRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+                .where(LaneRow.run_id == run_id, FindingRow.finding_id == finding_id)
+            ).first()
+            if row is None:
+                raise KeyError(f"run {run_id} has no finding {finding_id}")
+            target = row.round if round is None else round
+            stages = session.exec(
+                select(WorkflowStageRow).where(
+                    WorkflowStageRow.finding_key == row.finding_key,
+                    col(WorkflowStageRow.round) >= target,
+                )
+            ).all()
+            for stage in stages:
+                if stage.phase not in _SETTLED_STAGE_PHASES:
+                    continue
+                stage.stage_key = f"{stage.stage_key}:reopened{_now():%Y%m%d%H%M%S}"
+                stage.updated_at = _now()
+                retired += 1
+            for contract in self._superseded_contracts(session, row.finding_key, target, phase):
+                session.delete(contract)
+            row.phase = phase.value
+            row.round = target
+            row.escalation_reason = None if escalation_reason is None else escalation_reason.value
+            row.updated_at = _now()
+            lane = session.get(LaneRow, row.lane_id)
+            if lane is not None and lane.phase != LanePhase.ACTIVE.value:
+                lane.phase = LanePhase.ACTIVE.value
+                lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status != "active":
+                run.status = "active"
+                run.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "finding_reopened",
+                {
+                    "finding_id": finding_id,
+                    "phase": phase.value,
+                    "round": target,
+                    "reason": None if escalation_reason is None else escalation_reason.value,
+                    "retired_stages": retired,
+                    "note": note[:4_000],
+                },
+            )
+            return _finding(row)
+
+    @staticmethod
+    def _superseded_contracts(
+        session: Session, finding_key: str, round: int, phase: FindingPhase
+    ) -> list[FixAttemptRow | ReReviewRow | EscalationRow]:
+        """Collect the frozen contracts a reopen at `phase` invalidates.
+
+        Reopening to an escalation keeps the fix attempt on purpose: `accept_fix`
+        settles a finding on a commit that already exists, so dropping the record of
+        that commit would take away the evidence the re-adjudication has to weigh.
+        """
+
+        rows: list[FixAttemptRow | ReReviewRow | EscalationRow] = list(
+            session.exec(
+                select(EscalationRow).where(
+                    EscalationRow.finding_key == finding_key, col(EscalationRow.round) >= round
+                )
+            ).all()
+        )
+        if phase in {FindingPhase.PENDING_FIX, FindingPhase.PENDING_RE_REVIEW}:
+            rows.extend(
+                session.exec(
+                    select(ReReviewRow).where(
+                        ReReviewRow.finding_key == finding_key, col(ReReviewRow.round) >= round
+                    )
+                ).all()
+            )
+        if phase is FindingPhase.PENDING_FIX:
+            rows.extend(
+                session.exec(
+                    select(FixAttemptRow).where(
+                        FixAttemptRow.finding_key == finding_key, col(FixAttemptRow.round) >= round
+                    )
+                ).all()
+            )
+        return rows
+
     def set_finding_state(
         self,
         run_id: str,
@@ -763,11 +917,7 @@ class StateStore:
             raise ValueError("fixer stage omitted attempt kind")
         with self._session() as session:
             existing = session.exec(
-                select(FixAttemptRow).where(
-                    FixAttemptRow.finding_key == finding.finding_key,
-                    FixAttemptRow.round == attempt.round,
-                    FixAttemptRow.attempt_kind == stage.attempt_kind.value,
-                )
+                select(FixAttemptRow).where(FixAttemptRow.stage_id == stage.stage_id)
             ).first()
             created = self._record_contract(
                 session,
@@ -802,10 +952,7 @@ class StateStore:
     ) -> None:
         with self._session() as session:
             existing = session.exec(
-                select(ReReviewRow).where(
-                    ReReviewRow.finding_key == finding.finding_key,
-                    ReReviewRow.round == result.round,
-                )
+                select(ReReviewRow).where(ReReviewRow.stage_id == stage.stage_id)
             ).first()
             created = self._record_contract(
                 session,
@@ -836,9 +983,9 @@ class StateStore:
     def re_review(self, finding_key: str, round: int) -> ReReviewResult | None:
         with self._session() as session:
             row = session.exec(
-                select(ReReviewRow).where(
-                    ReReviewRow.finding_key == finding_key, ReReviewRow.round == round
-                )
+                select(ReReviewRow)
+                .where(ReReviewRow.finding_key == finding_key, ReReviewRow.round == round)
+                .order_by(col(ReReviewRow.created_at).desc())
             ).first()
             return None if row is None else ReReviewResult.model_validate_json(row.payload_json)
 
@@ -851,11 +998,7 @@ class StateStore:
     ) -> None:
         with self._session() as session:
             existing = session.exec(
-                select(EscalationRow).where(
-                    EscalationRow.finding_key == finding.finding_key,
-                    EscalationRow.round == decision.round,
-                    EscalationRow.reason == decision.reason,
-                )
+                select(EscalationRow).where(EscalationRow.stage_id == stage.stage_id)
             ).first()
             created = self._record_contract(
                 session,
@@ -896,8 +1039,24 @@ class StateStore:
             )
             if not rows:
                 return None
-            rows.sort(key=lambda row: (row.round, row.attempt_kind == "fallback"), reverse=True)
+            rows.sort(
+                key=lambda row: (row.round, row.attempt_kind == "fallback", row.created_at),
+                reverse=True,
+            )
             return FixAttempt.model_validate_json(rows[0].payload_json)
+
+    def fix_attempt_count(self, finding_key: str, round: int) -> int:
+        """Count the fix attempts this finding actually recorded at one round."""
+
+        with self._session() as session:
+            return len(
+                session.exec(
+                    select(FixAttemptRow).where(
+                        FixAttemptRow.finding_key == finding_key,
+                        FixAttemptRow.round == round,
+                    )
+                ).all()
+            )
 
     def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
         with self._session() as session:
@@ -911,7 +1070,9 @@ class StateStore:
             )
             if not rows:
                 return None
-            rows.sort(key=lambda row: row.attempt_kind == "fallback", reverse=True)
+            rows.sort(
+                key=lambda row: (row.attempt_kind == "fallback", row.created_at), reverse=True
+            )
             return FixAttempt.model_validate_json(rows[0].payload_json)
 
     def record_scope_check(
@@ -1157,6 +1318,14 @@ class StateStore:
         row: ContractRow,
         table_name: str,
     ) -> bool:
+        """Freeze one stage's contract against its own replay.
+
+        The subject is the stage, not the round. A round can legitimately be run
+        twice - a fix rebased after a conflict, an adjudication of a fix that
+        conflicted again - and each run records its own verdict. What must never
+        change is what a single stage said once it has been persisted.
+        """
+
         if existing is not None:
             if existing.payload_json != row.payload_json:
                 raise ValueError(f"{table_name} contract changed after persistence")
@@ -1244,6 +1413,47 @@ class StateStore:
             except Exception:
                 session.rollback()
                 raise
+
+    _CONTRACT_TABLES = ("fix_attempts", "re_reviews", "escalations")
+    """Tables whose contract identity moved from the round to the stage."""
+
+    def _migrate_contract_uniqueness(self) -> None:
+        """Rebuild contract tables that still make a round unique.
+
+        A round can legitimately be run twice, so the older unique keys rejected
+        an honest second verdict as a changed contract and stranded the finding.
+        Rebuild in place: the rows are kept, only the constraint changes.
+        """
+
+        inspector = inspect(self._engine)
+        for table in self._CONTRACT_TABLES:
+            if not inspector.has_table(table):
+                continue
+            superseded = f"{table}_superseded"
+            constraints = inspector.get_unique_constraints(table)
+            rebuilt = all(item["column_names"] == ["stage_id"] for item in constraints)
+            if rebuilt and not inspector.has_table(superseded):
+                continue
+            columns = [item["name"] for item in inspector.get_columns(table)]
+            names = ", ".join(columns)
+            if not rebuilt:
+                indexes = [item["name"] for item in inspector.get_indexes(table) if item["name"]]
+                with self._engine.begin() as connection:
+                    # A renamed table keeps its indexes, and create_all would
+                    # then refuse to build the replacement's own.
+                    for index in indexes:
+                        connection.exec_driver_sql(f"DROP INDEX {index}")
+                    connection.exec_driver_sql(f"ALTER TABLE {table} RENAME TO {superseded}")
+                SQLModel.metadata.create_all(self._engine)
+            # Finish a rebuild that was interrupted between the rename and the
+            # copy, and never overwrite a row the rebuilt table already holds.
+            with self._engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"INSERT INTO {table} ({names}) SELECT {names} FROM {superseded} old "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {table} new "
+                    f"WHERE new.stage_id = old.stage_id)"
+                )
+                connection.exec_driver_sql(f"DROP TABLE {superseded}")
 
     def _migrate_additive_columns(self) -> None:
         """Keep existing v2 databases readable without destructive migration."""

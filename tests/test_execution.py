@@ -20,11 +20,12 @@ from orkastrator.models import (
     PublicationReceipt,
     ReReviewResult,
     StageKind,
+    StagePhase,
     SupervisorPlan,
     ValidationRequirement,
     ValidationResult,
 )
-from orkastrator.orca import JsonObject
+from orkastrator.orca import JsonObject, OrcaError
 from orkastrator.publication import PublicationError
 from orkastrator.store import StateStore
 from tests.factories import (
@@ -95,6 +96,23 @@ def worker_result() -> str:
     )
 
 
+def worker_blocked(*, question: str = "Fix all four, or approve the two warnings as-is?") -> str:
+    return json.dumps(
+        {
+            "status": "blocked",
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "summary": "Guard restoration and upload lifetime disagree.",
+            "decision": {
+                "question": question,
+                "options": ["fix all four", "approve the two warnings"],
+                "consequence": "Approving leaves the owner unable to submit.",
+                "allowed_write_scope": {"paths": ["src/file1.py"], "symbols": []},
+            },
+        }
+    )
+
+
 def fixer_sha(finding_id: str, round: int) -> str:
     number = int(finding_id.rsplit("-", maxsplit=1)[-1])
     return f"{1_000 + round * 100 + number:040x}"
@@ -107,6 +125,7 @@ def fix_attempt(
     status: str = "fixed",
     base_sha: str | None = None,
     changed_path: str | None = None,
+    validation: list[dict[str, str]] | None = None,
 ) -> str:
     commit = fixer_sha(finding_id, round)
     base = base_sha or "b" * 40
@@ -121,7 +140,11 @@ def fix_attempt(
             "changed_paths": [changed_path or f"src/file{path_number}.py"]
             if status == "fixed"
             else [],
-            "validation_results": [],
+            "validation_results": (
+                validation
+                if validation is not None
+                else [{"command": "pytest", "status": "passed", "output": "passed"}]
+            ),
             "scope_expansion_required": (
                 {"paths": ["src/shared.py"], "reason": "Required."}
                 if status == "blocked_scope"
@@ -157,6 +180,7 @@ def escalation(
     *,
     round: int = 1,
     finding_id: str = "finding-1",
+    revised_finding: dict[str, object] | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -165,7 +189,7 @@ def escalation(
             "reason": reason,
             "action": action,
             "rationale": "Bounded adjudication.",
-            "revised_finding": None,
+            "revised_finding": revised_finding,
         }
     )
 
@@ -177,6 +201,9 @@ class FakeOrca:
         self.starts: list[dict[str, object]] = []
         self.releases: list[str] = []
         self.runs_by_id: dict[str, JsonObject] = {}
+        self.bound_runs: list[str] = []
+        self.unreadable_dispatches: set[str] = set()
+        self.messages_by_run: dict[str, list[JsonObject]] = {}
         self.fail_after_run_create = False
         self.fail_after_task_create = False
         self.fail_after_worker_start = False
@@ -192,6 +219,13 @@ class FakeOrca:
 
     async def runs(self) -> list[JsonObject]:
         return list(self.runs_by_id.values())
+
+    async def use_run(self, orca_run_id: str) -> JsonObject:
+        self.bound_runs.append(orca_run_id)
+        return {"ok": True}
+
+    async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]:
+        return list(self.messages_by_run.get(orca_run_id, []))
 
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         task_id = f"task-{len(self.tasks_by_id) + 1}"
@@ -235,6 +269,8 @@ class FakeOrca:
         return {"ok": True}
 
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
+        if task_id in self.unreadable_dispatches:
+            raise OrcaError("dispatch-show failed")
         for start in self.starts:
             if start["task_id"] == task_id:
                 return str(start["dispatch_id"]), str(start["worktree_id"])
@@ -295,6 +331,7 @@ class FakeGit(LocalGit):
         self.integrated: dict[str, str] = {}
         self.changed_override: list[str] | None = None
         self.head_override: str | None = None
+        self.ancestor_override: bool | None = None
         self.lane_head_override: str | None = None
         self.conflict = False
         self.crash_after_cherry_pick = False
@@ -309,6 +346,7 @@ class FakeGit(LocalGit):
         self.crash_mid_sequence = False
         self.active_sequence_commits: list[str] | None = None
         self.abort_calls = 0
+        self.diff_sha256_override: str | None = None
 
     async def head(self, worktree_id: str) -> str:
         if worktree_id == "repo::/tmp/issue" and self.lane_head_override is not None:
@@ -336,9 +374,13 @@ class FakeGit(LocalGit):
         return "a" * 40
 
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
+        if self.diff_sha256_override is not None and worktree_id == "repo::/tmp/issue":
+            return self.diff_sha256_override
         return "c" * 64
 
     async def is_ancestor(self, worktree_id: str, base_sha: str, head_sha: str) -> bool:
+        if self.ancestor_override is not None and "finding-" in worktree_id:
+            return self.ancestor_override
         return True
 
     async def commit_count(self, worktree_id: str, base_sha: str, head_sha: str) -> int:
@@ -522,6 +564,115 @@ async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Pat
 
     assert result.status == "failed"
     assert result.findings == []
+
+
+def _message(
+    message_id: str,
+    kind: str,
+    *,
+    from_handle: str,
+    thread_id: str | None = None,
+    created_at: str = "2026-08-22T10:16:56Z",
+) -> JsonObject:
+    return {
+        "id": message_id,
+        "type": kind,
+        "from_handle": from_handle,
+        "to_handle": "run:orca-run-1",
+        "thread_id": thread_id if thread_id is not None else message_id,
+        "subject": "Question",
+        "body": "Choose fix or approve.",
+        "created_at": created_at,
+    }
+
+
+async def test_monitor_reports_an_unanswered_question_against_its_stage(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    dispatch_id = accepted.started[0].dispatch_id
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{dispatch_id}"),
+        _message("msg-2", "heartbeat", from_handle=f"dispatch:{dispatch_id}"),
+    ]
+
+    result = await value.monitor(run_id)
+
+    assert [(q.message_id, q.kind, q.lane, q.role) for q in result.questions] == [
+        ("msg-1", "question", "issue-100", StageKind.WORKER)
+    ]
+    assert result.questions[0].dispatch_id == dispatch_id
+
+
+async def test_monitor_drops_a_question_once_it_has_a_reply(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    dispatch_id = accepted.started[0].dispatch_id
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{dispatch_id}"),
+        _message("msg-2", "status", from_handle="run:orca-run-1", thread_id="msg-1"),
+    ]
+
+    result = await value.monitor(run_id)
+
+    assert result.questions == []
+
+
+async def test_monitor_reports_an_escalation_it_cannot_attribute(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-9", "escalation", from_handle="term_unknown"),
+    ]
+
+    result = await value.monitor(run_id)
+
+    assert [(q.message_id, q.lane, q.role, q.dispatch_id) for q in result.questions] == [
+        ("msg-9", None, None, None)
+    ]
+
+
+async def test_initial_review_normalizes_a_differently_computed_diff_digest(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    finding = review_finding_data()
+    report = json.loads(initial_review_report_json(finding))
+    report["review_revision"]["diff_sha256"] = "d" * 64
+    report["findings"][0]["review_revision"]["diff_sha256"] = "d" * 64
+
+    orca.complete_dispatched(json.dumps(report))
+    result = await value.monitor(run_id)
+
+    assert result.status == "active"
+    assert [record.finding_id for record in result.findings] == ["finding-1"]
+    assert store.findings(run_id)[0].contract.review_revision.diff_sha256 == "c" * 64
+
+
+async def test_initial_review_rejects_a_diff_the_lane_checkout_cannot_reproduce(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    git.diff_sha256_override = "f" * 64
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
 
 
 async def test_initial_review_requires_the_clean_frozen_lane_head(tmp_path: Path) -> None:
@@ -711,7 +862,25 @@ async def test_partial_re_review_discovery_replays_idempotently(tmp_path: Path) 
         ],
     )
     orca.complete_dispatched(body)
-    persisted = ReReviewResult.model_validate_json(body)
+    # A crash-replay finds what the supervisor persisted, which is the report
+    # already restated on the revision it derived for the fixer commit.
+    bound = {
+        "base_sha": "b" * 40,
+        "head_sha": fixer_sha("finding-1", 1),
+        "diff_sha256": "c" * 64,
+    }
+    raw = ReReviewResult.model_validate_json(body)
+    persisted = raw.model_copy(
+        update={
+            "reviewed_commit_sha": fixer_sha("finding-1", 1),
+            "new_findings": [
+                item.model_copy(
+                    update={"finding": item.finding.model_copy(update={"review_revision": bound})}
+                )
+                for item in raw.new_findings
+            ],
+        }
+    )
     original = store.findings(run_id)[0]
     stage = next(item for item in store.stages(run_id) if item.role is StageKind.RE_REVIEWER)
     store.record_re_review(run_id, original, stage, persisted)
@@ -820,10 +989,120 @@ async def test_out_of_scope_diff_is_rejected_and_escalated(tmp_path: Path) -> No
     assert payload["actual_paths"] == ["src/outside.py"]
 
 
-async def test_exact_fixer_head_is_required_before_re_review(tmp_path: Path) -> None:
+async def test_fixer_identity_is_taken_from_the_record_not_from_the_report(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    mistyped = json.loads(fix_attempt())
+    mistyped["base_sha"] = "0" * 40
+    mistyped["commit_sha"] = "1" * 40
+    orca.complete_dispatched(json.dumps(mistyped))
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.RE_REVIEWER
+    attempt = store.latest_fix_attempt(store.findings(run_id)[0].finding_key)
+    assert attempt is not None
+    assert attempt.base_sha == "b" * 40
+    assert attempt.commit_sha == fixer_sha("finding-1", 1)
+
+
+async def test_adjudicator_may_omit_the_revision_of_a_revised_contract(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    await value.monitor(run_id)
+    revised = review_finding_data()
+    del revised["review_revision"]
+    revised["allowed_write_scope"] = {"paths": ["src/file1.py", "src/widened.py"], "symbols": []}
+    orca.complete_dispatched(
+        escalation("validation_failed", "approve_scope_revision", revised_finding=revised)
+    )
+
+    result = await value.monitor(run_id)
+
+    finding = result.findings[0]
+    assert finding.phase is FindingPhase.FIXING
+    assert finding.round == 2
+    contract = store.findings(run_id)[0].effective_contract
+    assert contract.review_revision is not None
+    assert contract.review_revision.head_sha == "b" * 40
+    assert contract.allowed_write_scope.paths == ["src/file1.py", "src/widened.py"]
+
+
+async def test_accepting_a_verified_fix_settles_the_finding_instead_of_refixing(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+    orca.complete_dispatched(escalation("validation_failed", "accept_fix"))
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.RESOLVED
+    assert store.integrations(run_id)[0].status == "integrated"
+
+
+async def test_accepting_a_fix_that_was_never_committed_blocks(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(status="capability_mismatch"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt(status="capability_mismatch"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("ambiguous_result", "accept_fix"))
+
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+
+
+async def test_approving_a_finding_unchanged_starts_the_next_fix_round(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    await value.monitor(run_id)
+    frozen = store.findings(run_id)[0].effective_contract
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged"))
+
+    result = await value.monitor(run_id)
+
+    finding = result.findings[0]
+    assert finding.phase is FindingPhase.FIXING
+    assert finding.round == 2
+    assert store.findings(run_id)[0].effective_contract == frozen
+
+
+async def test_fixer_head_off_its_assigned_base_is_rejected_before_re_review(
+    tmp_path: Path,
+) -> None:
     orca = FakeOrca()
     git = FakeGit()
     git.head_override = "9" * 40
+    git.ancestor_override = False
     value, _ = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
@@ -882,7 +1161,14 @@ async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: P
     fixer_starts = [item for item in orca.starts if "fixer" in str(item["lane_name"])]
     for start in fixer_starts:
         finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
-        orca.complete_task(str(start["task_id"]), fix_attempt(finding_id))
+        command = "pytest" if finding_id == "finding-1" else "pytest tests/test_two.py"
+        orca.complete_task(
+            str(start["task_id"]),
+            fix_attempt(
+                finding_id,
+                validation=[{"command": command, "status": "passed", "output": "passed"}],
+            ),
+        )
     result = await value.monitor(run_id)
     assert [item.role for item in result.started] == [StageKind.RE_REVIEWER], store.events(run_id)
 
@@ -941,7 +1227,15 @@ async def test_introduced_regression_integrates_the_approved_composite_chain(
     assert result.started[0].role is StageKind.FIXER
     corrected_commit = fixer_sha("finding-2", 1)
     git.commit_chain_override = [original_commit, corrected_commit]
-    orca.complete_dispatched(fix_attempt("finding-2", base_sha=original_commit))
+    orca.complete_dispatched(
+        fix_attempt(
+            "finding-2",
+            base_sha=original_commit,
+            validation=[
+                {"command": "pytest tests/regression.py", "status": "passed", "output": "passed"}
+            ],
+        )
+    )
     await value.monitor(run_id)
     orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
 
@@ -1058,6 +1352,32 @@ async def test_integration_conflict_maps_to_the_finding(tmp_path: Path) -> None:
 
     assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
     assert store.integrations(run_id)[0].status == "conflict"
+
+
+async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
+
+    orca.complete_dispatched(escalation("integration_conflict", "approve_unchanged"))
+    result = await value.monitor(run_id)
+
+    # The fix was approved on its merits, so the retry is a rebase at round 1
+    # rather than the second and final round the ceiling would then close.
+    assert result.findings[0].round == 1
+    assert result.started[0].role is StageKind.FIXER
+    assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
 
 
 async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:
@@ -1228,6 +1548,49 @@ async def test_global_worker_limit_counts_other_active_runs(tmp_path: Path) -> N
 
     assert result.started == []
     assert store.active_worker_count() == 1
+
+
+async def test_monitor_reclaims_an_abandoned_reservation_from_another_run(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    graph = config(max_workers=1, max_fixers=1)
+    value, store = controller(tmp_path, orca, graph_config=graph)
+    abandoned = store.record_proposal(proposal())
+    abandoned_stage = store.stages(abandoned)[0]
+    store.mark_accepted(abandoned, "orca-abandoned")
+    store.bind_stage_task(abandoned, abandoned_stage.stage_id, "task-abandoned")
+    assert store.reserve_stage_start(
+        abandoned, abandoned_stage, max_workers=1, max_lanes=1, max_lane_fixers=1
+    )
+
+    run_id = value.propose(proposal()).run_id
+    result = await value.accept(run_id)
+
+    assert [launch.role for launch in result.started] == [StageKind.WORKER]
+    assert store.stages(abandoned)[0].phase is StagePhase.READY
+
+
+async def test_monitor_keeps_a_reservation_whose_dispatch_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    graph = config(max_workers=1, max_fixers=1)
+    value, store = controller(tmp_path, orca, graph_config=graph)
+    abandoned = store.record_proposal(proposal())
+    abandoned_stage = store.stages(abandoned)[0]
+    store.mark_accepted(abandoned, "orca-abandoned")
+    store.bind_stage_task(abandoned, abandoned_stage.stage_id, "task-abandoned")
+    assert store.reserve_stage_start(
+        abandoned, abandoned_stage, max_workers=1, max_lanes=1, max_lane_fixers=1
+    )
+    orca.unreadable_dispatches.add("task-abandoned")
+
+    run_id = value.propose(proposal()).run_id
+    result = await value.accept(run_id)
+
+    assert result.started == []
+    assert store.stages(abandoned)[0].phase is StagePhase.STARTING
 
 
 async def test_invalid_fixer_result_stops_for_ambiguous_escalation(tmp_path: Path) -> None:
@@ -1419,3 +1782,181 @@ async def test_ci_fix_rounds_stop_after_two_failed_republished_heads(tmp_path: P
     assert result.status == "blocked"
     assert len(store.ci_failures(run_id)) == 2
     assert len(publisher.publish_calls) == 3
+
+
+async def test_blocked_worker_escalates_instead_of_starting_a_review(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_blocked())
+    result = await value.monitor(run_id)
+
+    assert [finding.origin for finding in result.findings] == ["worker_blocked"]
+    assert result.findings[0].phase is FindingPhase.ESCALATING
+    assert result.findings[0].escalation_reason is FindingReason.WORKER_DECISION
+    assert [launch.role for launch in result.started] == [StageKind.ESCALATION]
+    assert StageKind.INITIAL_REVIEWER not in {stage.role for stage in result.stages}
+    assert store.lanes(run_id)[0].review_head_sha is None
+
+
+async def test_blocked_worker_decision_reaches_the_adjudicator_verbatim(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_blocked(question="Which document may be uploaded?"))
+
+    result = await value.monitor(run_id)
+
+    contract = result.findings[0].effective_contract
+    assert contract.required_outcome.startswith("Which document may be uploaded?")
+    assert contract.allowed_write_scope.paths == ["src/file1.py"]
+    spec = orca.tasks_by_id[result.started[0].task_id]["spec"]
+    assert "Which document may be uploaded?" in str(spec)
+
+
+async def test_blocked_worker_must_leave_a_clean_checkout(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_clean_override = False
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_blocked())
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+    assert result.findings == []
+
+
+async def test_blocked_worker_head_must_match_its_lane(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_head_override = "9" * 40
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_blocked())
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+
+
+async def test_adjudicated_worker_decision_resumes_as_a_bounded_fixer(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_blocked())
+    await value.monitor(run_id)
+    revised = review_finding_data()
+    revised["id"] = "worker-decision-1"
+    revised["review_revision"] = {
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "diff_sha256": "c" * 64,
+    }
+    orca.complete_dispatched(
+        json.dumps(
+            {
+                "finding_id": "worker-decision-1",
+                "round": 1,
+                "reason": "worker_decision",
+                "action": "approve_scope_revision",
+                "rationale": "Fix all four.",
+                "revised_finding": revised,
+            }
+        )
+    )
+
+    result = await value.monitor(run_id)
+
+    assert [launch.role for launch in result.started] == [StageKind.FIXER]
+    assert result.findings[0].phase is FindingPhase.FIXING
+    assert result.findings[0].round == 2
+
+
+async def test_fixer_missing_a_required_validation_escalates(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+    assert [launch.role for launch in result.started] == [StageKind.ESCALATION]
+
+
+async def test_fixer_reporting_a_failed_required_validation_escalates(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(
+        fix_attempt(validation=[{"command": "pytest", "status": "failed", "output": "1 failed"}])
+    )
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+
+async def test_fixer_may_add_its_own_proof_beyond_the_contract(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(
+        fix_attempt(
+            validation=[
+                {"command": "pytest", "status": "passed", "output": "passed"},
+                {"command": "pytest tests/test_one.py", "status": "passed", "output": "passed"},
+            ]
+        )
+    )
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is None
+    assert [launch.role for launch in result.started] == [StageKind.RE_REVIEWER]
+
+
+async def test_an_adjudicated_retry_at_the_ceiling_is_granted_once(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged"))
+    result = await value.monitor(run_id)
+    assert result.findings[0].round == 2
+
+    orca.complete_dispatched(fix_attempt(round=2, validation=[]))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged", round=2))
+    result = await value.monitor(run_id)
+
+    # The adjudicator read the head itself and asked for one more attempt, so the
+    # ceiling round is re-run rather than closed over verified work.
+    assert result.findings[0].phase is FindingPhase.FIXING
+    assert result.findings[0].round == 2
+    assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
+
+    orca.complete_dispatched(fix_attempt(round=2, validation=[]))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged", round=2))
+    result = await value.monitor(run_id)
+
+    # A second grant would make the ceiling mean nothing, so the finding blocks.
+    assert result.findings[0].phase is FindingPhase.BLOCKED

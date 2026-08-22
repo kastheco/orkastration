@@ -104,3 +104,23 @@ async def test_dirty_state_and_validation_are_observed_without_shell(tmp_path: P
         [ValidationRequirement(command="git diff --check", expected="passes")],
     )
     assert results[0].status == "passed"
+
+
+async def test_unrunnable_validation_command_fails_the_finding_not_the_tick(
+    tmp_path: Path,
+) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "unrunnable"
+    lane_id = add_worktree(repo, lane, "unrunnable", base)
+
+    results = await LocalGit().validate(
+        lane_id,
+        [
+            ValidationRequirement(
+                command="cd app/ui && npx tsc -b", expected="Both exit 0 with no diagnostics."
+            )
+        ],
+    )
+
+    assert [item.status for item in results] == ["failed"]
+    assert "without a shell" in results[0].output

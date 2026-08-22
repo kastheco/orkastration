@@ -34,19 +34,20 @@ review_cycle:
     agent: codex
     model: gpt-5.6-sol
     strength: high
-    fast: false
+    fast: true
 
 roles:
   worker:
     agent: codex
     model: gpt-5.6-sol
     strength: medium
+    fast: true
 
   initial_reviewer:
     agent: claude
     model: opus
     strength: high
-    fast: false
+    fast: true
 
   fixer:
     agent: codex
@@ -64,7 +65,7 @@ roles:
     agent: claude
     model: sonnet
     strength: medium
-    fast: false
+    fast: true
 
 publication:
   authorized_by: graph_acceptance

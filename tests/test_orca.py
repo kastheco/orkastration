@@ -284,6 +284,8 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
         "task-1",
         "--terminal",
         "terminal-1",
+        "--worktree",
+        "id:repo::/tmp/issue-123",
         "--json",
     )
 
@@ -410,3 +412,70 @@ async def test_subprocess_runner_kills_timeout(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(OrcaError, match="timed out"):
         await SubprocessRunner(("orca-ide",), Path("/tmp"), 0.001).run(("status", "--json"))
     assert process.killed is True
+
+
+async def test_subprocess_runner_reports_the_orca_error_written_to_stdout(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "orca-fake"
+    script.write_text(
+        "#!/bin/sh\n"
+        'printf \'{"ok":false,"error":{"code":"selector_not_found",'
+        '"message":"selector_not_found"}}\'\n'
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    runner = SubprocessRunner(command=(str(script),), cwd=tmp_path, timeout_seconds=10)
+
+    with pytest.raises(OrcaError) as failure:
+        await runner.run(["orchestration", "worker-start"])
+
+    assert "selector_not_found" in str(failure.value)
+
+
+async def test_ok_surfaces_the_typed_error_code() -> None:
+    client = OrcaClient(
+        FakeRunner([{"ok": False, "error": {"code": "consumer_fenced", "message": "fenced"}}])
+    )
+
+    with pytest.raises(OrcaError) as failure:
+        await client.status()
+
+    assert "consumer_fenced: fenced" in str(failure.value)
+
+
+async def test_use_run_binds_the_coordinator_terminal() -> None:
+    runner = FakeRunner([{"ok": True, "result": {}}])
+
+    await OrcaClient(runner).use_run("run-1")
+
+    assert runner.calls[0] == ("orchestration", "run-use", "--id", "run-1", "--json")
+
+
+async def test_messages_returns_only_the_requested_run() -> None:
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "messages": [
+                        {"id": "msg-1", "run_id": "run-1", "type": "question"},
+                        {"id": "msg-2", "run_id": "run-2", "type": "question"},
+                    ]
+                },
+            }
+        ]
+    )
+    client = OrcaClient(runner)
+
+    messages = await client.messages("run-1")
+
+    assert [message["id"] for message in messages] == ["msg-1"]
+    assert runner.calls[0] == ("orchestration", "inbox", "--limit", "200", "--json")
+
+
+async def test_messages_rejects_a_response_without_a_message_list() -> None:
+    client = OrcaClient(FakeRunner([{"ok": True, "result": {"messages": "none"}}]))
+
+    with pytest.raises(OrcaError, match=r"omitted result\.messages"):
+        await client.messages("run-1")
