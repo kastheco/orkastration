@@ -171,6 +171,41 @@ uv run --project /home/kas/dev/orkastrator orkas reopen <run-id> \
 `--phase` accepts `pending_fix`, `pending_re_review`, or `pending_escalation`. The round defaults to
 the finding's current one.
 
+Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
+so it is a separate command from `reopen` and it records the note as evidence:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas settle <run-id> \
+  --finding <finding-id> --phase deferred --note "why" --json
+```
+
+## Measuring convergence
+
+A run's cost is not its wall clock. It is how many agent dispatches each finding consumed, and how
+much of that work was a repeat of work already attempted. Both are already on disk, so reading them
+costs one SQLite query and no agent turn:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas report <run-id>
+uv run --project /home/kas/dev/orkastrator orkas report <run-id> --json
+```
+
+```text
+dispatches per finding   7.667   (92 adjudication stages / 12 findings)
+repeat rate              0.505   (49 of 97 stages redid attempted work)
+start rejection rate     0.196   (20 of 102 starts; 7 reservations reset)
+findings past round 1    7 of 12
+```
+
+Both leading numbers should fall as the graph gets stricter about what it dispatches. Run `report`
+against a run from before a change and one from after: if the two numbers did not move, the change
+did not converge anything, whatever else it improved.
+
+Escalations are grouped by reason and start rejections by cause rather than by wording, so a class
+that recurs is visible as a count instead of as twenty near-identical strings. A single finding
+consuming a double-digit share of a run's dispatches is the shape to look for, and it is usually one
+reason repeating rather than a hard problem.
+
 ## Communication boundary
 
 The interactive supervisor can answer questions because it owns the conversation and the
@@ -182,12 +217,23 @@ return typed results through Orca.
 
 A running worker can ask a question. `orkas monitor` surfaces unanswered questions in its result and
 stops watching when it finds one, because an agent parked on a decision the graph cannot make for it
-will not move no matter how many ticks it gets. The supervisor reads the question, explains it, and
-answers through Orca's own reply channel:
+will not move no matter how many ticks it gets. The monitor line is a status line, so it carries the
+subject and a count. Read the question itself, and answer it:
 
 ```bash
-orca orchestration reply --id <message-id> --body <text> --json
+orkas questions <run-id>
+orkas answer <run-id> --message <message-id> --body-file answer.txt
 ```
+
+`--body` takes the text inline; `--body-file` reads it from a file, which is what a direction of any
+length wants. Only a question that is currently unanswered on that run can be answered: a typo must
+not direct an agent in a different run, and a thread that already has an answer must not collect a
+second one, because an agent reading the thread cannot tell which direction is current.
+
+Every answer is recorded as a `supervisor_answered` event, so `orkas show` can reconstruct why a lane
+changed course. Answering through `orca orchestration reply` directly is possible but awkward: it
+refuses any `--from` other than the run's own `coordinator_handle`, which `orkas answer` resolves for
+you.
 
 A worker that cannot proceed at all returns blocked or escalation evidence instead, and that evidence
 drives the convergence loop rather than the conversation.
