@@ -16,6 +16,7 @@ from orkastrator.models import (
     CiReceipt,
     FindingPhase,
     FindingReason,
+    LanePhase,
     LaneRecord,
     PublicationReceipt,
     ReReviewResult,
@@ -1816,6 +1817,41 @@ async def test_ci_failure_creates_scoped_finding_then_republishes_fix(
     assert len(publisher.publish_calls) == 2
     assert publisher.publish_calls[1][1] == "b" * 40
     assert store.publications(run_id)[-1].draft is False
+
+
+async def test_a_complete_lane_is_never_touched_by_publication_again(tmp_path: Path) -> None:
+    """A lane that has succeeded must not be able to fail on a later tick.
+
+    Publication used to skip only blocked and failed lanes, so a complete lane
+    was re-marked-ready every tick. ``mark_ready`` re-verifies that the pull
+    request is still OPEN, so an owner merging it - the outcome the lane was
+    working toward - turned the next tick into "the authorized lane pull request
+    is no longer open", blocking the lane and taking the whole run terminal with
+    every other lane still working.
+    """
+
+    class MergedAfterReady(FakePublisher):
+        async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            if self.ready_calls:
+                raise PublicationError("the authorized lane pull request is no longer open")
+            return await super().mark_ready(receipt)
+
+    orca = FakeOrca()
+    publisher = MergedAfterReady()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+    assert first.status == "complete", store.events(run_id)
+
+    second = await value.monitor(run_id)
+
+    assert second.status == "complete"
+    assert publisher.ready_calls == ["b" * 40]
+    assert store.lanes(run_id)[0].phase is LanePhase.COMPLETE
 
 
 async def test_stale_ci_sha_and_publication_errors_block_the_lane(tmp_path: Path) -> None:

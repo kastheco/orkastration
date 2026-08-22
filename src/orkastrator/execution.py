@@ -1393,7 +1393,16 @@ class ExecutionController:
 
         self._require_authorization(run_id)
         for lane in self._store.lanes(run_id):
-            if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED}:
+            if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}:
+                # A complete lane is finished: its head is published, its pull
+                # request is out of draft and its required checks passed for that
+                # exact head. Coming back to it every tick re-edits the pull
+                # request body and re-queries checks for no decision, and it hands
+                # the lane a way to fail after it has already succeeded - an owner
+                # who merges the pull request turns the next pass into
+                # "the authorized lane pull request is no longer open", which
+                # blocks the lane and takes the whole run terminal. Merging is the
+                # outcome this lane was working toward, so stop here.
                 continue
             if not self._local_lane_settled(run_id, lane):
                 continue
