@@ -187,6 +187,24 @@ class StateStore:
             ).all()
             return [_stage(row) for row in rows]
 
+    def foreign_reservations(self, run_id: str) -> list[tuple[str, StageRecord]]:
+        """Return unconfirmed start reservations held by every other run.
+
+        Capacity is counted across the whole store, so a reservation abandoned by a
+        run nobody monitors any more would otherwise spend that budget forever.
+        """
+
+        with self._session() as session:
+            rows = session.exec(
+                select(LaneRow.run_id, WorkflowStageRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(WorkflowStageRow.lane_id))
+                .where(LaneRow.run_id != run_id)
+                .where(WorkflowStageRow.phase == StagePhase.STARTING.value)
+                .where(col(WorkflowStageRow.orca_dispatch_id).is_(None))
+                .order_by(col(WorkflowStageRow.created_at), col(WorkflowStageRow.stage_id))
+            ).all()
+            return [(owner, _stage(row)) for owner, row in rows]
+
     def findings(self, run_id: str, lane_id: str | None = None) -> list[FindingRecord]:
         with self._session() as session:
             statement = (

@@ -20,11 +20,12 @@ from orkastrator.models import (
     PublicationReceipt,
     ReReviewResult,
     StageKind,
+    StagePhase,
     SupervisorPlan,
     ValidationRequirement,
     ValidationResult,
 )
-from orkastrator.orca import JsonObject
+from orkastrator.orca import JsonObject, OrcaError
 from orkastrator.publication import PublicationError
 from orkastrator.store import StateStore
 from tests.factories import (
@@ -178,6 +179,7 @@ class FakeOrca:
         self.releases: list[str] = []
         self.runs_by_id: dict[str, JsonObject] = {}
         self.bound_runs: list[str] = []
+        self.unreadable_dispatches: set[str] = set()
         self.fail_after_run_create = False
         self.fail_after_task_create = False
         self.fail_after_worker_start = False
@@ -240,6 +242,8 @@ class FakeOrca:
         return {"ok": True}
 
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
+        if task_id in self.unreadable_dispatches:
+            raise OrcaError("dispatch-show failed")
         for start in self.starts:
             if start["task_id"] == task_id:
                 return str(start["dispatch_id"]), str(start["worktree_id"])
@@ -1233,6 +1237,49 @@ async def test_global_worker_limit_counts_other_active_runs(tmp_path: Path) -> N
 
     assert result.started == []
     assert store.active_worker_count() == 1
+
+
+async def test_monitor_reclaims_an_abandoned_reservation_from_another_run(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    graph = config(max_workers=1, max_fixers=1)
+    value, store = controller(tmp_path, orca, graph_config=graph)
+    abandoned = store.record_proposal(proposal())
+    abandoned_stage = store.stages(abandoned)[0]
+    store.mark_accepted(abandoned, "orca-abandoned")
+    store.bind_stage_task(abandoned, abandoned_stage.stage_id, "task-abandoned")
+    assert store.reserve_stage_start(
+        abandoned, abandoned_stage, max_workers=1, max_lanes=1, max_lane_fixers=1
+    )
+
+    run_id = value.propose(proposal()).run_id
+    result = await value.accept(run_id)
+
+    assert [launch.role for launch in result.started] == [StageKind.WORKER]
+    assert store.stages(abandoned)[0].phase is StagePhase.READY
+
+
+async def test_monitor_keeps_a_reservation_whose_dispatch_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    graph = config(max_workers=1, max_fixers=1)
+    value, store = controller(tmp_path, orca, graph_config=graph)
+    abandoned = store.record_proposal(proposal())
+    abandoned_stage = store.stages(abandoned)[0]
+    store.mark_accepted(abandoned, "orca-abandoned")
+    store.bind_stage_task(abandoned, abandoned_stage.stage_id, "task-abandoned")
+    assert store.reserve_stage_start(
+        abandoned, abandoned_stage, max_workers=1, max_lanes=1, max_lane_fixers=1
+    )
+    orca.unreadable_dispatches.add("task-abandoned")
+
+    run_id = value.propose(proposal()).run_id
+    result = await value.accept(run_id)
+
+    assert result.started == []
+    assert store.stages(abandoned)[0].phase is StagePhase.STARTING
 
 
 async def test_invalid_fixer_result_stops_for_ambiguous_escalation(tmp_path: Path) -> None:

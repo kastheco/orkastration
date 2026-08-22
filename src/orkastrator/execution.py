@@ -43,7 +43,7 @@ from orkastrator.models import (
     ValidationRequirement,
     WorkerResult,
 )
-from orkastrator.orca import JsonObject
+from orkastrator.orca import JsonObject, OrcaError
 from orkastrator.publication import GitHubPublisher, LanePublisher, PublicationError
 from orkastrator.scope import path_allowed
 from orkastrator.store import IntegrationBusyError, StateStore
@@ -227,6 +227,7 @@ class ExecutionController:
 
         await self._process_results(run_id)
         await self._release_settled(run_id)
+        await self._reclaim_foreign_reservations(run_id)
         self._ensure_dynamic_stages(run_id)
         await self._ensure_tasks(run_id)
         started = await self._start_ready(run_id)
@@ -881,6 +882,28 @@ class ExecutionController:
             ):
                 await self._orca.release_worker(stage.orca_dispatch_id)
                 self._store.mark_released(run_id, stage.stage_id)
+
+    async def _reclaim_foreign_reservations(self, run_id: str) -> None:
+        """Release start reservations another run abandoned before Orca confirmed them.
+
+        A worker start that crashes between reserving capacity and recording its
+        Dispatch leaves the stage STARTING. Capacity is counted across every run, so
+        an abandoned reservation blocks this run's wave until its own run is
+        monitored again, which may never happen. Ask Orca whether a Dispatch exists
+        and reset the ones that were never really started.
+        """
+
+        for owner_run_id, stage in self._store.foreign_reservations(run_id):
+            if stage.orca_task_id is None:
+                continue
+            try:
+                recovered = await self._orca.worker_dispatch(stage.orca_task_id)
+            except OrcaError:
+                # The other run's Task may be gone entirely; leave its reservation
+                # alone rather than guessing, and keep reconciling this run.
+                continue
+            if recovered is None:
+                self._store.reset_stage_reservation(owner_run_id, stage)
 
     async def _start_ready(self, run_id: str) -> list[StageLaunch]:
         lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
