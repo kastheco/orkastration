@@ -8,6 +8,7 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-evals>=2.0,<3",
     "pyyaml>=6.0,<7",
+    "sqlmodel>=0.0.39,<0.1",
     "typer>=0.21,<1",
 ]
 

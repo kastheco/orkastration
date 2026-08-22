@@ -217,6 +217,7 @@ class Settings:
     database_path: Path
     claude_command: tuple[str, ...]
     codex_command: tuple[str, ...]
+    github_command: tuple[str, ...]
     orca_command: tuple[str, ...]
     command_timeout_seconds: float
     planner_timeout_seconds: float
@@ -241,6 +242,7 @@ class Settings:
             database_path=database_path,
             claude_command=_command("KASGRAPH_CLAUDE_COMMAND", default=("claude",)),
             codex_command=_command("KASGRAPH_CODEX_COMMAND", default=("codex",)),
+            github_command=_command("KASGRAPH_GITHUB_COMMAND", default=("gh",)),
             orca_command=_orca_command(),
             command_timeout_seconds=timeout,
             planner_timeout_seconds=planner_timeout,

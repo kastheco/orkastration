@@ -8,7 +8,7 @@ import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 
 from pydantic import TypeAdapter, ValidationError
 

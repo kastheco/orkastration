@@ -75,10 +75,20 @@ receipts, and deferred unrelated findings survive monitor restarts. If the
 session must remain interactive, call `monitor <run-id> --json` at checkpoints
 instead.
 
+After local findings settle, keep monitoring while Kasgraph publishes the
+integrated head to its deterministic GitHub branch, creates or updates the
+lane's draft pull request, and observes checks for that exact SHA. A failed check
+becomes a new scoped CI finding and can consume at most two CI-fix rounds. Do not
+rerun the initial reviewer. Kasgraph blocks on remote divergence, ambiguous fix
+attribution, unsupported remotes, or exhausted CI rounds. It never force-pushes,
+merges, or deploys. Treat `complete` as proof that the latest published head
+passed and the pull request was marked ready.
+
 Treat `integration_conflict` and `validation_failed` as finding-scoped
 escalations. Never clean or reset a dirty lane checkout on Kasgraph's behalf.
 Inspect `kasgraph show <run-id> --json` for the frozen review head, current
-integration head, exact fixer commits, and validation receipts.
+integration head, exact fixer commits, validation receipts, publication history,
+exact-SHA CI observations, and typed CI failures.
 
 On `blocked` or `failed`, inspect the Orca Task/Dispatch evidence before proposing
 recovery. On `complete`, summarize the exact lane results and update Linear or

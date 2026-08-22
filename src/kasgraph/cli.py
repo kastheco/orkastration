@@ -26,6 +26,7 @@ from kasgraph.planner import (
     SubprocessClaudeRunner,
     SubprocessCodexRunner,
 )
+from kasgraph.publication import GitHubPublisher, PublicationError
 from kasgraph.store import StateStore, UnsupportedStateError
 
 app = typer.Typer(
@@ -72,6 +73,7 @@ def doctor(
             "orca_command": list(settings.orca_command),
             "claude_command": list(settings.claude_command),
             "codex_command": list(settings.codex_command),
+            "github_command": list(settings.github_command),
             "orca_reachable": status.get("ok") is True,
         }
 
@@ -182,6 +184,13 @@ def show_graph(
             "integrations": [
                 receipt.model_dump(mode="json") for receipt in store.integrations(run_id)
             ],
+            "publications": [
+                receipt.model_dump(mode="json") for receipt in store.publications(run_id)
+            ],
+            "ci": [receipt.model_dump(mode="json") for receipt in store.ci_receipts(run_id)],
+            "ci_failures": [
+                finding.model_dump(mode="json") for finding in store.ci_failures(run_id)
+            ],
         }
     except (ConfigError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
@@ -209,7 +218,12 @@ def _components() -> tuple[Settings, StateStore, OrcaClient]:
 
 def _controller() -> ExecutionController:
     settings, store, orca = _components()
-    return ExecutionController(config=settings.graph, orca=orca, store=store)
+    return ExecutionController(
+        config=settings.graph,
+        orca=orca,
+        store=store,
+        publisher=GitHubPublisher(gh_command=settings.github_command),
+    )
 
 
 def _planner() -> SchemaCliPlanner:
@@ -242,6 +256,7 @@ def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
         GitError,
         OrcaError,
         PlannerError,
+        PublicationError,
         UnsupportedStateError,
         KeyError,
         TypeError,

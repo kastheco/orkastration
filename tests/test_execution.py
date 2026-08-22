@@ -12,8 +12,12 @@ from kasgraph.config import AgentProfile, GraphConfig
 from kasgraph.execution import ExecutionController
 from kasgraph.git import GitCommandResult, LocalGit
 from kasgraph.models import (
+    CiCheckResult,
+    CiReceipt,
     FindingPhase,
     FindingReason,
+    LaneRecord,
+    PublicationReceipt,
     ReReviewResult,
     StageKind,
     SupervisorPlan,
@@ -21,6 +25,7 @@ from kasgraph.models import (
     ValidationResult,
 )
 from kasgraph.orca import JsonObject
+from kasgraph.publication import PublicationError
 from kasgraph.store import StateStore
 from tests.factories import (
     graph_config_data,
@@ -101,6 +106,7 @@ def fix_attempt(
     round: int = 1,
     status: str = "fixed",
     base_sha: str | None = None,
+    changed_path: str | None = None,
 ) -> str:
     commit = fixer_sha(finding_id, round)
     base = base_sha or "b" * 40
@@ -112,7 +118,9 @@ def fix_attempt(
             "status": status,
             "base_sha": base,
             "commit_sha": commit if status == "fixed" else None,
-            "changed_paths": [f"src/file{path_number}.py"] if status == "fixed" else [],
+            "changed_paths": [changed_path or f"src/file{path_number}.py"]
+            if status == "fixed"
+            else [],
             "validation_results": [],
             "scope_expansion_required": (
                 {"paths": ["src/shared.py"], "reason": "Required."}
@@ -319,7 +327,9 @@ class FakeGit(LocalGit):
             return self.changed_override
         for number in range(1, 10):
             if f"finding-{number}" in worktree_id:
-                return [f"src/file{number}.py"]
+                return (
+                    ["src/file1.py"] if "ci-finding-" in worktree_id else [f"src/file{number}.py"]
+                )
         return ["src/file1.py"]
 
     async def resolve_ref(self, worktree_id: str, ref: str) -> str:
@@ -391,18 +401,63 @@ class FakeGit(LocalGit):
         ]
 
 
+class FakePublisher:
+    def __init__(self, statuses: list[str] | None = None) -> None:
+        self.statuses = list(statuses or ["passed"])
+        self.publish_calls: list[tuple[str, str | None]] = []
+        self.ready_calls: list[str] = []
+
+    async def publish(
+        self,
+        *,
+        run_id: str,
+        lane: LaneRecord,
+        head_sha: str,
+        previous: PublicationReceipt | None,
+    ) -> PublicationReceipt:
+        self.publish_calls.append((head_sha, previous.head_sha if previous else None))
+        return PublicationReceipt(
+            run_id=run_id,
+            lane=lane.name,
+            remote_url="git@github.com:example/repo.git",
+            base_branch="main",
+            branch=f"kasgraph/{run_id[:12]}/{lane.name}",
+            pull_request_url="https://github.com/example/repo/pull/1",
+            head_sha=head_sha,
+            draft=True,
+        )
+
+    async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        checks = []
+        if status == "failed":
+            checks = [
+                CiCheckResult(name="tests", status="failed", output="tests/test_ci.py failed")
+            ]
+        return CiReceipt(provider="github", head_sha=receipt.head_sha, status=status, checks=checks)
+
+    async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        self.ready_calls.append(receipt.head_sha)
+        return receipt.model_copy(update={"draft": False})
+
+
 def controller(
     tmp_path: Path,
     orca: FakeOrca,
     *,
     graph_config: GraphConfig | None = None,
     git: FakeGit | None = None,
+    publisher: FakePublisher | None = None,
 ) -> tuple[ExecutionController, StateStore]:
     store = StateStore(tmp_path / "state.sqlite3")
     store.setup()
     return (
         ExecutionController(
-            config=graph_config or config(), orca=orca, store=store, git=git or FakeGit()
+            config=graph_config or config(),
+            orca=orca,
+            store=store,
+            git=git or FakeGit(),
+            publisher=publisher or FakePublisher(),
         ),
         store,
     )
@@ -1020,7 +1075,9 @@ async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: 
     with pytest.raises(RuntimeError, match="crash after cherry-pick"):
         await value.monitor(run_id)
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store, git=git)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=git, publisher=FakePublisher()
+    )
     result = await restarted.monitor(run_id)
     assert result.status == "complete"
     assert store.integrations(run_id)[0].status == "integrated"
@@ -1044,7 +1101,9 @@ async def test_restart_aborts_partial_composite_then_retries_from_reserved_base(
         await value.monitor(run_id)
     assert git.in_progress
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store, git=git)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=git, publisher=FakePublisher()
+    )
     result = await restarted.monitor(run_id)
 
     assert result.status == "complete"
@@ -1067,7 +1126,9 @@ async def test_restart_does_not_abort_an_unrelated_cherry_pick(tmp_path: Path) -
         await value.monitor(run_id)
     git.active_sequence_commits = ["9" * 40]
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store, git=git)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=git, publisher=FakePublisher()
+    )
     result = await restarted.monitor(run_id)
 
     assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
@@ -1085,7 +1146,9 @@ async def test_restart_reconciliation_does_not_duplicate_tasks_or_receipts(tmp_p
     task_count = len(orca.tasks_by_id)
     event_count = len(store.events(run_id))
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=FakeGit(), publisher=FakePublisher()
+    )
     await restarted.monitor(run_id)
     await restarted.monitor(run_id)
 
@@ -1102,7 +1165,9 @@ async def test_restart_recovers_task_created_before_local_binding(tmp_path: Path
     with pytest.raises(RuntimeError, match="remote task creation"):
         await value.accept(run_id)
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=FakeGit(), publisher=FakePublisher()
+    )
     result = await restarted.accept(run_id)
     assert len(orca.tasks_by_id) == 1
     assert len(result.started) == 1
@@ -1117,7 +1182,9 @@ async def test_restart_recovers_run_created_before_local_binding(tmp_path: Path)
     with pytest.raises(RuntimeError, match="remote run creation"):
         await value.accept(run_id)
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=FakeGit(), publisher=FakePublisher()
+    )
     result = await restarted.accept(run_id)
     assert len(orca.runs_by_id) == 1
     assert result.orca_run_id == "orca-run-1"
@@ -1132,7 +1199,9 @@ async def test_restart_recovers_dispatch_started_before_local_binding(tmp_path: 
     with pytest.raises(RuntimeError, match="remote worker start"):
         await value.accept(run_id)
 
-    restarted = ExecutionController(config=config(), orca=orca, store=store)
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=FakeGit(), publisher=FakePublisher()
+    )
     result = await restarted.monitor(run_id)
     assert len(orca.starts) == 1
     assert result.stages[0].orca_dispatch_id == "dispatch-1"
@@ -1199,3 +1268,154 @@ async def test_accept_rejects_non_lane_plan(tmp_path: Path) -> None:
     run_id = value.propose(proposal(next_action="needs_owner")).run_id
     with pytest.raises(ValueError, match="no executable lanes"):
         await value.accept(run_id)
+
+
+async def test_acceptance_freezes_authorization_before_publication(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher(["pending"])
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    assert publisher.publish_calls == []
+    assert store.acceptance_authorization(run_id) is None
+
+    await value.accept(run_id)
+
+    authorization = store.acceptance_authorization(run_id)
+    assert authorization is not None
+    assert len(authorization.proposal_sha256) == 64
+    assert len(authorization.config_sha256) == 64
+    assert publisher.publish_calls == []
+
+
+async def test_resumed_run_rejects_changed_graph_policy(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    changed = ExecutionController(
+        config=config(max_workers=3),
+        orca=orca,
+        store=store,
+        git=FakeGit(),
+        publisher=publisher,
+    )
+
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await changed.monitor(run_id)
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await changed.accept(run_id)
+
+    assert publisher.publish_calls == []
+
+
+async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher(["pending"])
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+    second = await value.monitor(run_id)
+
+    assert first.status == second.status == "active"
+    assert publisher.publish_calls == [("b" * 40, None)]
+    assert store.publications(run_id)[0].draft
+    assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
+
+
+async def test_ci_failure_creates_scoped_finding_then_republishes_fix(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher(["failed", "passed"])
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    failed = await value.monitor(run_id)
+    assert [item.role for item in failed.started] == [StageKind.FIXER]
+    finding = next(item for item in failed.findings if item.origin == "ci_failure")
+    assert finding.effective_contract.allowed_write_scope.paths == ["src/file1.py"]
+    assert store.ci_failures(run_id)[0].published_sha == "b" * 40
+
+    orca.complete_dispatched(fix_attempt(finding.finding_id, base_sha="b" * 40))
+    passed = await value.monitor(run_id)
+
+    assert passed.status == "complete", store.events(run_id)
+    assert len(publisher.publish_calls) == 2
+    assert publisher.publish_calls[1][1] == "b" * 40
+    assert store.publications(run_id)[-1].draft is False
+
+
+async def test_stale_ci_sha_and_publication_errors_block_the_lane(tmp_path: Path) -> None:
+    class StalePublisher(FakePublisher):
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            return CiReceipt(provider="github", head_sha="d" * 40, status="passed", checks=[])
+
+    class BrokenPublisher(FakePublisher):
+        async def publish(
+            self,
+            *,
+            run_id: str,
+            lane: LaneRecord,
+            head_sha: str,
+            previous: PublicationReceipt | None,
+        ) -> PublicationReceipt:
+            raise PublicationError("authentication failed")
+
+    for publisher in (StalePublisher(), BrokenPublisher()):
+        orca = FakeOrca()
+        value, store = controller(tmp_path / type(publisher).__name__, orca, publisher=publisher)
+        run_id = value.propose(proposal()).run_id
+        await value.accept(run_id)
+        await advance_to_initial_review(value, orca, run_id)
+        orca.complete_dispatched(initial_review_report_json())
+        result = await value.monitor(run_id)
+        assert result.status == "blocked"
+        blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+        assert blocked
+        payload = blocked[-1]["payload"]
+        assert isinstance(payload, dict) and payload["reason"]
+
+
+async def test_ci_fix_rounds_stop_after_two_failed_republished_heads(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher(["failed", "failed", "failed"])
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+    first = await value.monitor(run_id)
+    first_finding = next(item for item in first.findings if item.origin == "ci_failure")
+
+    orca.complete_dispatched(fix_attempt(first_finding.finding_id, base_sha="b" * 40))
+    second = await value.monitor(run_id)
+    second_finding = next(
+        item
+        for item in second.findings
+        if item.origin == "ci_failure" and item.finding_id != first_finding.finding_id
+    )
+    second_base = second.lanes[0].integration_head_sha
+    assert second_base is not None
+    orca.complete_dispatched(
+        fix_attempt(
+            second_finding.finding_id,
+            base_sha=second_base,
+            changed_path="src/file1.py",
+        )
+    )
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked"
+    assert len(store.ci_failures(run_id)) == 2
+    assert len(publisher.publish_calls) == 3

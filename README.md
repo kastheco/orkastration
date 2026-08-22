@@ -21,7 +21,7 @@ interactive supervisor (Linear + Notion)
               |
               +-- worker -> one full initial review
               |                    |
-              |                    +-- no findings -> complete
+              |                    +-- no findings -> publish
               |                    `-- frozen findings
               |                              |
               |                        fix -> scoped re-review
@@ -29,6 +29,12 @@ interactive supervisor (Linear + Notion)
               |                      resolve, retry, or escalate
               v
       persisted Orca Tasks/Dispatches
+              |
+              v
+ deterministic branch -> draft PR -> exact-SHA GitHub checks
+                                      |
+                                      +-- pass -> ready / complete
+                                      `-- fail -> scoped CI fix (max 2)
 ```
 
 Kasgraph does not call model APIs directly and does not own API credentials. Its
@@ -36,8 +42,10 @@ planner invokes either the installed Codex CLI or Claude Code CLI using their
 saved authentication, supplies `SupervisorPlan.model_json_schema()`, and
 validates the final JSON with Pydantic. It is one non-persistent subprocess per
 planning cycle. Orca remains the execution and worker-lifecycle authority.
-SQLite stores proposals, immutable finding contracts, attempts, verdicts,
-escalation decisions, validated lifecycle receipts, and transition evidence.
+SQLModel provides the typed persistence layer over SQLite for proposals,
+immutable finding contracts, attempts, verdicts, escalation decisions, validated
+lifecycle receipts, publication/CI receipts, and transition evidence. Raw SQL is
+limited to SQLite locking and additive compatibility migrations.
 
 ## Configuration
 
@@ -123,8 +131,19 @@ resolved verdict reserves that commit for serial `cherry-pick -x` integration
 into the lane checkout. Kasgraph refuses dirty integration checkouts, aborts its
 own conflicting cherry-pick without resetting unrelated work, runs validation
 commands without a shell, and persists the base SHA, fixer SHA, integrated SHA,
-validation output, and conflict state. Publication and remote CI remain later
-delivery slices and are not live yet.
+validation output, and conflict state.
+
+After local convergence, acceptance authorizes a deterministic
+`kasgraph/<run>/<lane>` branch and one draft GitHub pull request for that lane.
+Kasgraph never force-pushes: an existing unowned branch or a remote head that no
+longer matches the last publication receipt blocks the lane. It observes checks
+through the GitHub CLI using the exact published commit SHA, ignores stale check
+runs, and marks the pull request ready only after every observed check passes.
+A failed check becomes a typed, path-scoped CI finding without restarting the
+initial review. CI fixes republish and rerun the gate, with at most two fix
+rounds. Ambiguous multi-fix attribution, exhausted rounds, authentication
+failures, unsupported remotes, and divergence stop the lane with evidence in
+`kasgraph show` and the SQLite event ledger. Kasgraph never merges or deploys.
 
 Inspect the generated agent-result contracts with:
 
@@ -147,6 +166,7 @@ uv sync --extra dev
 export KASGRAPH_CONFIG=kasgraph.yaml
 codex login status
 claude --version
+gh auth status
 ```
 
 Inside an Orca-managed terminal, `orca` is resolved automatically. On Linux

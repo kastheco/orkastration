@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -11,8 +12,14 @@ from pydantic import ValidationError
 from kasgraph.config import AgentProfile, GraphConfig
 from kasgraph.git import GitError, LocalGit
 from kasgraph.models import (
+    AcceptanceAuthorization,
+    AllowedWriteScope,
     AttemptKind,
+    CiFailureFinding,
+    CiReceipt,
     EscalationDecision,
+    FindingEvidence,
+    FindingLocation,
     FindingPhase,
     FindingReason,
     FindingRecord,
@@ -24,7 +31,10 @@ from kasgraph.models import (
     LaneRecord,
     OrcaWorkerResult,
     ProposalReceipt,
+    PublicationReceipt,
     ReReviewResult,
+    ReviewFinding,
+    ReviewRevision,
     StageKind,
     StageLaunch,
     StagePhase,
@@ -34,6 +44,7 @@ from kasgraph.models import (
     WorkerResult,
 )
 from kasgraph.orca import JsonObject
+from kasgraph.publication import GitHubPublisher, LanePublisher, PublicationError
 from kasgraph.scope import path_allowed
 from kasgraph.store import IntegrationBusyError, StateStore
 
@@ -85,11 +96,13 @@ class ExecutionController:
         orca: OrcaGraphController,
         store: StateStore,
         git: LocalGit | None = None,
+        publisher: LanePublisher | None = None,
     ):
         self._config = config
         self._orca = orca
         self._store = store
         self._git = git or LocalGit()
+        self._publisher = publisher or GitHubPublisher()
 
     def propose(self, proposal: SupervisorPlan) -> ProposalReceipt:
         """Record a proposal without mutating Orca."""
@@ -104,6 +117,14 @@ class ExecutionController:
         if run.proposal.next_action != "propose_lanes":
             raise ValueError(f"run {run_id} has no executable lanes ({run.proposal.next_action})")
         if run.status == "proposed":
+            self._store.record_acceptance_authorization(
+                run_id,
+                AcceptanceAuthorization(
+                    run_id=run_id,
+                    proposal_sha256=_sha256_json(run.proposal.model_dump(mode="json")),
+                    config_sha256=_sha256_json(self._config.model_dump(mode="json")),
+                ),
+            )
             objective = _orca_run_objective(run_id, run.proposal.objective)
             matches = [
                 item for item in await self._orca.runs() if item.get("objective") == objective
@@ -117,6 +138,8 @@ class ExecutionController:
             self._store.mark_accepted(run_id, orca_run_id)
         elif run.status not in {"active", "blocked"}:
             raise ValueError(f"run {run_id} cannot be accepted from status {run.status}")
+        else:
+            self._require_authorization(run_id)
         await self._ensure_tasks(run_id)
         return await self.monitor(run_id)
 
@@ -126,6 +149,7 @@ class ExecutionController:
         run = self._store.run(run_id)
         if run.orca_run_id is None:
             raise ValueError(f"run {run_id} has not been accepted")
+        self._require_authorization(run_id)
         tasks = await self._orca.tasks(run.orca_run_id)
         by_id = {_task_id(task): task for task in tasks}
         lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
@@ -196,6 +220,10 @@ class ExecutionController:
         self._ensure_dynamic_stages(run_id)
         await self._ensure_tasks(run_id)
         started = await self._start_ready(run_id)
+        await self._advance_publication(run_id)
+        self._ensure_dynamic_stages(run_id)
+        await self._ensure_tasks(run_id)
+        started.extend(await self._start_ready(run_id))
         status = self._derive_status(run_id)
         current = self._store.run(run_id).status
         if status in {"complete", "failed", "blocked"} and current != status:
@@ -208,6 +236,8 @@ class ExecutionController:
             lanes=self._store.lanes(run_id),
             stages=self._store.stages(run_id),
             findings=self._store.findings(run_id),
+            publications=self._store.publications(run_id),
+            ci=self._store.ci_receipts(run_id),
         )
 
     async def _process_results(self, run_id: str) -> None:
@@ -276,9 +306,16 @@ class ExecutionController:
             if not await self._validate_fixer_commit(run_id, finding, stage, attempt):
                 self._escalate(run_id, finding, FindingReason.SCOPE_ESCAPE)
                 return
-            self._store.set_finding_state(
-                run_id, finding.finding_key, phase=FindingPhase.PENDING_RE_REVIEW
-            )
+            if finding.origin == "ci_failure":
+                if stage.worktree_id is None:
+                    raise ValueError("CI fixer omitted its isolated worktree")
+                await self._integrate_fix(
+                    run_id, finding, attempt, fixer_worktree=stage.worktree_id
+                )
+            else:
+                self._store.set_finding_state(
+                    run_id, finding.finding_key, phase=FindingPhase.PENDING_RE_REVIEW
+                )
         elif attempt.status == "blocked_scope":
             self._escalate(run_id, finding, FindingReason.SCOPE_ESCAPE)
         elif stage.attempt_kind is AttemptKind.PRIMARY and self._config.roles.fixer.fallback:
@@ -459,7 +496,12 @@ class ExecutionController:
         return accepted
 
     async def _integrate_fix(
-        self, run_id: str, finding: FindingRecord, attempt: FixAttempt
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        attempt: FixAttempt,
+        *,
+        fixer_worktree: str | None = None,
     ) -> None:
         """Serially integrate one re-review-approved commit into the lane checkout."""
 
@@ -468,7 +510,7 @@ class ExecutionController:
         lane = next(item for item in self._store.lanes(run_id) if item.lane_id == finding.lane_id)
         if lane.worktree_id is None or lane.integration_head_sha is None:
             raise ValueError("lane omitted its integration checkout or frozen head")
-        fixer_worktree = self._fixer_worktree(run_id, finding)
+        fixer_worktree = fixer_worktree or self._fixer_worktree(run_id, finding)
         _, source_commits, source_finding_ids = await self._integration_sources(
             run_id, finding, attempt, fixer_worktree
         )
@@ -938,7 +980,9 @@ class ExecutionController:
                 stage.phase is StagePhase.FAILED for stage in lane_stages
             ):
                 phase = LanePhase.FAILED
-            elif any(finding.phase is FindingPhase.BLOCKED for finding in lane_findings):
+            elif lane.phase is LanePhase.BLOCKED or any(
+                finding.phase is FindingPhase.BLOCKED for finding in lane_findings
+            ):
                 phase = LanePhase.BLOCKED
             else:
                 reviewed = any(
@@ -949,7 +993,20 @@ class ExecutionController:
                     finding.phase in {FindingPhase.RESOLVED, FindingPhase.DEFERRED}
                     for finding in lane_findings
                 )
-                phase = LanePhase.COMPLETE if reviewed and settled else LanePhase.ACTIVE
+                publications = self._store.publications(run_id, lane.lane_id)
+                ci = self._store.ci_receipts(run_id, lane.lane_id)
+                published_head = publications[-1].head_sha if publications else None
+                passed_head = next(
+                    (item.head_sha for item in reversed(ci) if item.status == "passed"), None
+                )
+                phase = (
+                    LanePhase.COMPLETE
+                    if reviewed
+                    and settled
+                    and published_head == lane.integration_head_sha == passed_head
+                    and not publications[-1].draft
+                    else LanePhase.ACTIVE
+                )
             self._store.set_lane_phase(run_id, lane.lane_id, phase)
             lane_phases.append(phase)
         if any(phase is LanePhase.FAILED for phase in lane_phases):
@@ -959,6 +1016,163 @@ class ExecutionController:
         if lane_phases and all(phase is LanePhase.COMPLETE for phase in lane_phases):
             return "complete"
         return "active"
+
+    async def _advance_publication(self, run_id: str) -> None:
+        """Publish locally settled lanes and gate them on checks for the exact head."""
+
+        self._require_authorization(run_id)
+        for lane in self._store.lanes(run_id):
+            if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED}:
+                continue
+            if not self._local_lane_settled(run_id, lane):
+                continue
+            if lane.integration_head_sha is None:
+                self._store.block_lane(run_id, lane.lane_id, "lane has no integrated head")
+                continue
+            publications = self._store.publications(run_id, lane.lane_id)
+            previous = publications[-1] if publications else None
+            try:
+                if previous is None or previous.head_sha != lane.integration_head_sha:
+                    receipt = await self._publisher.publish(
+                        run_id=run_id,
+                        lane=lane,
+                        head_sha=lane.integration_head_sha,
+                        previous=previous,
+                    )
+                    if receipt.run_id != run_id or receipt.lane != lane.name:
+                        raise PublicationError("publisher receipt does not match the accepted lane")
+                    if receipt.head_sha != lane.integration_head_sha:
+                        raise PublicationError(
+                            "publisher receipt does not match the integrated head"
+                        )
+                    self._store.record_publication(run_id, lane.lane_id, receipt)
+                    publications.append(receipt)
+                else:
+                    receipt = previous
+                ci = await self._publisher.checks(receipt)
+                if ci.head_sha != receipt.head_sha:
+                    raise PublicationError("CI observation is not pinned to the published head")
+                self._store.record_ci_receipt(run_id, lane.lane_id, ci)
+                if ci.status == "passed":
+                    ready = await self._publisher.mark_ready(receipt)
+                    if ready.head_sha != receipt.head_sha or ready.draft:
+                        raise PublicationError("provider did not mark the exact pull request ready")
+                    self._store.record_publication(run_id, lane.lane_id, ready)
+                elif ci.status == "failed":
+                    await self._record_ci_failure(run_id, lane, publications, ci)
+            except PublicationError as exc:
+                self._store.block_lane(run_id, lane.lane_id, str(exc))
+
+    def _local_lane_settled(self, run_id: str, lane: LaneRecord) -> bool:
+        stages = [item for item in self._store.stages(run_id) if item.lane_id == lane.lane_id]
+        reviewed = any(
+            item.role is StageKind.INITIAL_REVIEWER and item.processed for item in stages
+        )
+        findings = self._store.findings(run_id, lane.lane_id)
+        return reviewed and all(
+            item.phase in {FindingPhase.RESOLVED, FindingPhase.DEFERRED} for item in findings
+        )
+
+    def _require_authorization(self, run_id: str) -> AcceptanceAuthorization:
+        """Reject resumed work when its frozen proposal or graph policy changed."""
+
+        run = self._store.run(run_id)
+        expected = AcceptanceAuthorization(
+            run_id=run_id,
+            proposal_sha256=_sha256_json(run.proposal.model_dump(mode="json")),
+            config_sha256=_sha256_json(self._config.model_dump(mode="json")),
+        )
+        authorization = self._store.acceptance_authorization(run_id)
+        if authorization is None:
+            raise ValueError(f"run {run_id} has no frozen acceptance authorization")
+        if authorization != expected:
+            raise ValueError(
+                f"run {run_id} proposal or graph policy changed after acceptance; "
+                "record and accept a new proposal"
+            )
+        return authorization
+
+    async def _record_ci_failure(
+        self,
+        run_id: str,
+        lane: LaneRecord,
+        publications: list[PublicationReceipt],
+        ci: CiReceipt,
+    ) -> None:
+        failures = self._store.ci_failures(run_id, lane.lane_id)
+        if any(item.published_sha == ci.head_sha for item in failures):
+            return
+        round_number = len(failures) + 1
+        if round_number > self._config.final_gate.on_failure.max_fix_rounds:
+            self._store.block_lane(run_id, lane.lane_id, "CI fix round limit exhausted")
+            return
+        previous_head = publications[-2].head_sha if len(publications) > 1 else None
+        integrations = [
+            item
+            for item in self._store.integrations(run_id)
+            if item.lane_id == lane.lane_id
+            and item.status == "integrated"
+            and (previous_head is None or item.base_sha == previous_head)
+        ]
+        if len(integrations) > 1:
+            self._store.block_lane(
+                run_id,
+                lane.lane_id,
+                "CI failure attribution is ambiguous across multiple integrated fixes",
+            )
+            return
+        worker = self._store.worker_result(lane.lane_id)
+        if integrations:
+            implicated = integrations[0].source_commits
+            finding_ids = set(integrations[0].source_finding_ids)
+            paths = sorted(
+                {
+                    path
+                    for finding in self._store.findings(run_id, lane.lane_id)
+                    if finding.finding_id in finding_ids
+                    for path in finding.effective_contract.allowed_write_scope.paths
+                }
+            )
+        else:
+            implicated = []
+            paths = worker.changed_paths
+        if not paths:
+            self._store.block_lane(run_id, lane.lane_id, "CI failure has no deterministic scope")
+            return
+        failing = [item for item in ci.checks if item.status in {"failed", "cancelled"}]
+        failure_id = f"ci-finding-{round_number}"
+        typed = CiFailureFinding(
+            id=failure_id,
+            published_sha=ci.head_sha,
+            failing_checks=failing,
+            implicated_fix_commits=implicated,
+            allowed_write_scope=AllowedWriteScope(paths=paths),
+            round=round_number,
+        )
+        if not self._store.record_ci_failure(run_id, lane.lane_id, typed):
+            return
+        base_sha = worker.review_revision.base_sha
+        review_revision = ReviewRevision(
+            base_sha=base_sha,
+            head_sha=ci.head_sha,
+            diff_sha256=await self._git.diff_sha256(lane.worktree_id or "", base_sha, ci.head_sha),
+        )
+        detail = "\n".join(f"{item.name}: {item.output or item.status}" for item in failing)[:4_000]
+        contract = ReviewFinding(
+            id=failure_id,
+            review_revision=review_revision,
+            evidence=[
+                FindingEvidence(
+                    location=FindingLocation(path=path, start_line=1, end_line=1),
+                    claim=detail or "Required CI failed for the published head.",
+                )
+                for path in paths[:64]
+            ],
+            failure_mode=detail or "Required CI failed for the published head.",
+            required_outcome="Make every required CI check pass for the next exact published head.",
+            allowed_write_scope=typed.allowed_write_scope,
+        )
+        self._store.add_finding(run_id, lane.lane_id, contract, origin="ci_failure")
 
     def _finding_for_stage(self, run_id: str, stage: StageRecord) -> FindingRecord:
         matches = [
@@ -1134,3 +1348,10 @@ def _recovered_worktree(
     if stage.role in {StageKind.FIXER, StageKind.RE_REVIEWER}:
         return recovered
     return recovered or lane_worktree
+
+
+def _sha256_json(value: object) -> str:
+    """Return a stable digest for one accepted structured value."""
+
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
