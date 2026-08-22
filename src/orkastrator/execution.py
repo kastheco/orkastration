@@ -281,13 +281,8 @@ class ExecutionController:
         if stage.role is StageKind.INITIAL_REVIEWER:
             report = InitialReviewReport.model_validate_json(lifecycle.body)
             worker = self._store.worker_result(stage.lane_id)
-            if report.review_revision != worker.review_revision:
-                raise ValueError("initial review revision does not match the worker changeset")
-            if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
-                raise ValueError("initial review checkout contains uncommitted changes")
-            if await self._git.head(stage.worktree_id) != report.review_revision.head_sha:
-                raise ValueError("initial review checkout drifted from the frozen worker head")
-            self._store.record_initial_review(run_id, stage.lane_id, report)
+            verified = await self._verified_review(stage, report, worker.review_revision)
+            self._store.record_initial_review(run_id, stage.lane_id, verified)
             return
         finding = self._finding_for_stage(run_id, stage)
         if stage.round != finding.round:
@@ -306,6 +301,46 @@ class ExecutionController:
             self._apply_escalation(
                 run_id, finding, stage, EscalationDecision.model_validate_json(lifecycle.body)
             )
+
+    async def _verified_review(
+        self,
+        stage: StageRecord,
+        report: InitialReviewReport,
+        frozen: ReviewRevision,
+    ) -> InitialReviewReport:
+        """Bind one review to the worker changeset Git can prove it read.
+
+        base_sha and head_sha are facts about commits: a reviewer naming different
+        ones reviewed something else, and that stays fatal. diff_sha256 is not a
+        fact about commits but a digest of whatever `git diff` invocation the
+        reviewer happened to run, and dropping --full-index changes those bytes
+        without changing a line of the diff. Requiring two agents to type the same
+        command failed whole runs over identical content, so verify the reviewer's
+        own checkout against the frozen digest instead, then restate the review on
+        the frozen revision so every finding contract downstream carries one.
+        """
+
+        reported = report.review_revision
+        if (reported.base_sha, reported.head_sha) != (frozen.base_sha, frozen.head_sha):
+            raise ValueError("initial review revision does not match the worker changeset")
+        if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("initial review checkout contains uncommitted changes")
+        if await self._git.head(stage.worktree_id) != frozen.head_sha:
+            raise ValueError("initial review checkout drifted from the frozen worker head")
+        observed = await self._git.diff_sha256(stage.worktree_id, frozen.base_sha, frozen.head_sha)
+        if observed != frozen.diff_sha256:
+            raise ValueError("initial review checkout does not reproduce the frozen worker diff")
+        if reported == frozen:
+            return report
+        return report.model_copy(
+            update={
+                "review_revision": frozen,
+                "findings": [
+                    finding.model_copy(update={"review_revision": frozen})
+                    for finding in report.findings
+                ],
+            }
+        )
 
     async def _apply_fix(
         self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt

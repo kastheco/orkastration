@@ -318,6 +318,7 @@ class FakeGit(LocalGit):
         self.crash_mid_sequence = False
         self.active_sequence_commits: list[str] | None = None
         self.abort_calls = 0
+        self.diff_sha256_override: str | None = None
 
     async def head(self, worktree_id: str) -> str:
         if worktree_id == "repo::/tmp/issue" and self.lane_head_override is not None:
@@ -345,6 +346,8 @@ class FakeGit(LocalGit):
         return "a" * 40
 
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
+        if self.diff_sha256_override is not None and worktree_id == "repo::/tmp/issue":
+            return self.diff_sha256_override
         return "c" * 64
 
     async def is_ancestor(self, worktree_id: str, base_sha: str, head_sha: str) -> bool:
@@ -531,6 +534,44 @@ async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Pat
 
     assert result.status == "failed"
     assert result.findings == []
+
+
+async def test_initial_review_normalizes_a_differently_computed_diff_digest(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    finding = review_finding_data()
+    report = json.loads(initial_review_report_json(finding))
+    report["review_revision"]["diff_sha256"] = "d" * 64
+    report["findings"][0]["review_revision"]["diff_sha256"] = "d" * 64
+
+    orca.complete_dispatched(json.dumps(report))
+    result = await value.monitor(run_id)
+
+    assert result.status == "active"
+    assert [record.finding_id for record in result.findings] == ["finding-1"]
+    assert store.findings(run_id)[0].contract.review_revision.diff_sha256 == "c" * 64
+
+
+async def test_initial_review_rejects_a_diff_the_lane_checkout_cannot_reproduce(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    git.diff_sha256_override = "f" * 64
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
 
 
 async def test_initial_review_requires_the_clean_frozen_lane_head(tmp_path: Path) -> None:
