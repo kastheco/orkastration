@@ -66,6 +66,11 @@ class LaneReport:
     published: bool
     integrations: int
     conflicts: int
+    # Escalations attributed to this lane's findings. Run-wide totals say a
+    # reason recurs; they cannot say whether one lane's reviewer is producing
+    # findings the downstream roles cannot act on, which is the question that
+    # decides whether to fix the reviewer or the adjudicator.
+    escalations: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +188,14 @@ def build_report(
                 for row in integrations
                 if row.lane_id == lane.lane_id and row.status == "conflict"
             ),
+            escalations=dict(
+                Counter(
+                    reason
+                    for record in findings
+                    if record.lane_id == lane.lane_id
+                    for reason in per_finding_escalations.get(record.finding_id, ())
+                ).most_common()
+            ),
         )
         for lane in lanes
     )
@@ -295,12 +308,24 @@ def render(report: RunReport) -> str:
             f" findings={lane.findings} resolved={lane.resolved} deferred={lane.deferred}"
             f" integrations={lane.integrations} conflicts={lane.conflicts}"
         )
+        if lane.escalations:
+            escalations = "  ".join(
+                f"{reason}={count}" for reason, count in lane.escalations.items()
+            )
+            lines.append(f"      escalations {escalations}")
 
     costly = sorted(report.findings, key=lambda item: (-item.dispatches, item.finding_id))
     if costly:
         lines += ["", "findings by cost"]
         for item in costly:
-            escalations = f" escalated={','.join(item.escalations)}" if item.escalations else ""
+            # Counted rather than listed: a finding that escalated for the same
+            # reason thirteen times printed that reason thirteen times, which
+            # buried the finding's identity under its own repetition.
+            reasons = "  ".join(
+                f"{reason}x{count}" if count > 1 else reason
+                for reason, count in Counter(item.escalations).most_common()
+            )
+            escalations = f" escalated={reasons}" if reasons else ""
             lines.append(
                 f"  {item.dispatches:>3} dispatches (+{item.repeats} repeat)"
                 f" round={item.round} {item.phase} {item.finding_id} [{item.lane}]{escalations}"

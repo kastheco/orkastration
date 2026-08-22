@@ -334,7 +334,10 @@ there that names waste rather than slowness. `unknown` is a stage that could not
 deliberately not folded into a tool bucket.
 
 Escalations are grouped by reason and start rejections by cause rather than by wording, so a class
-that recurs is visible as a count instead of as twenty near-identical strings. A single finding
+that recurs is visible as a count instead of as twenty near-identical strings. They are also
+attributed per lane, because a run-wide total cannot say whether one lane's reviewer is writing
+findings the downstream roles cannot act on - which decides whether to fix the reviewer or the
+adjudicator. A single finding
 consuming a double-digit share of a run's dispatches is the shape to look for, and it is usually one
 reason repeating rather than a hard problem.
 

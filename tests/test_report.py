@@ -267,6 +267,53 @@ def test_a_run_with_no_late_stages_says_so_without_an_empty_histogram():
     assert "overdue stages were doing" not in render(report)
 
 
+def test_escalations_are_attributed_to_the_lane_whose_reviewer_produced_them():
+    """Run-wide totals cannot say which reviewer is writing unactionable findings."""
+
+    findings = [
+        _finding("lane-a", "finding-one"),
+        _finding("lane-b", "finding-two"),
+        _finding("lane-b", "finding-three"),
+    ]
+    events = [
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-one", "reason": "ambiguous"},
+        },
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-two", "reason": "ambiguous"},
+        },
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-two", "reason": "ambiguous"},
+        },
+        {
+            "kind": "escalation_recorded",
+            "payload": {"finding_id": "finding-three", "reason": "conflict"},
+        },
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane-a", "alpha"), _lane("lane-b", "beta")],
+        stages=[],
+        findings=findings,
+        integrations=[],
+        publications=[],
+        events=events,
+    )
+
+    by_name = {lane.name: lane.escalations for lane in report.lanes}
+    assert by_name["alpha"] == {"ambiguous": 1}
+    assert by_name["beta"] == {"ambiguous": 2, "conflict": 1}
+
+    rendered = render(report)
+    assert "escalations ambiguous=2  conflict=1" in rendered
+    # A finding that escalated twice for one reason names it once, with a count.
+    assert "escalated=ambiguousx2" in rendered
+
+
 def test_an_empty_run_reports_zeroes_rather_than_dividing_by_zero():
     report = build_report(
         run_id="run",
