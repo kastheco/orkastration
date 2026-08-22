@@ -290,10 +290,14 @@ def test_an_open_stage_is_measured_to_now_and_a_released_one_to_its_last_touch()
     assert [(item.lane, item.role, item.minutes) for item in report.live_stages] == [
         ("demo", "worker", 360)
     ]
-    assert report.minutes_by_role == {"worker": 360, "fixer": 30}
+    assert [(c.role, c.stages, c.minutes, c.median_minutes) for c in report.role_costs] == [
+        ("worker", 1, 360, 360),
+        ("fixer", 1, 30, 30),
+    ]
     rendered = render(report)
     assert "  360m  demo:worker" in rendered
-    assert "wall clock by role" in rendered
+    assert "360m  worker" in rendered
+    assert "1 stages  median 360m" in rendered
 
 
 def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished():
@@ -322,7 +326,8 @@ def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished():
     early = build_report(**kwargs, now=datetime(2026, 8, 22, 8, 0, tzinfo=UTC))
     late = build_report(**kwargs, now=datetime(2026, 9, 22, 8, 0, tzinfo=UTC))
 
-    assert early.minutes_by_role == late.minutes_by_role == {"worker": 60}
+    assert early.role_costs == late.role_costs
+    assert [(c.role, c.minutes) for c in early.role_costs] == [("worker", 60)]
     assert early.live_stages == late.live_stages == ()
 
 

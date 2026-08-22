@@ -356,9 +356,9 @@ still open
     455m  application-lifecycle-kas-580:worker
 
 wall clock by role
-   1675m  escalation
-    736m  fixer
-    559m  worker
+   1675m  escalation          52 stages  median 30m
+    736m  fixer               26 stages  median 11m
+    559m  worker               3 stages  median 52m
 
 overdue stages were doing
     3  exec poll loop
@@ -389,8 +389,10 @@ supervisor has been holding it for that whole span, and a runtime-only figure wo
 abandoned attempt inside it.
 
 `wall clock by role` answers a different question from `dispatches per finding`, and usually gives a
-different answer. A run can spend most of its dispatches on fixers and most of its hours on
-escalations.
+different answer. The median is next to the total because those want different fixes: a role that is
+expensive because it runs constantly is a graph problem, and one that is expensive because each run
+takes half an hour is a prompt or a tool problem. On the run above, escalation is both - twice the
+fixer's stage count at nearly three times its median.
 
 A rejected start is the most expensive thing that can happen: a whole dispatch billed for input,
 output and wall clock, and nothing kept. So the buckets are named for who could have prevented it.

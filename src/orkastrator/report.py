@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from statistics import median
 
 from orkastrator.models import (
     FindingRecord,
@@ -32,7 +33,15 @@ from orkastrator.models import (
     StageRecord,
 )
 
-__all__ = ["FindingReport", "LaneReport", "LiveStage", "RunReport", "build_report", "render"]
+__all__ = [
+    "FindingReport",
+    "LaneReport",
+    "LiveStage",
+    "RoleCost",
+    "RunReport",
+    "build_report",
+    "render",
+]
 
 # The roles that cost a dispatch per finding rather than per lane. A worker and
 # an initial reviewer run once for the whole lane no matter how many findings
@@ -61,6 +70,20 @@ class LiveStage:
     lane: str
     role: str
     minutes: int
+
+
+@dataclass(frozen=True, slots=True)
+class RoleCost:
+    """What one role cost in stages and in hours.
+
+    The median is here because the total alone cannot separate a role that runs
+    often from one that runs long, and those want different fixes.
+    """
+
+    role: str
+    stages: int
+    minutes: int
+    median_minutes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,10 +142,10 @@ class RunReport:
     # that finished, so an unfinished stage is invisible to all of them. This is
     # the line that says a run is stuck rather than slow.
     live_stages: tuple[LiveStage, ...] = ()
-    # Total wall clock each role has consumed. Ratios say how many dispatches a
-    # finding cost; this says which role the hours went to, which is a different
-    # question and often a different answer.
-    minutes_by_role: dict[str, int] = field(default_factory=dict)
+    # What each role cost in stages and hours, dearest first. Ratios say how many
+    # dispatches a finding cost; this says which role the hours went to, which is
+    # a different question and often a different answer.
+    role_costs: tuple[RoleCost, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -228,7 +251,7 @@ def build_report(
     )
 
     live: list[LiveStage] = []
-    minutes: Counter[str] = Counter()
+    spans: dict[str, list[int]] = {}
     for stage in stages:
         # A released stage is measured to its last touch; an open one to now.
         # The clock starts at `created_at`, so a stage that was dispatched, lost
@@ -237,7 +260,7 @@ def build_report(
         # the supervisor has been holding that stage for the whole span, and a
         # runtime-only figure would hide every abandoned attempt inside it.
         elapsed = _minutes(stage.created_at, stage.updated_at if stage.released else now)
-        minutes[str(stage.role.value)] += elapsed
+        spans.setdefault(str(stage.role.value), []).append(elapsed)
         if not stage.released:
             live.append(
                 LiveStage(
@@ -268,7 +291,20 @@ def build_report(
         timed_out_stages=timed_out,
         overdue_by_activity=dict(activities.most_common()),
         live_stages=tuple(sorted(live, key=lambda item: (-item.minutes, item.lane, item.role))),
-        minutes_by_role=dict(minutes.most_common()),
+        role_costs=tuple(
+            sorted(
+                (
+                    RoleCost(
+                        role=role,
+                        stages=len(values),
+                        minutes=sum(values),
+                        median_minutes=int(median(values)),
+                    )
+                    for role, values in spans.items()
+                ),
+                key=lambda item: (-item.minutes, item.role),
+            )
+        ),
     )
 
 
@@ -383,9 +419,13 @@ def render(report: RunReport) -> str:
         lines += [
             f"  {stage.minutes:>5}m  {stage.lane}:{stage.role}" for stage in report.live_stages
         ]
-    if report.minutes_by_role:
+    if report.role_costs:
         lines += ["", "wall clock by role"]
-        lines += [f"  {count:>5}m  {role}" for role, count in report.minutes_by_role.items()]
+        lines += [
+            f"  {cost.minutes:>5}m  {cost.role:<18}"
+            f" {cost.stages:>3} stages  median {cost.median_minutes}m"
+            for cost in report.role_costs
+        ]
     lines += _histogram("overdue stages were doing", report.overdue_by_activity)
     lines += _histogram("escalations", report.escalations_by_reason)
     lines += _histogram("start rejections", report.rejection_reasons)
