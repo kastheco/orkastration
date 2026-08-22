@@ -1587,6 +1587,64 @@ async def test_a_second_acceptance_of_the_same_failed_validation_blocks(
     assert adjudications == 2
 
 
+async def test_reopening_a_blocked_finding_does_not_refund_the_adjudication_budget(
+    tmp_path: Path,
+) -> None:
+    """A reopen frees the stage key. It must not also free the verdict count.
+
+    The reopen deletes every escalation row at or past the reopened round, which
+    is what lets a re-adjudication record its own verdict under the same stage.
+    While the bound was read from that table, the deletion also refunded it: run
+    1f13dd37 reopened one finding three times and paid thirteen accept_fix
+    adjudications against one unchanged failing command, because each reopen
+    reset the count that was supposed to stop the second.
+    """
+
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+
+    adjudications = 0
+    for _ in range(10):
+        if result.findings[0].phase is FindingPhase.BLOCKED:
+            break
+        orca.complete_dispatched(escalation("validation_failed", "accept_fix"))
+        adjudications += 1
+        result = await value.monitor(run_id)
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+    assert adjudications == 2
+
+    finding = result.findings[0]
+    store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_ESCALATION,
+        round=finding.round,
+        escalation_reason=FindingReason.VALIDATION_FAILED,
+        note="owner looked and wants one more adjudication",
+    )
+    # One more look is what the reopen bought. A second would be the loop again.
+    after = 0
+    result = await value.monitor(run_id)
+    for _ in range(10):
+        if result.findings[0].phase is FindingPhase.BLOCKED:
+            break
+        orca.complete_dispatched(escalation("validation_failed", "accept_fix"))
+        after += 1
+        result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+    assert after <= 1
+
+
 async def test_accepting_a_fix_rechecks_it_instead_of_replaying_the_stored_verdict(
     tmp_path: Path,
 ) -> None:

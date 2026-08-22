@@ -1168,18 +1168,13 @@ class StateStore:
 
         The integrations ledger is unique on (finding_key, round), so a fix that
         conflicts repeatedly inside one round leaves a single row and cannot be
-        counted from there. Escalation records are keyed by the stage that
-        produced them, so they are the only place the recurrence survives.
+        counted from there. The adjudications can, and `_adjudications` explains
+        why they are counted from the event log rather than from the ledger.
         """
 
-        with self._session() as session:
-            rows = session.exec(
-                select(EscalationRow).where(
-                    EscalationRow.finding_key == finding_key,
-                    EscalationRow.reason == FindingReason.INTEGRATION_CONFLICT.value,
-                )
-            ).all()
-            return len(rows)
+        return len(
+            self._adjudications(finding_key, reason=FindingReason.INTEGRATION_CONFLICT.value)
+        )
 
     def latest_fix_attempt(self, finding_key: str) -> FixAttempt | None:
         with self._session() as session:
@@ -1216,19 +1211,59 @@ class StateStore:
     ) -> int:
         """Count how often one trigger has already drawn the same adjudicated verdict."""
 
+        return len(self._adjudications(finding_key, round=round, reason=reason, action=action))
+
+    def _adjudications(
+        self,
+        finding_key: str,
+        *,
+        round: int | None = None,
+        reason: str | None = None,
+        action: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Every adjudication this finding has drawn, from the append-only log.
+
+        Not from the escalations ledger. A reopen deletes every escalation row at
+        or past the reopened round, which is correct for the frozen contract - a
+        re-adjudication has to be free to record its own verdict under the same
+        stage. It is wrong for a bound. The bounds above exist to stop a verdict
+        that settles nothing from being asked for again, and reading them from a
+        table the reopen empties means the owner unsticking a finding silently
+        hands the graph an unlimited budget for the exact verdict that stuck it.
+        Run 1f13dd37 did this three times: thirteen accept_fix adjudications on
+        one finding, of which the ledger retained one.
+
+        Events are never deleted, so the count survives the reopen. They carry
+        `finding_id` rather than `finding_key`, and that is unique per lane, so
+        scoping the scan to the finding's own lane is what makes the two the same
+        subject.
+        """
+
         with self._session() as session:
+            finding = session.get(FindingRow, finding_key)
+            if finding is None:
+                raise KeyError(f"unknown finding {finding_key}")
             rows = session.exec(
-                select(EscalationRow).where(
-                    EscalationRow.finding_key == finding_key,
-                    EscalationRow.round == round,
-                    EscalationRow.reason == reason,
+                select(EventRow).where(
+                    EventRow.lane_id == finding.lane_id,
+                    EventRow.kind == "escalation_recorded",
                 )
             ).all()
-        return sum(
-            1
-            for row in rows
-            if EscalationDecision.model_validate_json(row.payload_json).action == action
-        )
+        matched: list[dict[str, object]] = []
+        for row in rows:
+            payload = json.loads(row.payload_json)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("finding_id") != finding.finding_id:
+                continue
+            if round is not None and payload.get("round") != round:
+                continue
+            if reason is not None and payload.get("reason") != reason:
+                continue
+            if action is not None and payload.get("action") != action:
+                continue
+            matched.append(payload)
+        return matched
 
     def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
         with self._session() as session:
