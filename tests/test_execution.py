@@ -1318,6 +1318,32 @@ async def test_integration_conflict_maps_to_the_finding(tmp_path: Path) -> None:
     assert store.integrations(run_id)[0].status == "conflict"
 
 
+async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
+
+    orca.complete_dispatched(escalation("integration_conflict", "approve_unchanged"))
+    result = await value.monitor(run_id)
+
+    # The fix was approved on its merits, so the retry is a rebase at round 1
+    # rather than the second and final round the ceiling would then close.
+    assert result.findings[0].round == 1
+    assert result.started[0].role is StageKind.FIXER
+    assert any(":rebase1" in stage.stage_key for stage in store.stages(run_id))
+
+
 async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:
     orca = FakeOrca()
     git = FakeGit()

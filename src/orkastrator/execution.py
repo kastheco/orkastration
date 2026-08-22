@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
@@ -633,7 +634,22 @@ class ExecutionController:
         )
         self._store.record_escalation(run_id, finding, stage, decision)
         if decision.action in {"approve_unchanged", "approve_scope_revision"}:
-            if finding.round >= self._config.review_cycle.max_fix_rounds_per_finding:
+            limit = self._config.review_cycle.max_fix_rounds_per_finding
+            # A conflict is a fact about the lane head moving, not about the fix,
+            # which re-review already approved. Re-landing it is a rebase, so it
+            # retries the same round: the ceiling is there to stop a fixer
+            # thrashing on one defect, and that is not what happened. Its own
+            # bound is how many times the same finding has conflicted.
+            if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
+                conflicts = sum(
+                    1
+                    for receipt in self._store.integrations(run_id)
+                    if receipt.finding_key == finding.finding_key and receipt.status == "conflict"
+                )
+                retry_round = finding.round if conflicts < limit else finding.round + 1
+            else:
+                retry_round = finding.round + 1
+            if retry_round > limit:
                 self._store.set_finding_state(
                     run_id, finding.finding_key, phase=FindingPhase.BLOCKED
                 )
@@ -642,7 +658,7 @@ class ExecutionController:
                     run_id,
                     finding.finding_key,
                     phase=FindingPhase.PENDING_FIX,
-                    round=finding.round + 1,
+                    round=retry_round,
                     effective_contract=decision.revised_finding or finding.effective_contract,
                 )
         elif decision.action == "defer":
@@ -989,6 +1005,11 @@ class ExecutionController:
 
     def _ensure_dynamic_stages(self, run_id: str) -> None:
         stages = self._store.stages(run_id)
+        conflicts = Counter(
+            receipt.finding_key
+            for receipt in self._store.integrations(run_id)
+            if receipt.status == "conflict"
+        )
         by_lane: dict[str, list[StageRecord]] = {}
         for stage in stages:
             by_lane.setdefault(stage.lane_id, []).append(stage)
@@ -1023,9 +1044,13 @@ class ExecutionController:
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
+                        # A conflict retry re-lands the same round, so the key
+                        # carries the rebase ordinal or ensure_stage would find
+                        # the settled stage and never dispatch the fixer again.
                         stage_key=(
                             f"{lane.lane_id}:{finding.finding_id}:fix:"
                             f"{finding.round}:{attempt_kind.value}"
+                            f"{_rebase_suffix(conflicts[finding.finding_key])}"
                         ),
                         role=StageKind.FIXER,
                         finding_key=finding.finding_key,
@@ -1515,6 +1540,12 @@ class ExecutionController:
             f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
             f"{context}"
         )
+
+
+def _rebase_suffix(conflicts: int) -> str:
+    """Name a conflict retry without renaming the first attempt at a round."""
+
+    return f":rebase{conflicts}" if conflicts else ""
 
 
 def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
