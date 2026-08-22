@@ -37,7 +37,7 @@ When a fresh, schema-constrained planning pass is useful, run this instead:
 uv run kasgraph plan --objective "<direction>" --json
 ```
 
-This invokes the supervisor backend selected in `kasgraph.yaml`. `agent: codex`
+This invokes the planner backend selected in `kasgraph.yaml`. `agent: codex`
 uses `codex exec` with an ephemeral read-only sandbox. `agent: claude` uses
 `claude -p` with plan permissions and no session persistence. Both receive the
 Pydantic-generated `SupervisorPlan` JSON Schema and must remain read-only against
@@ -74,6 +74,6 @@ Notion only when the owner request or standing project workflow authorizes those
 writes.
 
 The model you are talking to belongs to this interactive session. The top-level
-`supervisor` profile in `kasgraph.yaml` configures only the optional Codex or
+`planner` profile in `kasgraph.yaml` configures only the optional Codex or
 Claude planning turn. The four `roles` profiles configure Orca execution launches,
 including provider-native fast mode before supervised task injection.

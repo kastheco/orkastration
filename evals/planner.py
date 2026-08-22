@@ -8,11 +8,21 @@ from pydantic import ValidationError
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EqualsExpected
 
-from kasgraph.models import SupervisorPlan
+from kasgraph.models import (
+    InitialReviewReport,
+    ReReviewResult,
+    SupervisorPlan,
+    WorkflowContract,
+)
 
 
 class ContractInput(TypedDict):
     plan: dict[str, object]
+
+
+class WorkflowContractInput(TypedDict):
+    contract: str
+    value: dict[str, object]
 
 
 def validates_supervisor_plan(value: ContractInput) -> bool:
@@ -20,6 +30,21 @@ def validates_supervisor_plan(value: ContractInput) -> bool:
 
     try:
         SupervisorPlan.model_validate(value["plan"])
+    except ValidationError:
+        return False
+    return True
+
+
+def validates_workflow_contract(value: WorkflowContractInput) -> bool:
+    """Return whether a candidate satisfies its named workflow contract."""
+
+    contracts: dict[str, type[WorkflowContract]] = {
+        "initial_review_report": InitialReviewReport,
+        "re_review_result": ReReviewResult,
+    }
+    contract = contracts[value["contract"]]
+    try:
+        contract.model_validate(value["value"])
     except ValidationError:
         return False
     return True
@@ -80,12 +105,54 @@ dataset: Dataset[ContractInput, bool, None] = Dataset(
     evaluators=[EqualsExpected()],
 )
 
+REVISION: dict[str, object] = {
+    "base_sha": "a" * 40,
+    "head_sha": "b" * 40,
+    "diff_sha256": "c" * 64,
+}
+
+workflow_dataset: Dataset[WorkflowContractInput, bool, None] = Dataset(
+    name="workflow_contracts",
+    cases=[
+        Case(
+            name="accept_frozen_initial_review",
+            inputs={
+                "contract": "initial_review_report",
+                "value": {
+                    "review_revision": REVISION,
+                    "summary": "No findings.",
+                    "findings": [],
+                },
+            },
+            expected_output=True,
+        ),
+        Case(
+            name="reject_unrelated_re_review_verdict",
+            inputs={
+                "contract": "re_review_result",
+                "value": {
+                    "finding_id": "finding-003",
+                    "round": 1,
+                    "reviewed_commit_sha": "d" * 40,
+                    "verdict": "new_unrelated_finding",
+                    "rationale": "This must be deferred to a new review run.",
+                    "evidence": [],
+                },
+            },
+            expected_output=False,
+        ),
+    ],
+    evaluators=[EqualsExpected()],
+)
+
 
 def main() -> None:
-    """Run the local planner contract eval."""
+    """Run the local planner and workflow contract evals."""
 
     report = dataset.evaluate_sync(validates_supervisor_plan)
     report.print(include_input=True, include_output=True)
+    workflow_report = workflow_dataset.evaluate_sync(validates_workflow_contract)
+    workflow_report.print(include_input=True, include_output=True)
 
 
 if __name__ == "__main__":

@@ -9,23 +9,17 @@ from kasgraph.execution import ExecutionController
 from kasgraph.models import RoleName, StagePhase, SupervisorPlan
 from kasgraph.orca import JsonObject
 from kasgraph.store import StateStore
+from tests.factories import graph_config_data
 
 
 def config(*, max_parallel: int = 2) -> GraphConfig:
-    profile = {"agent": "codex", "model": "gpt-test", "strength": "high"}
-    return GraphConfig.model_validate(
-        {
-            "version": 1,
-            "max_parallel_lanes": max_parallel,
-            "supervisor": profile,
-            "roles": {
-                "worker": profile,
-                "initial_reviewer": profile,
-                "fixer": profile,
-                "re_reviewer": {**profile, "strength": "xhigh"},
-            },
-        }
-    )
+    raw = graph_config_data(max_parallel_lanes=max_parallel)
+    roles = raw["roles"]
+    assert isinstance(roles, dict)
+    re_reviewer = roles["re_reviewer"]
+    assert isinstance(re_reviewer, dict)
+    re_reviewer["strength"] = "xhigh"
+    return GraphConfig.model_validate(raw)
 
 
 def proposal(*, lane_count: int = 1, next_action: str = "propose_lanes") -> SupervisorPlan:

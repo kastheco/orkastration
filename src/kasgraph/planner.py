@@ -11,7 +11,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from kasgraph.config import SupervisorProfile
+from kasgraph.config import PlannerProfile
 from kasgraph.models import SupervisorPlan
 
 
@@ -68,14 +68,14 @@ class SubprocessCodexRunner:
 
     command: tuple[str, ...]
     cwd: Path
-    profile: SupervisorProfile
+    profile: PlannerProfile
     timeout_seconds: float
 
     async def run(self, prompt: str, schema: dict[str, object]) -> str:
         """Invoke an ephemeral read-only turn and return its final structured message."""
 
         if self.profile.agent != "codex":
-            raise PlannerError("the supervisor profile agent must be codex")
+            raise PlannerError("the planner profile agent must be codex")
         service_tier = "priority" if self.profile.fast else "default"
         with tempfile.TemporaryDirectory(prefix="kasgraph-planner-") as raw_directory:
             directory = Path(raw_directory)
@@ -137,14 +137,14 @@ class SubprocessClaudeRunner:
 
     command: tuple[str, ...]
     cwd: Path
-    profile: SupervisorProfile
+    profile: PlannerProfile
     timeout_seconds: float
 
     async def run(self, prompt: str, schema: dict[str, object]) -> str:
         """Invoke one non-persistent `claude -p` turn and return structured JSON."""
 
         if self.profile.agent != "claude":
-            raise PlannerError("the Claude supervisor profile agent must be claude")
+            raise PlannerError("the Claude planner profile agent must be claude")
         process = await asyncio.create_subprocess_exec(
             *self.command,
             "-p",

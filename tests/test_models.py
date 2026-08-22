@@ -3,7 +3,13 @@
 import pytest
 from pydantic import ValidationError
 
-from kasgraph.models import SupervisorPlan
+from kasgraph.models import (
+    FixAttempt,
+    InitialReviewReport,
+    ReReviewResult,
+    SupervisorPlan,
+    workflow_contract_schemas,
+)
 
 
 def proposal(**lane_overrides: object) -> dict[str, object]:
@@ -69,3 +75,91 @@ def test_needs_owner_requires_question() -> None:
                 "lanes": [],
             }
         )
+
+
+def finding(**overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "id": "finding-003",
+        "review_revision": {
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "diff_sha256": "c" * 64,
+        },
+        "evidence": [
+            {
+                "location": {"path": "src/app.py", "start_line": 10, "end_line": 12},
+                "claim": "The branch drops the failure result.",
+            }
+        ],
+        "failure_mode": "A failed operation is reported as successful.",
+        "required_outcome": "Preserve and return the failed state.",
+        "allowed_write_scope": {"paths": ["src/app.py"], "symbols": ["run_operation"]},
+        "forbidden_scope": ["database migrations"],
+        "validation": [{"command": "pytest tests/test_app.py", "expected": "passes"}],
+        "dependencies": [],
+    }
+    value.update(overrides)
+    return value
+
+
+def test_initial_review_report_rejects_unknown_finding_dependency() -> None:
+    with pytest.raises(ValidationError, match="unknown finding"):
+        InitialReviewReport.model_validate(
+            {
+                "review_revision": finding()["review_revision"],
+                "summary": "One finding.",
+                "findings": [finding(dependencies=["finding-999"])],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        {
+            "finding_id": "finding-003",
+            "round": 3,
+            "status": "fixed",
+            "base_sha": "b" * 40,
+            "commit_sha": "d" * 40,
+            "changed_paths": ["src/app.py"],
+            "validation_results": [],
+            "scope_expansion_required": None,
+        },
+        {
+            "finding_id": "finding-003",
+            "round": 1,
+            "status": "fixed",
+            "base_sha": "b" * 40,
+            "commit_sha": None,
+            "changed_paths": ["src/app.py"],
+            "validation_results": [],
+            "scope_expansion_required": None,
+        },
+    ],
+)
+def test_fix_attempt_enforces_round_and_commit_invariants(attempt: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        FixAttempt.model_validate(attempt)
+
+
+def test_re_review_result_accepts_only_closed_verdict_set() -> None:
+    with pytest.raises(ValidationError):
+        ReReviewResult.model_validate(
+            {
+                "finding_id": "finding-003",
+                "round": 1,
+                "reviewed_commit_sha": "d" * 40,
+                "verdict": "new_unrelated_finding",
+                "rationale": "Unrelated.",
+                "evidence": [],
+            }
+        )
+
+
+def test_workflow_contract_schemas_are_stable_and_strict() -> None:
+    first = workflow_contract_schemas()
+    second = workflow_contract_schemas()
+    assert first == second
+    assert first["initial_review_report"]["additionalProperties"] is False
+    assert first["fix_attempt"]["title"] == "FixAttempt"

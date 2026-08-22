@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
@@ -17,25 +18,13 @@ from kasgraph.models import OrcaSnapshot, ProposalReceipt, SupervisorPlan
 from kasgraph.orca import OrcaError
 from kasgraph.planner import ClaudeCliPlanner, CodexCliPlanner
 from kasgraph.store import StateStore
+from tests.factories import graph_config_data
 
 runner = CliRunner()
 
 
 def graph_config() -> GraphConfig:
-    profile = {"agent": "codex", "model": "gpt-test", "strength": "high"}
-    return GraphConfig.model_validate(
-        {
-            "version": 1,
-            "max_parallel_lanes": 2,
-            "supervisor": profile,
-            "roles": {
-                "worker": profile,
-                "initial_reviewer": profile,
-                "fixer": profile,
-                "re_reviewer": profile,
-            },
-        }
-    )
+    return GraphConfig.model_validate(graph_config_data())
 
 
 def proposal() -> SupervisorPlan:
@@ -119,8 +108,16 @@ def test_doctor_and_snapshot_emit_json(fake_wiring: None) -> None:
     doctor = runner.invoke(cli.app, ["doctor", "--json"])
     snapshot = runner.invoke(cli.app, ["snapshot", "--json"])
     assert doctor.exit_code == 0
-    assert json.loads(doctor.stdout)["supervisor"]["model"] == "gpt-test"
+    assert json.loads(doctor.stdout)["planner"]["model"] == "gpt-test"
     assert json.loads(snapshot.stdout)["worktrees"] == []
+
+
+def test_schemas_emit_strict_workflow_contracts() -> None:
+    result = runner.invoke(cli.app, ["schemas", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["initial_review_report"]["additionalProperties"] is False
+    assert payload["fix_attempt"]["title"] == "FixAttempt"
 
 
 def test_plan_records_codex_result(fake_wiring: None) -> None:
@@ -182,25 +179,18 @@ def test_runtime_error_is_clean_json(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_controller_and_planner_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config_path = tmp_path / "kasgraph.yaml"
-    config_path.write_text(
-        """
-version: 1
-max_parallel_lanes: 2
-supervisor: {agent: codex, model: gpt-test, strength: high}
-roles:
-  worker: {agent: codex, model: gpt-test, strength: high}
-  initial_reviewer: {agent: codex, model: gpt-test, strength: high}
-  fixer: {agent: codex, model: gpt-test, strength: high}
-  re_reviewer: {agent: codex, model: gpt-test, strength: high}
-""".strip()
-    )
+    config_path.write_text(yaml.safe_dump(graph_config_data(), sort_keys=False))
     monkeypatch.setenv("KASGRAPH_CONFIG", str(config_path))
     monkeypatch.setenv("KASGRAPH_DB_PATH", str(tmp_path / "state.sqlite3"))
     monkeypatch.setenv("ORCA_CLI_COMMAND", "orca-ide")
     assert cli._controller() is not None
     assert isinstance(cli._planner(), CodexCliPlanner)
 
-    config_path.write_text(config_path.read_text().replace("agent: codex", "agent: claude", 1))
+    raw = graph_config_data()
+    planner = raw["planner"]
+    assert isinstance(planner, dict)
+    planner["agent"] = "claude"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     assert isinstance(cli._planner(), ClaudeCliPlanner)
 
 

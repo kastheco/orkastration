@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 from kasgraph import __version__
 from kasgraph.config import ConfigError, Settings
 from kasgraph.execution import ExecutionController
-from kasgraph.models import SupervisorPlan
+from kasgraph.models import SupervisorPlan, workflow_contract_schemas
 from kasgraph.orca import OrcaClient, OrcaError, SubprocessRunner
 from kasgraph.planner import (
     ClaudeCliPlanner,
@@ -63,8 +63,9 @@ def doctor(
             "ok": True,
             "config_path": str(settings.config_path),
             "roles": settings.graph.roles.model_dump(mode="json"),
-            "supervisor": settings.graph.supervisor.model_dump(mode="json"),
+            "planner": settings.graph.planner.model_dump(mode="json"),
             "max_parallel_lanes": settings.graph.max_parallel_lanes,
+            "max_parallel_workers": settings.graph.max_parallel_workers,
             "database_path": str(settings.database_path),
             "database": store.counts(),
             "orca_command": list(settings.orca_command),
@@ -87,6 +88,15 @@ def snapshot(
         return await orca.snapshot()
 
     _run(read(), json_output=json_output)
+
+
+@app.command()
+def schemas(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Emit every agent-facing workflow result schema."""
+
+    _emit(workflow_contract_schemas(), json_output=json_output)
 
 
 @app.command()
@@ -199,7 +209,7 @@ def _controller() -> ExecutionController:
 
 def _planner() -> SchemaCliPlanner:
     settings = Settings.from_env()
-    profile = settings.graph.supervisor
+    profile = settings.graph.planner
     if profile.agent == "codex":
         runner = SubprocessCodexRunner(
             command=settings.codex_command,
@@ -216,7 +226,7 @@ def _planner() -> SchemaCliPlanner:
             timeout_seconds=settings.planner_timeout_seconds,
         )
         return ClaudeCliPlanner(claude_runner)
-    raise ConfigError(f"unsupported supervisor agent: {profile.agent}")
+    raise ConfigError(f"unsupported planner agent: {profile.agent}")
 
 
 def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:

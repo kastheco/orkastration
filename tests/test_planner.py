@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from kasgraph.config import SupervisorProfile
+from kasgraph.config import PlannerProfile
 from kasgraph.planner import (
     ClaudeCliPlanner,
     CodexCliPlanner,
@@ -88,7 +88,7 @@ def subprocess_runner(
     return SubprocessCodexRunner(
         command=("codex",),
         cwd=Path("/repo"),
-        profile=SupervisorProfile(agent=agent, model="gpt-test", strength="xhigh", fast=fast),
+        profile=PlannerProfile(agent=agent, model="gpt-test", strength="xhigh", fast=fast),
         timeout_seconds=timeout,
     )
 
@@ -169,7 +169,7 @@ def claude_runner(
     return SubprocessClaudeRunner(
         command=("claude",),
         cwd=Path("/repo"),
-        profile=SupervisorProfile(agent=agent, model="sonnet", strength="high", fast=fast),
+        profile=PlannerProfile(agent=agent, model="sonnet", strength="high", fast=fast),
         timeout_seconds=timeout,
     )
 

@@ -36,46 +36,60 @@ stores proposal and correlation state.
 
 ## Configuration
 
-All planner and execution model/strength choices are in
-[`kasgraph.yaml`](kasgraph.yaml):
+The strict v2 policy and every planner/execution profile are in
+[`kasgraph.yaml`](kasgraph.yaml). Its main sections are:
 
 ```yaml
-version: 1
+version: 2
 max_parallel_lanes: 3
+max_parallel_workers: 6
 
-supervisor:
+planner:
   agent: codex
-  model: gpt-5.6-sol
-  strength: high
+  model: gpt-5.6-terra
+  strength: medium
   fast: false
+
+review_cycle:
+  initial_scope: lane_changeset
+  freeze_findings_after_initial_review: true
+  max_fix_rounds_per_finding: 2
+  # See kasgraph.yaml for scope, isolation, integration, and escalation policy.
 
 roles:
   worker:
     agent: codex
     model: gpt-5.6-sol
-    strength: high
-    fast: false
+    strength: medium
   initial_reviewer:
-    agent: codex
-    model: gpt-5.6-sol
+    agent: claude
+    model: opus
     strength: high
     fast: false
   fixer:
     agent: codex
-    model: gpt-5.6-sol
+    model: gpt-5.6-luna
     strength: high
-    fast: false
+    fast: true
+    fallback:
+      agent: codex
+      model: gpt-5.6-terra
+      strength: high
+      fast: true
+      trigger: capability_mismatch
   re_reviewer:
-    agent: codex
-    model: gpt-5.6-sol
-    strength: xhigh
+    agent: claude
+    model: sonnet
+    strength: medium
     fast: false
+
+# publication and final_gate define the accepted-run external-write boundary.
 ```
 
 Every profile accepts an optional `fast` value that defaults to `false`. The
 execution-role values map to Orca's supervised worker launch. A fast role uses
 Orca's custom-argv path so the provider-native fast setting is active before the
-terminal is attached to its Task Dispatch. The top-level `supervisor` profile
+terminal is attached to its Task Dispatch. The top-level `planner` profile
 selects the planner backend. For Codex, `fast: true` selects the `priority`
 service tier; for Claude, it requests Claude Code fast mode. Claude may decline
 the request when fast mode is unavailable for the account or model.
@@ -83,6 +97,19 @@ the request when fast mode is unavailable for the account or model.
 `agent: claude` maps to `claude -p --model --effort`. Set `KASGRAPH_CONFIG` to
 use a different YAML file. The surrounding interactive session still controls
 the model you are talking to.
+
+The v2 schema now validates the settled convergence, publication, and CI
+policies. The current execution controller still runs the original fixed
+four-stage lane chain; dynamic per-finding scheduling, git integration, and
+remote publication are subsequent implementation slices and are not yet live.
+Version 1 YAML is intentionally unsupported; configuration errors identify the
+invalid field before Kasgraph creates local or Orca state.
+
+Inspect the generated agent-result contracts with:
+
+```bash
+uv run kasgraph schemas --json
+```
 
 An all-Claude example is provided in
 [`kasgraph.claude.yaml`](kasgraph.claude.yaml):

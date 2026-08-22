@@ -1,29 +1,105 @@
-version: 1
+version: 2
 max_parallel_lanes: 3
+max_parallel_workers: 6
 
-supervisor:
+planner:
   agent: codex
-  model: gpt-5.6-sol
-  strength: high
+  model: gpt-5.6-terra
+  strength: medium
   fast: false
+
+review_cycle:
+  initial_scope: lane_changeset
+  freeze_findings_after_initial_review: true
+  max_fix_rounds_per_finding: 2
+
+  re_review_scope:
+    - finding_contract
+    - relevant_original_context
+    - fixer_diff
+    - validation_evidence
+
+  new_findings_during_re_review:
+    introduced_by_fix: accept
+    otherwise: defer_to_next_review_run
+
+  scope:
+    escape: stop_and_escalate
+    reject_out_of_scope_diff: true
+    required_boundary: paths
+    symbols: enforce_when_adapter_available
+
+  parallel_fixers:
+    max_per_lane: 3
+    workspace: isolated_from_review_revision
+    require_disjoint_write_scopes: true
+    on_overlap: serialize
+    integration: serial
+
+  escalation:
+    agent: codex
+    model: gpt-5.6-sol
+    strength: high
+    fast: false
 
 roles:
   worker:
     agent: codex
     model: gpt-5.6-sol
-    strength: high
+    strength: medium
 
   initial_reviewer:
-    agent: codex
-    model: gpt-5.6-sol
+    agent: claude
+    model: opus
     strength: high
+    fast: false
 
   fixer:
     agent: codex
-    model: gpt-5.6-sol
+    model: gpt-5.6-luna
     strength: high
+    fast: true
+    fallback:
+      agent: codex
+      model: gpt-5.6-terra
+      strength: high
+      fast: true
+      trigger: capability_mismatch
 
   re_reviewer:
-    agent: codex
-    model: gpt-5.6-sol
-    strength: xhigh
+    agent: claude
+    model: sonnet
+    strength: medium
+    fast: false
+
+publication:
+  authorized_by: graph_acceptance
+  scope: accepted_run
+  branch:
+    create: true
+    push: true
+    force_push: false
+  pull_request:
+    create_or_update: true
+    initial_state: draft
+    mark_ready_after_final_gate: true
+  merge: false
+  deploy: false
+
+final_gate:
+  type: ci
+  provider: auto
+  repository: lane_repository
+  run_on: integrated_fix_set
+  require_remote: true
+  require_all_checks: true
+  restart_initial_review: false
+
+  on_failure:
+    create_scoped_finding: true
+    scope_source:
+      - failing_check
+      - failure_output
+      - implicated_fix_commits
+    max_fix_rounds: 2
+    scope_escape: stop_and_escalate
