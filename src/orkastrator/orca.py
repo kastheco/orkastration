@@ -155,6 +155,40 @@ class OrcaClient:
             if cast(JsonObject, row).get("run_id") == orca_run_id
         ]
 
+    async def coordinator_handle(self, orca_run_id: str) -> str:
+        """Resolve the handle a supervisor reply has to be sent from.
+
+        Orca refuses `orchestration reply` from any terminal it cannot pin to a
+        stable pane, and the handle that satisfies it is the Run's own
+        `coordinator_handle`. That field is already in `run-show`, so read it
+        rather than leaving an operator to discover it by trying handles until
+        one is accepted - which is how it was found the first time.
+        """
+
+        response = await self._ok("orchestration", "run-show", "--id", orca_run_id, "--json")
+        run = _object(_object(response.get("result"), "result").get("run"), "result.run")
+        handle = run.get("coordinator_handle")
+        if not isinstance(handle, str) or not handle:
+            raise OrcaError("Orca run-show response omitted result.run.coordinator_handle")
+        return handle
+
+    async def reply(self, orca_run_id: str, message_id: str, body: str) -> JsonObject:
+        """Answer one blocked agent on the Run that owns its dispatch."""
+
+        return await self._ok(
+            "orchestration",
+            "reply",
+            "--id",
+            message_id,
+            "--run",
+            orca_run_id,
+            "--from",
+            await self.coordinator_handle(orca_run_id),
+            "--body",
+            body,
+            "--json",
+        )
+
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
         """Recover the supervised Dispatch and worktree already attached to a Task."""
 

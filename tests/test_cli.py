@@ -71,6 +71,16 @@ class FakeController:
     async def accept(self, run_id: str) -> StatusResult:
         return StatusResult(run_id=run_id, status="active")
 
+    answered: ClassVar[list[tuple[str, str, str]]] = []
+    pending: ClassVar[list[object]] = []
+
+    async def questions(self, run_id: str) -> list[object]:
+        return list(type(self).pending)
+
+    async def answer(self, run_id: str, message_id: str, body: str) -> object:
+        type(self).answered.append((run_id, message_id, body))
+        return SimpleNamespace(lane="issue-123", role="worker")
+
     async def monitor(self, run_id: str) -> StatusResult:
         return StatusResult(
             run_id=run_id,
@@ -202,3 +212,55 @@ def test_watch_stops_on_a_parked_question(fake_wiring: None) -> None:
 
     assert result.exit_code == 0
     assert json.loads(result.stdout)["questions"] == ["msg-1"]
+
+
+def test_answer_reads_the_body_from_a_file(fake_wiring: None, tmp_path: Path) -> None:
+    """A five-part direction is not something anyone types onto a command line."""
+
+    FakeController.answered.clear()
+    body = tmp_path / "answer.txt"
+    body.write_text("restore the exclusion\nand fix the guard\n")
+
+    result = runner.invoke(
+        cli.app, ["answer", "run-1", "--message", "msg-1", "--body-file", str(body)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert FakeController.answered == [
+        ("run-1", "msg-1", "restore the exclusion\nand fix the guard\n")
+    ]
+
+
+def test_answer_refuses_both_a_body_and_a_body_file(fake_wiring: None, tmp_path: Path) -> None:
+    """Silently preferring one would send a direction nobody chose."""
+
+    FakeController.answered.clear()
+    body = tmp_path / "answer.txt"
+    body.write_text("from the file")
+
+    result = runner.invoke(
+        cli.app,
+        ["answer", "run-1", "--message", "msg-1", "--body", "inline", "--body-file", str(body)],
+    )
+
+    assert result.exit_code != 0
+    assert "exactly one" in result.output
+    assert FakeController.answered == []
+
+
+def test_answer_refuses_an_empty_body(fake_wiring: None) -> None:
+    FakeController.answered.clear()
+
+    result = runner.invoke(cli.app, ["answer", "run-1", "--message", "msg-1", "--body", "   "])
+
+    assert result.exit_code != 0
+    assert FakeController.answered == []
+
+
+def test_questions_says_so_when_there_are_none(fake_wiring: None) -> None:
+    FakeController.pending = []
+
+    result = runner.invoke(cli.app, ["questions", "run-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "no unanswered questions" in result.output

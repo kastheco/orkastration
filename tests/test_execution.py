@@ -205,6 +205,7 @@ class FakeOrca:
         self.bound_runs: list[str] = []
         self.unreadable_dispatches: set[str] = set()
         self.messages_by_run: dict[str, list[JsonObject]] = {}
+        self.replies: list[tuple[str, str, str]] = []
         self.fail_after_run_create = False
         self.fail_after_task_create = False
         self.fail_after_worker_start = False
@@ -227,6 +228,10 @@ class FakeOrca:
 
     async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]:
         return list(self.messages_by_run.get(orca_run_id, []))
+
+    async def reply(self, orca_run_id: str, message_id: str, body: str) -> JsonObject:
+        self.replies.append((orca_run_id, message_id, body))
+        return {"ok": True}
 
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         task_id = f"task-{len(self.tasks_by_id) + 1}"
@@ -633,6 +638,91 @@ async def test_monitor_drops_a_question_once_it_has_a_reply(tmp_path: Path) -> N
     result = await value.monitor(run_id)
 
     assert result.questions == []
+
+
+async def test_answering_sends_the_reply_and_records_that_the_supervisor_directed_the_lane(
+    tmp_path: Path,
+) -> None:
+    """The only trace of a supervisor's direction used to live in Orca's log.
+
+    A lane that changes course because it was told to should be explicable from
+    the supervisor's own ledger, not from a message store `show` cannot read.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    dispatch_id = accepted.started[0].dispatch_id
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{dispatch_id}"),
+    ]
+
+    question = await value.answer(run_id, "msg-1", "restore the exclusion")
+
+    assert question.lane == "issue-100"
+    assert orca.replies == [("orca-run-1", "msg-1", "restore the exclusion")]
+    recorded = [event for event in store.events(run_id) if event["kind"] == "supervisor_answered"]
+    assert recorded == [
+        {
+            "kind": "supervisor_answered",
+            "payload": {"message_id": "msg-1", "body": "restore the exclusion"},
+        }
+    ]
+
+
+async def test_answering_an_unknown_message_sends_nothing(tmp_path: Path) -> None:
+    """A typo must not direct an agent in some other run."""
+
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{accepted.started[0].dispatch_id}"),
+    ]
+
+    with pytest.raises(ValueError, match="not an unanswered question"):
+        await value.answer(run_id, "msg-typo", "body")
+
+    assert orca.replies == []
+
+
+async def test_an_already_answered_question_cannot_collect_a_second_answer(
+    tmp_path: Path,
+) -> None:
+    """An agent reading a thread cannot tell which of two directions is current."""
+
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    dispatch_id = accepted.started[0].dispatch_id
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{dispatch_id}"),
+        _message("msg-2", "status", from_handle="run:orca-run-1", thread_id="msg-1"),
+    ]
+
+    with pytest.raises(ValueError, match="not an unanswered question"):
+        await value.answer(run_id, "msg-1", "second direction")
+
+    assert orca.replies == []
+
+
+async def test_questions_carries_the_body_the_monitor_line_only_counts(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    accepted = await value.accept(run_id)
+    orca.messages_by_run["orca-run-1"] = [
+        _message("msg-1", "question", from_handle=f"dispatch:{accepted.started[0].dispatch_id}"),
+    ]
+
+    pending = await value.questions(run_id)
+
+    assert [(item.message_id, item.body) for item in pending] == [
+        ("msg-1", "Choose fix or approve.")
+    ]
 
 
 async def test_monitor_reports_an_escalation_it_cannot_attribute(tmp_path: Path) -> None:

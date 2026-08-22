@@ -479,3 +479,45 @@ async def test_messages_rejects_a_response_without_a_message_list() -> None:
 
     with pytest.raises(OrcaError, match=r"omitted result\.messages"):
         await client.messages("run-1")
+
+
+def test_a_reply_is_sent_from_the_handle_the_run_itself_names() -> None:
+    """Orca refuses a reply from a terminal it cannot pin to a stable pane.
+
+    The handle it accepts is the Run's own `coordinator_handle`, and it is
+    already in `run-show`. Discovering it by trying handles until one is
+    accepted is how it was found the first time, and is not a procedure.
+    """
+
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"run": {"id": "orca-run-1", "coordinator_handle": "term_abc"}}},
+            {"ok": True, "result": {"message": {"id": "msg-2"}}},
+        ]
+    )
+
+    asyncio.run(OrcaClient(runner).reply("orca-run-1", "msg-1", "do the thing"))
+
+    assert runner.calls[0] == ("orchestration", "run-show", "--id", "orca-run-1", "--json")
+    assert runner.calls[1] == (
+        "orchestration",
+        "reply",
+        "--id",
+        "msg-1",
+        "--run",
+        "orca-run-1",
+        "--from",
+        "term_abc",
+        "--body",
+        "do the thing",
+        "--json",
+    )
+
+
+def test_a_run_without_a_coordinator_handle_is_an_error_not_an_empty_from() -> None:
+    """An empty --from is accepted by argv and rejected by Orca, far from the cause."""
+
+    runner = FakeRunner([{"ok": True, "result": {"run": {"id": "orca-run-1"}}}])
+
+    with pytest.raises(OrcaError, match="coordinator_handle"):
+        asyncio.run(OrcaClient(runner).coordinator_handle("orca-run-1"))

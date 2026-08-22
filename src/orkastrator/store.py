@@ -1103,6 +1103,27 @@ class StateStore:
             ).first()
             return None if row is None else ReReviewResult.model_validate_json(row.payload_json)
 
+    def record_supervisor_answer(
+        self, run_id: str, lane_id: str | None, message_id: str, body: str
+    ) -> None:
+        """Record that the supervisor answered a blocked agent.
+
+        Without this the only trace that a supervisor redirected a lane lives in
+        Orca's message log, so `show` cannot reconstruct why the lane changed
+        direction. The body is kept whole on purpose: a direction that shaped
+        what landed is exactly the thing an audit needs to read back.
+        """
+
+        with self._session() as session:
+            self._event(
+                session,
+                run_id,
+                lane_id,
+                "supervisor_answered",
+                {"message_id": message_id, "body": body},
+            )
+            session.commit()
+
     def record_escalation(
         self,
         run_id: str,

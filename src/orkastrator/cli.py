@@ -240,6 +240,63 @@ def show_graph(
 
 
 @app.command()
+def questions(
+    run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Show every unanswered question raised inside one run, body included."""
+
+    try:
+        controller = _controller()
+        pending = asyncio.run(controller.questions(run_id))
+    except (ConfigError, OrcaError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    if json_output:
+        _emit([item.model_dump(mode="json") for item in pending], json_output=True)
+        return
+    if not pending:
+        typer.echo("no unanswered questions")
+        return
+    for item in pending:
+        typer.echo(f"{item.message_id}  {item.kind}  {item.lane or '?'}/{item.role or '?'}")
+        typer.echo(f"  asked {item.asked_at}: {item.subject}")
+        typer.echo(f"  {item.body}")
+        typer.echo("")
+
+
+@app.command()
+def answer(
+    run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],
+    message: Annotated[str, typer.Option("--message", help="Message ID from `questions`.")],
+    body: Annotated[str, typer.Option("--body", help="Answer text.")] = "",
+    body_file: Annotated[
+        Path | None,
+        typer.Option("--body-file", help="Read the answer from a file instead of --body."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Answer one blocked agent, resolving the reply handle from the run itself."""
+
+    if (body == "") == (body_file is None):
+        _fail("pass exactly one of --body or --body-file", json_output=json_output)
+    try:
+        text = body if body_file is None else body_file.read_text()
+    except OSError as exc:
+        _fail(str(exc), json_output=json_output)
+    if not text.strip():
+        _fail("answer body cannot be empty", json_output=json_output)
+    try:
+        controller = _controller()
+        question = asyncio.run(controller.answer(run_id, message, text))
+    except (ConfigError, OrcaError, KeyError, ValueError, OSError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(
+        {"answered": message, "lane": question.lane, "role": question.role},
+        json_output=json_output,
+    )
+
+
+@app.command()
 def report(
     run_id: Annotated[str, typer.Argument(help="Local graph run ID.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,

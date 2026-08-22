@@ -266,6 +266,44 @@ class ExecutionController:
             questions=await self._pending_questions(run_id, run.orca_run_id),
         )
 
+    async def questions(self, run_id: str) -> list[PendingQuestion]:
+        """Return every unanswered question on this run, body included.
+
+        The monitor line reports these as a count and a subject, which is the
+        right density for a status line and the wrong one for deciding what to
+        say back. This is the read that carries the body and the message id.
+        """
+
+        run = self._store.run(run_id)
+        if run.orca_run_id is None:
+            raise ValueError(f"run {run_id} has not been accepted")
+        return await self._pending_questions(run_id, run.orca_run_id)
+
+    async def answer(self, run_id: str, message_id: str, body: str) -> PendingQuestion:
+        """Answer one blocked agent, and record that the supervisor did.
+
+        The message has to be pending on this run. Sending to an arbitrary id
+        would let a typo direct an agent in a different run, and a question that
+        already has an answer must not collect a second one - an agent reading a
+        thread cannot tell which of two directions is current.
+        """
+
+        pending = await self.questions(run_id)
+        question = next((item for item in pending if item.message_id == message_id), None)
+        if question is None:
+            known = ", ".join(item.message_id for item in pending) or "none"
+            raise ValueError(
+                f"{message_id} is not an unanswered question on this run; pending: {known}"
+            )
+        run = self._store.run(run_id)
+        assert run.orca_run_id is not None
+        await self._orca.reply(run.orca_run_id, message_id, body)
+        lanes = {lane.name: lane.lane_id for lane in self._store.lanes(run_id)}
+        self._store.record_supervisor_answer(
+            run_id, lanes.get(question.lane or ""), message_id, body
+        )
+        return question
+
     async def _pending_questions(self, run_id: str, orca_run_id: str) -> list[PendingQuestion]:
         """Report every unanswered question or escalation raised inside this run.
 
