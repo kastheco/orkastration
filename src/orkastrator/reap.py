@@ -18,6 +18,12 @@ its stage is both released and processed: orkastrator has consumed that result,
 so nothing is still reading it. Everything else is held, whatever Orca says
 about it, which is why this can run against a live run without touching the
 stage in flight.
+
+That rule is load-bearing for a second reason. `release_worker` runs
+`worker-release` before it closes anything, so a released stage's Dispatch is
+already settled and closing its pane ends the agent. A held stage's is not, and
+closing that pane instead re-dispatches its Task into a new worktree with a new
+agent. Reclaiming a held stage is a fence-and-settle, never a close. KAS-632.
 """
 
 from __future__ import annotations

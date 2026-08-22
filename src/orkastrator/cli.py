@@ -316,6 +316,13 @@ def reap(
 
     Without `--confirm` this prints what it would close and closes nothing:
     which panes it thinks are yours is the whole question.
+
+    Do not close a held pane by hand. Closing a pane whose Dispatch was never
+    released re-dispatches its Task: Orca opens a fresh worktree and starts a
+    new agent on work nobody is waiting for. That is why release goes through
+    `worker-release` first and why this holds anything it has not seen settle.
+    Reclaiming a stage of an abandoned run means fencing the Dispatch and
+    settling the Task, not killing the terminal. See KAS-632.
     """
 
     async def sweep() -> ReapPlan:
