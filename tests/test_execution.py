@@ -357,6 +357,9 @@ class FakeGit(LocalGit):
         self.ancestor_override: bool | None = None
         self.lane_head_override: str | None = None
         self.conflict = False
+        # Conflict for one named fix rather than for the whole run, which is what a
+        # lane head moving under one finding actually looks like.
+        self.conflict_commits: set[str] = set()
         self.crash_after_cherry_pick = False
         self.integration_count = 0
         self.commit_count_override: int | None = None
@@ -425,7 +428,7 @@ class FakeGit(LocalGit):
 
     async def cherry_pick_many(self, worktree_id: str, commit_shas: list[str]) -> GitCommandResult:
         self.pre_sequence_head = self.heads[worktree_id]
-        if self.conflict:
+        if self.conflict or self.conflict_commits.intersection(commit_shas):
             self.in_progress = True
             self.active_sequence_commits = list(commit_shas)
             return GitCommandResult(1, "", "conflict")
@@ -2642,3 +2645,160 @@ def test_a_reopened_stage_no_longer_counts_toward_its_family() -> None:
     # escalation ceiling then read as a loop and blocked on the next tick.
     assert _next_key(settled, base) == base
     assert _next_key(settled | {base}, base) == f"{base}:retry1"
+
+
+async def test_a_conflict_retry_is_rebuilt_on_the_lane_head_it_has_to_land_on(
+    tmp_path: Path,
+) -> None:
+    """A rebase is the supervisor's job, because no adjudicator can do it.
+
+    `finding-escape-drops-search-drilldown-with-job-sheet` was dispatched three
+    times at round 2, every time from `0706fc6c`, while the lane head sat at
+    `f1c5dbd8`. The fix was correct - it cherry-picked cleanly by hand - and it
+    conflicted identically on every attempt because it was rebuilt on the base
+    that had just conflicted. Re-adjudicating that forever cannot help: the
+    supervisor knows both shas and Git is the only thing that can settle it.
+    """
+
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(), review_finding_data(2))
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    # The first fix lands and moves the lane head; the second then conflicts on
+    # the head it was never built against. That is the whole defect in one pass.
+    git.conflict_commits = {fixer_sha("finding-2", 1)}
+    orca.complete_dispatched(re_review("resolved"))
+    await value.monitor(run_id)
+
+    lane_head = store.lanes(run_id)[0].integration_head_sha
+    assert lane_head is not None and lane_head != "b" * 40, "the first fix should have landed"
+    conflicted = next(
+        item for item in store.findings(run_id) if item.phase is not FindingPhase.RESOLVED
+    )
+    assert conflicted.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    # It was dispatched from the review revision, which is now behind the lane.
+    assert conflicted.dispatch_base_sha is None
+
+    orca.complete_dispatched(
+        escalation("integration_conflict", "approve_unchanged", finding_id=conflicted.finding_id)
+    )
+    result = await value.monitor(run_id)
+
+    retried = next(item for item in result.findings if item.finding_id == conflicted.finding_id)
+    assert retried.dispatch_base_sha == lane_head
+    assert retried.phase is FindingPhase.FIXING
+    # And the fixer's checkout is cut from that head, not from the frozen review.
+    retry = next(
+        stage
+        for stage in store.stages(run_id)
+        if stage.finding_id == conflicted.finding_id
+        and stage.role is StageKind.FIXER
+        and ":retry" in stage.stage_key
+    )
+    assert retry.phase is not StagePhase.PENDING
+
+
+async def test_a_rebased_retry_lands_and_the_round_slot_follows_it(tmp_path: Path) -> None:
+    """The rebase is only worth doing if the ledgers let the retry finish.
+
+    A conflict retry stays in its own round on purpose, and both per-round
+    ledgers keyed on that round refused the retry for producing a different
+    commit - which is exactly what it was sent to do. The integration slot is
+    re-pointed at the commit that is now current, and the re-review guard asks
+    the stage rather than the round.
+    """
+
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(), review_finding_data(2))
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    git.conflict_commits = {fixer_sha("finding-2", 1)}
+    orca.complete_dispatched(re_review("resolved"))
+    await value.monitor(run_id)
+    conflicted_commit = store.integration(
+        next(item.finding_key for item in store.findings(run_id) if item.finding_id == "finding-2"),
+        1,
+    )
+    assert conflicted_commit is not None and conflicted_commit.status == "conflict"
+
+    orca.complete_dispatched(
+        escalation("integration_conflict", "approve_unchanged", finding_id="finding-2")
+    )
+    await value.monitor(run_id)
+    # The rebased fixer produces a genuinely different commit, and it applies.
+    git.conflict_commits = set()
+    git.head_override = fixer_sha("finding-2", 3)
+    orca.complete_dispatched(fix_attempt("finding-2"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert all(item.phase is FindingPhase.RESOLVED for item in result.findings)
+    landed = store.integration(conflicted_commit.finding_key, 1)
+    assert landed is not None
+    assert landed.status == "integrated"
+    # The slot now names the commit that actually landed, and the one it replaced
+    # is on the record rather than overwritten in silence.
+    assert landed.fixer_commit_sha == fixer_sha("finding-2", 3)
+    reopened = [item for item in store.events(run_id) if item["kind"] == "integration_reopened"]
+    assert reopened and reopened[-1]["payload"]["previous_commit_sha"] == fixer_sha("finding-2", 1)
+
+
+async def test_a_fix_stacked_on_another_fix_is_never_rebased_off_it(tmp_path: Path) -> None:
+    """A rebase that drops a commit is worse than a conflict that stops.
+
+    An introduced-regression fix is built on the commit it corrects, and its
+    integration replays that whole chain. Moving its base to the lane head would
+    cut the predecessor out of the range and land half the work, so the retry is
+    left where it is and the ceiling handles it.
+    """
+
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    original_commit = fixer_sha("finding-1", 1)
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    introduced = review_finding_data(2)
+    revision = introduced["review_revision"]
+    assert isinstance(revision, dict)
+    revision["head_sha"] = original_commit
+    git.conflict_commits = {fixer_sha("finding-2", 1)}
+    orca.complete_dispatched(
+        re_review(
+            "regression_introduced_by_fix",
+            new_findings=[{"origin": "introduced_by_fix", "finding": introduced}],
+        )
+    )
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt("finding-2", base_sha=original_commit))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
+    result = await value.monitor(run_id)
+    stacked = next(item for item in result.findings if item.finding_id == "finding-2")
+    assert stacked.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+
+    orca.complete_dispatched(
+        escalation("integration_conflict", "approve_unchanged", finding_id="finding-2")
+    )
+    result = await value.monitor(run_id)
+
+    stacked = next(item for item in result.findings if item.finding_id == "finding-2")
+    assert stacked.dispatch_base_sha is None
+    assert not [item for item in store.events(run_id) if item["kind"] == "fix_base_advanced"]
+    # And not because there was nothing to move to: the lane head really has
+    # advanced past the commit this fix is stacked on.
+    assert store.lanes(run_id)[0].integration_head_sha not in {None, original_commit}

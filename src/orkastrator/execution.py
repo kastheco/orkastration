@@ -25,6 +25,7 @@ from orkastrator.models import (
     FindingReason,
     FindingRecord,
     FixAttempt,
+    FixAttemptIdentity,
     GraphResult,
     InitialReviewReport,
     LanePhase,
@@ -609,7 +610,12 @@ class ExecutionController:
         collisions = {
             item.finding.id for item in result.new_findings if item.finding.id in existing_ids
         }
-        persisted = self._store.re_review(finding.finding_key, result.round)
+        # Asked of this stage, not of the round. A conflict retry stays in its own
+        # round on purpose, and the re-review of the rebased commit is a different
+        # verdict about a different commit; keyed on the round, the retry's own
+        # re-review read as the first one being rewritten and was refused, which
+        # left the rebase unable to finish what it was sent to do.
+        persisted = self._store.re_review_for_stage(stage.stage_id)
         if persisted is not None and persisted != result:
             raise ValueError("re-review result changed after persistence")
         if collisions and persisted is None:
@@ -746,6 +752,8 @@ class ExecutionController:
                     run_id, finding.finding_key, phase=FindingPhase.BLOCKED
                 )
             else:
+                if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
+                    self._rebase_conflicted_fix(run_id, finding)
                 self._store.set_finding_state(
                     run_id,
                     finding.finding_key,
@@ -866,22 +874,37 @@ class ExecutionController:
         _, source_commits, source_finding_ids = await self._integration_sources(
             run_id, finding, attempt, fixer_worktree
         )
+        identity = FixAttemptIdentity(
+            fixer_commit_sha=attempt.commit_sha,
+            base_sha=lane.integration_head_sha,
+            source_commits=source_commits,
+            source_finding_ids=source_finding_ids,
+        )
         receipt = self._store.integration(finding.finding_key, finding.round)
         if receipt is None:
             receipt = self._store.begin_integration(
                 run_id,
                 finding,
-                fixer_commit_sha=attempt.commit_sha,
-                source_commits=source_commits,
-                source_finding_ids=source_finding_ids,
-                base_sha=lane.integration_head_sha,
+                fixer_commit_sha=identity.fixer_commit_sha,
+                source_commits=identity.source_commits,
+                source_finding_ids=identity.source_finding_ids,
+                base_sha=identity.base_sha,
             )
         elif (
             receipt.fixer_commit_sha != attempt.commit_sha
             or receipt.source_commits != source_commits
             or receipt.source_finding_ids != source_finding_ids
         ):
-            raise ValueError("integration sources changed after persistence")
+            # A conflict retry stays in its own round, and this ledger is unique
+            # on (finding, round), so the retry's commit arrives at a slot still
+            # describing the attempt it replaces. That is the retry working, not
+            # sources changing under a live integration, so re-point the slot at
+            # it. Only a settled non-terminal verdict is re-pointed; a `starting`
+            # receipt really is mid-flight and still refuses.
+            rebound = self._store.reopen_integration(run_id, finding, attempt=identity)
+            if rebound is None:
+                raise ValueError("integration sources changed after persistence")
+            receipt = rebound
         if receipt.status == "integrated":
             self._settle_source_findings(
                 run_id,
@@ -1119,10 +1142,60 @@ class ExecutionController:
                 self._store.set_finding_state(run_id, item.finding_key, phase=phase)
 
     def _fix_base_sha(self, finding: FindingRecord) -> str:
+        """The commit this finding's fix is built on, which is not always the review.
+
+        The review revision is where every fix starts and where almost all of them
+        stay. It moves only after an integration conflict, which is a fact about
+        the lane head having moved rather than about the fix, and which no amount
+        of re-fixing on the old base can clear.
+        """
+
+        if finding.dispatch_base_sha is not None:
+            return finding.dispatch_base_sha
         revision = finding.effective_contract.review_revision
         if revision is None:
             raise ValueError(f"finding {finding.finding_id} was persisted without a revision")
         return revision.head_sha
+
+    def _rebase_conflicted_fix(self, run_id: str, finding: FindingRecord) -> None:
+        """Point the next attempt at the head it has to land on, when that is safe.
+
+        A conflict retry rebuilt on the base that just conflicted produces a
+        commit that conflicts identically, so the loop spends every remaining
+        round re-deriving the same collision and blocks a fix that was correct.
+        `finding-escape-drops-search-drilldown-with-job-sheet` did exactly that
+        three times on `0706fc6c` while the lane head sat at `f1c5dbd8`; the fix
+        itself cherry-picked cleanly by hand. No adjudicator can rebase a commit,
+        and the supervisor knows both shas, so it does it here instead of asking.
+
+        A fix with a composite predecessor is left alone. Its integration replays
+        the whole chain, and a rebase onto the lane head would silently drop the
+        predecessor's commit from the range - a wrong landing is worse than a
+        blocked one.
+        """
+
+        lane = next(item for item in self._store.lanes(run_id) if item.lane_id == finding.lane_id)
+        head = lane.integration_head_sha
+        if head is None or head == self._fix_base_sha(finding):
+            return
+        if self._composite_predecessor(run_id, finding) is not None:
+            return
+        self._store.advance_fix_base(run_id, finding.finding_key, head)
+
+    def _composite_predecessor(self, run_id: str, finding: FindingRecord) -> FindingRecord | None:
+        """The finding whose fix commit this one was built on, if it was built on one."""
+
+        base = self._fix_base_sha(finding)
+        return next(
+            (
+                item
+                for item in self._store.findings(run_id, finding.lane_id)
+                if item.finding_key != finding.finding_key
+                and (prior := self._store.latest_fix_attempt(item.finding_key)) is not None
+                and prior.commit_sha == base
+            ),
+            None,
+        )
 
     def _ensure_dynamic_stages(self, run_id: str) -> None:
         stages = self._store.stages(run_id)

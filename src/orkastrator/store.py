@@ -42,6 +42,7 @@ from orkastrator.models import (
     FindingReason,
     FindingRecord,
     FixAttempt,
+    FixAttemptIdentity,
     InitialReviewReport,
     IntegrationRecord,
     LanePhase,
@@ -1102,6 +1103,32 @@ class StateStore:
                 },
             )
 
+    def advance_fix_base(self, run_id: str, finding_key: str, base_sha: str) -> None:
+        """Move the commit the next fixer for this finding is dispatched from.
+
+        Only the build base moves. `review_revision` stays exactly as the initial
+        review froze it, because that is the evidence anchor `_verified_review`
+        checks and rewriting it would make the finding's own diff digest describe
+        a range nobody reviewed.
+        """
+
+        with self._session() as session:
+            row = session.get(FindingRow, finding_key)
+            if row is None:
+                raise KeyError(f"unknown finding {finding_key}")
+            if row.dispatch_base_sha == base_sha:
+                return
+            previous = row.dispatch_base_sha
+            row.dispatch_base_sha = base_sha
+            row.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "fix_base_advanced",
+                {"finding_id": row.finding_id, "from": previous, "to": base_sha},
+            )
+
     def record_fix_attempt(
         self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
     ) -> None:
@@ -1179,6 +1206,19 @@ class StateStore:
                 .where(ReReviewRow.finding_key == finding_key, ReReviewRow.round == round)
                 .order_by(col(ReReviewRow.created_at).desc())
             ).first()
+            return None if row is None else ReReviewResult.model_validate_json(row.payload_json)
+
+    def re_review_for_stage(self, stage_id: str) -> ReReviewResult | None:
+        """The verdict one re-review stage recorded, if it has recorded one.
+
+        Distinct from `re_review`, which answers for a round. A round can be run
+        twice - a fix rebased after a conflict and re-reviewed again - and those
+        two verdicts describe different commits, so "has this stage already spoken
+        and is it saying something else now" cannot be asked of the round.
+        """
+
+        with self._session() as session:
+            row = session.exec(select(ReReviewRow).where(ReReviewRow.stage_id == stage_id)).first()
             return None if row is None else ReReviewResult.model_validate_json(row.payload_json)
 
     def record_supervisor_answer(
@@ -1461,8 +1501,14 @@ class StateStore:
             session.flush()
             return _integration(row)
 
-    def reopen_integration(self, run_id: str, finding: FindingRecord) -> IntegrationRecord | None:
-        """Reopen a settled integration whose verdict an adjudicator has overruled.
+    def reopen_integration(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        *,
+        attempt: FixAttemptIdentity | None = None,
+    ) -> IntegrationRecord | None:
+        """Reopen a settled integration whose verdict no longer describes the fix.
 
         A conflict and a failed validation are facts about one attempt against one
         lane head, not about the fix itself. When an adjudicator reads the commit
@@ -1472,6 +1518,14 @@ class StateStore:
         on the same frozen output until it blocks. Put the receipt back to
         ``starting`` so the next pass actually re-checks it. An integrated receipt
         is never reopened, because that one is genuinely terminal.
+
+        `attempt` re-points the slot at a commit that did not exist when the
+        verdict was written. A conflict retry stays in its own round on purpose -
+        a lane head moving is not the fixer thrashing - and this table is unique
+        on (finding, round), so the retry has no slot of its own and would
+        otherwise be refused as "sources changed after persistence" for having
+        done exactly what it was sent to do. The identity it replaces goes into
+        the event, so the superseded attempt is still on the record.
         """
 
         with self._session(immediate=True) as session:
@@ -1491,7 +1545,15 @@ class StateStore:
             ).first()
             if active is not None:
                 raise IntegrationBusyError(f"lane {finding.lane_id} is integrating another finding")
-            previous = row.status
+            superseded: dict[str, object] = {"previous_status": row.status}
+            if attempt is not None and attempt.fixer_commit_sha != row.fixer_commit_sha:
+                superseded["previous_commit_sha"] = row.fixer_commit_sha
+                superseded["previous_base_sha"] = row.base_sha
+                row.fixer_commit_sha = attempt.fixer_commit_sha
+                row.base_sha = attempt.base_sha
+                row.source_commits_json = json.dumps(attempt.source_commits)
+                row.source_finding_ids_json = json.dumps(attempt.source_finding_ids)
+                row.integrated_sha = None
             row.status = "starting"
             row.validation_json = "[]"
             row.updated_at = _now()
@@ -1500,7 +1562,7 @@ class StateStore:
                 run_id,
                 finding.lane_id,
                 "integration_reopened",
-                {"finding_id": finding.finding_id, "previous_status": previous},
+                {"finding_id": finding.finding_id, **superseded},
             )
             session.flush()
             return _integration(row)
@@ -1871,6 +1933,7 @@ class StateStore:
                 ("integration_head_sha", "TEXT"),
             ),
             "workflow_stages": (("worktree_id", "TEXT"),),
+            "findings": (("dispatch_base_sha", "TEXT"),),
             "integrations": (
                 ("source_commits_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("source_finding_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1972,6 +2035,7 @@ def _finding(row: FindingRow) -> FindingRecord:
         escalation_reason=(
             FindingReason(row.escalation_reason) if row.escalation_reason is not None else None
         ),
+        dispatch_base_sha=row.dispatch_base_sha,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

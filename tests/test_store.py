@@ -657,3 +657,44 @@ def test_a_publication_pass_that_never_failed_records_nothing(tmp_path: Path) ->
 
     kinds = [event["kind"] for event in store.events(run_id)]
     assert "lane_publication_progress" not in kinds
+
+
+def test_advancing_a_fix_base_leaves_the_review_revision_alone(tmp_path: Path) -> None:
+    """The build base and the evidence anchor are different facts.
+
+    A conflict retry has to be rebuilt on the lane head, but the review revision
+    is what `_verified_review` checks the frozen diff against. Rewriting it to
+    say where the retry starts would make the finding's own digest describe a
+    range nobody reviewed.
+    """
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data(1))),
+    )
+    finding = store.findings(run_id)[0]
+    assert finding.dispatch_base_sha is None
+    revision = finding.effective_contract.review_revision
+    assert revision is not None
+
+    store.advance_fix_base(run_id, finding.finding_key, "e" * 40)
+
+    moved = store.findings(run_id)[0]
+    assert moved.dispatch_base_sha == "e" * 40
+    assert moved.effective_contract.review_revision == revision
+    advanced = [item for item in store.events(run_id) if item["kind"] == "fix_base_advanced"]
+    assert advanced[-1]["payload"] == {
+        "finding_id": finding.finding_id,
+        "from": None,
+        "to": "e" * 40,
+    }
+
+    # Advancing to where it already is writes nothing, so a replayed tick cannot
+    # fill the log with a move that did not happen.
+    store.advance_fix_base(run_id, finding.finding_key, "e" * 40)
+    assert len([item for item in store.events(run_id) if item["kind"] == "fix_base_advanced"]) == 1

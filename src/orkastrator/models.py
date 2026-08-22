@@ -679,6 +679,9 @@ class FindingRecord(BaseModel):
     phase: FindingPhase
     round: int
     escalation_reason: FindingReason | None
+    # None means "the frozen review revision", which is where every fix starts.
+    # It moves only when a conflict retry has to be rebuilt on the lane head.
+    dispatch_base_sha: GitObjectId | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -701,6 +704,23 @@ class IntegrationRecord(BaseModel):
     validation_results: list[ValidationResult]
     created_at: datetime
     updated_at: datetime
+
+
+class FixAttemptIdentity(BaseModel):
+    """What a fixer commit is, and what range it carries, as one value.
+
+    These four move together or not at all: a commit implies its base, and the
+    source range and the findings it represents are derived from both. Passing
+    them separately is how a receipt ends up describing one attempt's commit over
+    another attempt's range.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fixer_commit_sha: GitObjectId
+    base_sha: GitObjectId
+    source_commits: list[GitObjectId]
+    source_finding_ids: list[FindingId]
 
 
 class PendingQuestion(BaseModel):

@@ -67,6 +67,11 @@ class FindingRow(SQLModel, table=True):
     phase: str
     round: int
     escalation_reason: str | None = None
+    # The commit a fixer was actually dispatched from, when that is no longer the
+    # frozen review revision. A conflict retry has to be rebuilt on the lane head
+    # it must land on, and the review revision is the evidence anchor rather than
+    # a build base, so it must not be rewritten to say that.
+    dispatch_base_sha: str | None = None
     created_at: datetime
     updated_at: datetime
 
