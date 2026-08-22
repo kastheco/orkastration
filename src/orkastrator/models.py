@@ -10,7 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 GitObjectId = Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-FindingId = Annotated[str, StringConstraints(pattern=r"^(?:finding|ci-finding)-[a-z0-9-]+$")]
+FindingId = Annotated[
+    str, StringConstraints(pattern=r"^(?:finding|ci-finding|worker-decision)-[a-z0-9-]+$")
+]
 
 
 class RoleName(StrEnum):
@@ -93,6 +95,7 @@ class FindingReason(StrEnum):
     ROUNDS_EXHAUSTED = "rounds_exhausted"
     INTEGRATION_CONFLICT = "integration_conflict"
     VALIDATION_FAILED = "validation_failed"
+    WORKER_DECISION = "worker_decision"
 
 
 class LaneProposal(BaseModel):
@@ -283,6 +286,7 @@ class ValidationResult(WorkflowContract):
 class WorkerResult(WorkflowContract):
     """Exact committed changeset and validation evidence produced by a lane worker."""
 
+    status: Literal["committed"] = "committed"
     review_revision: ReviewRevision
     commit_sha: GitObjectId
     changed_paths: list[str] = Field(default_factory=list, max_length=256)
@@ -296,6 +300,30 @@ class WorkerResult(WorkflowContract):
         if self.commit_sha != self.review_revision.head_sha:
             raise ValueError("worker commit_sha must equal review_revision.head_sha")
         return self
+
+
+class WorkerDecision(WorkflowContract):
+    """One decision a lane worker cannot take from its own contract."""
+
+    question: str = Field(min_length=1, max_length=4_000)
+    options: list[str] = Field(min_length=2, max_length=8)
+    consequence: str = Field(min_length=1, max_length=4_000)
+    allowed_write_scope: AllowedWriteScope
+
+
+class WorkerBlocked(WorkflowContract):
+    """A lane worker that stopped on a decision its contract does not answer.
+
+    The graph routes a decision nobody in the lane can take, so a worker that
+    needs one ends its stage with this instead of waiting on a human. Asking
+    out of band leaves the stage dispatched and the decision uncontracted.
+    """
+
+    status: Literal["blocked"]
+    base_sha: GitObjectId
+    head_sha: GitObjectId
+    summary: str = Field(min_length=1, max_length=8_000)
+    decision: WorkerDecision
 
 
 class ScopeExpansionRequest(WorkflowContract):
@@ -385,6 +413,7 @@ class EscalationDecision(WorkflowContract):
         "rounds_exhausted",
         "integration_conflict",
         "validation_failed",
+        "worker_decision",
     ]
     action: Literal["approve_scope_revision", "defer", "block"]
     rationale: str = Field(min_length=1, max_length=4_000)
@@ -592,7 +621,9 @@ class FindingRecord(BaseModel):
     finding_key: str
     lane_id: str
     finding_id: str
-    origin: Literal["initial_review", "introduced_by_fix", "unrelated", "ci_failure"]
+    origin: Literal[
+        "initial_review", "introduced_by_fix", "unrelated", "ci_failure", "worker_blocked"
+    ]
     contract: ReviewFinding
     effective_contract: ReviewFinding
     phase: FindingPhase

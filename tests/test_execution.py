@@ -96,6 +96,23 @@ def worker_result() -> str:
     )
 
 
+def worker_blocked(*, question: str = "Fix all four, or approve the two warnings as-is?") -> str:
+    return json.dumps(
+        {
+            "status": "blocked",
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "summary": "Guard restoration and upload lifetime disagree.",
+            "decision": {
+                "question": question,
+                "options": ["fix all four", "approve the two warnings"],
+                "consequence": "Approving leaves the owner unable to submit.",
+                "allowed_write_scope": {"paths": ["src/file1.py"], "symbols": []},
+            },
+        }
+    )
+
+
 def fixer_sha(finding_id: str, round: int) -> str:
     number = int(finding_id.rsplit("-", maxsplit=1)[-1])
     return f"{1_000 + round * 100 + number:040x}"
@@ -1587,3 +1604,99 @@ async def test_ci_fix_rounds_stop_after_two_failed_republished_heads(tmp_path: P
     assert result.status == "blocked"
     assert len(store.ci_failures(run_id)) == 2
     assert len(publisher.publish_calls) == 3
+
+
+async def test_blocked_worker_escalates_instead_of_starting_a_review(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_blocked())
+    result = await value.monitor(run_id)
+
+    assert [finding.origin for finding in result.findings] == ["worker_blocked"]
+    assert result.findings[0].phase is FindingPhase.ESCALATING
+    assert result.findings[0].escalation_reason is FindingReason.WORKER_DECISION
+    assert [launch.role for launch in result.started] == [StageKind.ESCALATION]
+    assert StageKind.INITIAL_REVIEWER not in {stage.role for stage in result.stages}
+    assert store.lanes(run_id)[0].review_head_sha is None
+
+
+async def test_blocked_worker_decision_reaches_the_adjudicator_verbatim(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_blocked(question="Which document may be uploaded?"))
+
+    result = await value.monitor(run_id)
+
+    contract = result.findings[0].effective_contract
+    assert contract.required_outcome.startswith("Which document may be uploaded?")
+    assert contract.allowed_write_scope.paths == ["src/file1.py"]
+    spec = orca.tasks_by_id[result.started[0].task_id]["spec"]
+    assert "Which document may be uploaded?" in str(spec)
+
+
+async def test_blocked_worker_must_leave_a_clean_checkout(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_clean_override = False
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_blocked())
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+    assert result.findings == []
+
+
+async def test_blocked_worker_head_must_match_its_lane(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_head_override = "9" * 40
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_blocked())
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+
+
+async def test_adjudicated_worker_decision_resumes_as_a_bounded_fixer(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_blocked())
+    await value.monitor(run_id)
+    revised = review_finding_data()
+    revised["id"] = "worker-decision-1"
+    revised["review_revision"] = {
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "diff_sha256": "c" * 64,
+    }
+    orca.complete_dispatched(
+        json.dumps(
+            {
+                "finding_id": "worker-decision-1",
+                "round": 1,
+                "reason": "worker_decision",
+                "action": "approve_scope_revision",
+                "rationale": "Fix all four.",
+                "revised_finding": revised,
+            }
+        )
+    )
+
+    result = await value.monitor(run_id)
+
+    assert [launch.role for launch in result.started] == [StageKind.FIXER]
+    assert result.findings[0].phase is FindingPhase.FIXING
+    assert result.findings[0].round == 2

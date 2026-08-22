@@ -69,7 +69,9 @@ class IntegrationBusyError(RuntimeError):
     """Raised when another approved commit owns a lane's integration lock."""
 
 
-FindingOrigin = Literal["initial_review", "introduced_by_fix", "unrelated", "ci_failure"]
+FindingOrigin = Literal[
+    "initial_review", "introduced_by_fix", "unrelated", "ci_failure", "worker_blocked"
+]
 ContractRow = TypeVar("ContractRow", FixAttemptRow, ReReviewRow, EscalationRow)
 
 

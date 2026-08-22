@@ -42,6 +42,7 @@ from orkastrator.models import (
     StageRecord,
     SupervisorPlan,
     ValidationRequirement,
+    WorkerBlocked,
     WorkerResult,
 )
 from orkastrator.orca import JsonObject, OrcaError
@@ -327,7 +328,11 @@ class ExecutionController:
         self, run_id: str, stage: StageRecord, lifecycle: OrcaWorkerResult
     ) -> None:
         if stage.role is StageKind.WORKER:
-            result = WorkerResult.model_validate_json(lifecycle.body)
+            payload = json.loads(lifecycle.body)
+            if isinstance(payload, dict) and payload.get("status") == "blocked":
+                await self._apply_worker_block(run_id, stage, WorkerBlocked.model_validate(payload))
+                return
+            result = WorkerResult.model_validate(payload)
             await self._validate_worker_result(run_id, stage, result)
             self._store.record_worker_result(run_id, stage.lane_id, result)
             return
@@ -394,6 +399,51 @@ class ExecutionController:
                 ],
             }
         )
+
+    async def _apply_worker_block(
+        self, run_id: str, stage: StageRecord, blocked: WorkerBlocked
+    ) -> None:
+        """Route a worker's undecidable choice through the graph's own adjudicator.
+
+        A decision the lane contract does not answer is exactly the shape the
+        finding machinery already carries: escalate it, let the configured
+        escalation role adjudicate, and let an approved revision come back as a
+        bounded fixer rather than as an unbounded worker resumed by hand.
+        """
+
+        if stage.worktree_id is None:
+            raise ValueError("blocked worker omitted its isolated worktree")
+        if not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("blocked worker left uncommitted changes in its lane")
+        if await self._git.head(stage.worktree_id) != blocked.head_sha:
+            raise ValueError("blocked worker head does not match its reported head")
+        lane = next(item for item in self._store.lanes(run_id) if item.lane_id == stage.lane_id)
+        finding_id = f"worker-decision-{len(self._store.findings(run_id, lane.lane_id)) + 1}"
+        detail = "\n".join(
+            [blocked.decision.question, *(f"- {option}" for option in blocked.decision.options)]
+        )
+        contract = ReviewFinding(
+            id=finding_id,
+            review_revision=ReviewRevision(
+                base_sha=blocked.base_sha,
+                head_sha=blocked.head_sha,
+                diff_sha256=await self._git.diff_sha256(
+                    stage.worktree_id, blocked.base_sha, blocked.head_sha
+                ),
+            ),
+            evidence=[
+                FindingEvidence(
+                    location=FindingLocation(path=path, start_line=1, end_line=1),
+                    claim=blocked.decision.consequence,
+                )
+                for path in blocked.decision.allowed_write_scope.paths[:64]
+            ],
+            failure_mode=f"{blocked.summary}\n\n{blocked.decision.consequence}"[:8_000],
+            required_outcome=detail[:8_000],
+            allowed_write_scope=blocked.decision.allowed_write_scope,
+        )
+        finding = self._store.add_finding(run_id, lane.lane_id, contract, origin="worker_blocked")
+        self._escalate(run_id, finding, FindingReason.WORKER_DECISION)
 
     async def _apply_fix(
         self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
@@ -862,7 +912,9 @@ class ExecutionController:
             by_lane.setdefault(stage.lane_id, []).append(stage)
         for lane in self._store.lanes(run_id):
             lane_stages = by_lane.get(lane.lane_id, [])
-            worker_done = any(
+            # A blocked worker is processed but produced no changeset, so review
+            # only what the lane actually recorded a worker result for.
+            worker_done = lane.review_head_sha is not None and any(
                 stage.role is StageKind.WORKER and stage.processed for stage in lane_stages
             )
             reviewer_exists = any(stage.role is StageKind.INITIAL_REVIEWER for stage in lane_stages)
@@ -1322,12 +1374,16 @@ class ExecutionController:
         )
         if stage.role is StageKind.WORKER:
             schema = json.dumps(WorkerResult.model_json_schema(), sort_keys=True)
+            blocked = json.dumps(WorkerBlocked.model_json_schema(), sort_keys=True)
             return (
                 "Implement the scoped issue, verify it, and commit the result. Compute "
                 "diff_sha256 over the raw output of `git diff --binary --full-index "
                 "<base>..<head> --` and report the exact sorted changed paths. Send worker_done "
                 "with an explicit outcome and body set to only the changeset JSON matching "
-                f"this schema: {schema}\n\n{context}"
+                f"this schema: {schema}\n"
+                "If you reach a decision this contract does not answer, do not ask anyone and do "
+                "not wait. Commit what you have, then send worker_done with body set to only the "
+                f"blocked JSON matching this schema: {blocked}\n\n{context}"
             )
         if stage.role is StageKind.INITIAL_REVIEWER:
             schema = json.dumps(InitialReviewReport.model_json_schema(), sort_keys=True)
