@@ -1153,6 +1153,49 @@ async def test_dirty_fixer_worktree_is_rejected_before_re_review(tmp_path: Path)
     assert result.findings[0].escalation_reason is FindingReason.AMBIGUOUS_RESULT
 
 
+async def test_an_in_flight_fixer_does_not_hold_up_an_unrelated_re_review(tmp_path: Path) -> None:
+    """A lane is not a queue of one.
+
+    Refusing every non-worker stage while any stage in the lane was active made
+    the lane strictly serial. One fixer that takes an hour held up the
+    adjudication of every finding that had already been fixed, and a lane with
+    three settled findings sat idle waiting on a fourth it had nothing to do
+    with.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca, graph_config=config(max_workers=3, max_fixers=2))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    second = review_finding_data(2)
+    second["validation"] = [{"command": "pytest tests/test_two.py", "expected": "passes"}]
+    await advance_to_fixer(value, orca, run_id, review_finding_data(1), second)
+
+    first_fixer = next(
+        item
+        for item in orca.starts
+        if "fixer" in str(item["lane_name"]) and "finding-1" in str(item["lane_name"])
+    )
+    orca.complete_task(
+        str(first_fixer["task_id"]),
+        fix_attempt(
+            "finding-1",
+            validation=[{"command": "pytest", "status": "passed", "output": "passed"}],
+        ),
+    )
+
+    result = await value.monitor(run_id)
+
+    # The second fixer is still out, and the first finding's re-review starts
+    # anyway - it reads a frozen diff in its own worktree and owns nothing the
+    # fixer touches.
+    assert [item.role for item in result.started] == [StageKind.RE_REVIEWER], store.events(run_id)
+    assert any(
+        item.role is StageKind.FIXER and item.phase is StagePhase.DISPATCHED
+        for item in store.stages(run_id)
+    )
+
+
 async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: Path) -> None:
     orca = FakeOrca()
     git = FakeGit()
@@ -1176,26 +1219,20 @@ async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: P
             ),
         )
     result = await value.monitor(run_id)
-    assert [item.role for item in result.started] == [StageKind.RE_REVIEWER], store.events(run_id)
+    # Each re-review reads a diff already frozen to an exact base and head, so
+    # neither has a reason to wait on the other. Integration is what stays
+    # serial, and the receipts below are what prove it.
+    assert [item.role for item in result.started] == [
+        StageKind.RE_REVIEWER,
+        StageKind.RE_REVIEWER,
+    ], store.events(run_id)
 
-    first_stage = next(
-        item for item in store.stages(run_id) if item.orca_task_id == result.started[0].task_id
-    )
-    assert first_stage.finding_id is not None
-    orca.complete_task(
-        result.started[0].task_id,
-        re_review("resolved", finding_id=first_stage.finding_id),
-    )
+    for started in result.started:
+        stage = next(item for item in store.stages(run_id) if item.orca_task_id == started.task_id)
+        assert stage.finding_id is not None
+        orca.complete_task(started.task_id, re_review("resolved", finding_id=stage.finding_id))
+
     result = await value.monitor(run_id)
-    assert [item.role for item in result.started] == [StageKind.RE_REVIEWER]
-    second_stage = next(
-        item for item in store.stages(run_id) if item.orca_task_id == result.started[0].task_id
-    )
-    assert second_stage.finding_id is not None
-    orca.complete_task(
-        result.started[0].task_id,
-        re_review("resolved", finding_id=second_stage.finding_id),
-    )
     result = await value.monitor(run_id)
 
     assert result.status == "complete"

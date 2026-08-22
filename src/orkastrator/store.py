@@ -554,7 +554,17 @@ class StateStore:
                     contract = ReviewFinding.model_validate_json(finding.effective_contract_json)
                     if scopes_overlap(write_paths, tuple(contract.allowed_write_scope.paths)):
                         return False
-            elif stage.lane_id in active_lanes:
+            elif stage.role is StageKind.WORKER and stage.lane_id in active_lanes:
+                # Only a worker owns the lane exclusively. Reviewers, re-reviewers
+                # and escalations each get their own Orca worktree and read a diff
+                # that was already frozen to an exact base and head, so nothing
+                # they do can observe or disturb another stage's work. Refusing
+                # them while any stage in the lane was active made the lane strictly
+                # serial: one slow fixer held up every unrelated adjudication behind
+                # it, and a lane with three settled findings sat idle waiting on a
+                # fix for a fourth. Total concurrency is still governed by
+                # ``max_workers``, lane spread by ``max_lanes``, and overlapping
+                # fixers by the write-scope check above.
                 return False
             row.phase = StagePhase.STARTING.value
             row.updated_at = _now()
