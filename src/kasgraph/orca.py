@@ -27,6 +27,7 @@ class CommandRunner(Protocol):
 
     async def run(self, arguments: Sequence[str]) -> JsonObject:
         """Return the parsed JSON response."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

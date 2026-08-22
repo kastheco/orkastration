@@ -49,3 +49,7 @@ python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 files = ["src", "evals", "tests"]
+
+[tool.pyright]
+reportUnusedVariable = "none"
+reportUnusedImport = "none"
