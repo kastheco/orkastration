@@ -415,3 +415,79 @@ def test_a_finding_cannot_be_reopened_into_a_phase_no_stage_advances(tmp_path: P
         )
     with pytest.raises(KeyError):
         store.reopen_finding(run_id, "finding-absent", phase=FindingPhase.PENDING_FIX, note="typo")
+
+
+def test_a_round_level_contract_constraint_is_rebuilt_around_the_stage(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    store = StateStore(path)
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    stage = store.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key="escalate:2",
+        role=StageKind.ESCALATION,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=2,
+    )
+    decision = EscalationDecision(
+        finding_id=finding.finding_id,
+        round=2,
+        reason="validation_failed",
+        action="approve_unchanged",
+        rationale="Verified at the committed head.",
+        revised_finding=None,
+    )
+    store.record_escalation(run_id, finding, stage, decision)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = OFF;
+            DROP INDEX ix_escalations_finding_key;
+            ALTER TABLE escalations RENAME TO escalations_legacy;
+            CREATE TABLE escalations (
+                escalation_id VARCHAR NOT NULL PRIMARY KEY,
+                finding_key VARCHAR NOT NULL REFERENCES findings (finding_key),
+                round INTEGER NOT NULL,
+                reason VARCHAR NOT NULL,
+                stage_id VARCHAR NOT NULL REFERENCES workflow_stages (stage_id),
+                payload_json VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL,
+                UNIQUE (finding_key, round, reason)
+            );
+            CREATE INDEX ix_escalations_finding_key ON escalations (finding_key);
+            INSERT INTO escalations SELECT * FROM escalations_legacy;
+            DROP TABLE escalations_legacy;
+            """
+        )
+
+    reopened = StateStore(path)
+    reopened.setup()
+    second = reopened.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key="escalate:2:retry1",
+        role=StageKind.ESCALATION,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=2,
+    )
+    reopened.record_escalation(
+        run_id,
+        finding,
+        second,
+        decision.model_copy(update={"rationale": "Looked again after the conflict."}),
+    )
+
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute("SELECT stage_id FROM escalations ORDER BY created_at").fetchall()
+    # The first verdict survived the rebuild, and the second round-mate records.
+    assert [item[0] for item in rows] == [stage.stage_id, second.stage_id]

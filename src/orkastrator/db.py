@@ -113,7 +113,7 @@ class WorkerResultRow(SQLModel, table=True):
 
 class FixAttemptRow(SQLModel, table=True):
     __tablename__ = "fix_attempts"
-    __table_args__ = (UniqueConstraint("finding_key", "round", "attempt_kind"),)
+    __table_args__ = (UniqueConstraint("stage_id"),)
 
     attempt_id: str = Field(primary_key=True)
     finding_key: str = Field(foreign_key="findings.finding_key", index=True)
@@ -126,7 +126,7 @@ class FixAttemptRow(SQLModel, table=True):
 
 class ReReviewRow(SQLModel, table=True):
     __tablename__ = "re_reviews"
-    __table_args__ = (UniqueConstraint("finding_key", "round"),)
+    __table_args__ = (UniqueConstraint("stage_id"),)
 
     review_id: str = Field(primary_key=True)
     finding_key: str = Field(foreign_key="findings.finding_key", index=True)
@@ -138,7 +138,7 @@ class ReReviewRow(SQLModel, table=True):
 
 class EscalationRow(SQLModel, table=True):
     __tablename__ = "escalations"
-    __table_args__ = (UniqueConstraint("finding_key", "round", "reason"),)
+    __table_args__ = (UniqueConstraint("stage_id"),)
 
     escalation_id: str = Field(primary_key=True)
     finding_key: str = Field(foreign_key="findings.finding_key", index=True)

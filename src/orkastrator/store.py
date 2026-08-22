@@ -105,6 +105,7 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         SQLModel.metadata.create_all(self._engine)
         self._migrate_additive_columns()
+        self._migrate_contract_uniqueness()
         with self._session() as session:
             active_runs = session.exec(
                 select(SupervisorRunRow).where(
@@ -916,11 +917,7 @@ class StateStore:
             raise ValueError("fixer stage omitted attempt kind")
         with self._session() as session:
             existing = session.exec(
-                select(FixAttemptRow).where(
-                    FixAttemptRow.finding_key == finding.finding_key,
-                    FixAttemptRow.round == attempt.round,
-                    FixAttemptRow.attempt_kind == stage.attempt_kind.value,
-                )
+                select(FixAttemptRow).where(FixAttemptRow.stage_id == stage.stage_id)
             ).first()
             created = self._record_contract(
                 session,
@@ -955,10 +952,7 @@ class StateStore:
     ) -> None:
         with self._session() as session:
             existing = session.exec(
-                select(ReReviewRow).where(
-                    ReReviewRow.finding_key == finding.finding_key,
-                    ReReviewRow.round == result.round,
-                )
+                select(ReReviewRow).where(ReReviewRow.stage_id == stage.stage_id)
             ).first()
             created = self._record_contract(
                 session,
@@ -989,9 +983,9 @@ class StateStore:
     def re_review(self, finding_key: str, round: int) -> ReReviewResult | None:
         with self._session() as session:
             row = session.exec(
-                select(ReReviewRow).where(
-                    ReReviewRow.finding_key == finding_key, ReReviewRow.round == round
-                )
+                select(ReReviewRow)
+                .where(ReReviewRow.finding_key == finding_key, ReReviewRow.round == round)
+                .order_by(col(ReReviewRow.created_at).desc())
             ).first()
             return None if row is None else ReReviewResult.model_validate_json(row.payload_json)
 
@@ -1004,11 +998,7 @@ class StateStore:
     ) -> None:
         with self._session() as session:
             existing = session.exec(
-                select(EscalationRow).where(
-                    EscalationRow.finding_key == finding.finding_key,
-                    EscalationRow.round == decision.round,
-                    EscalationRow.reason == decision.reason,
-                )
+                select(EscalationRow).where(EscalationRow.stage_id == stage.stage_id)
             ).first()
             created = self._record_contract(
                 session,
@@ -1049,7 +1039,10 @@ class StateStore:
             )
             if not rows:
                 return None
-            rows.sort(key=lambda row: (row.round, row.attempt_kind == "fallback"), reverse=True)
+            rows.sort(
+                key=lambda row: (row.round, row.attempt_kind == "fallback", row.created_at),
+                reverse=True,
+            )
             return FixAttempt.model_validate_json(rows[0].payload_json)
 
     def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
@@ -1064,7 +1057,9 @@ class StateStore:
             )
             if not rows:
                 return None
-            rows.sort(key=lambda row: row.attempt_kind == "fallback", reverse=True)
+            rows.sort(
+                key=lambda row: (row.attempt_kind == "fallback", row.created_at), reverse=True
+            )
             return FixAttempt.model_validate_json(rows[0].payload_json)
 
     def record_scope_check(
@@ -1310,6 +1305,14 @@ class StateStore:
         row: ContractRow,
         table_name: str,
     ) -> bool:
+        """Freeze one stage's contract against its own replay.
+
+        The subject is the stage, not the round. A round can legitimately be run
+        twice - a fix rebased after a conflict, an adjudication of a fix that
+        conflicted again - and each run records its own verdict. What must never
+        change is what a single stage said once it has been persisted.
+        """
+
         if existing is not None:
             if existing.payload_json != row.payload_json:
                 raise ValueError(f"{table_name} contract changed after persistence")
@@ -1397,6 +1400,40 @@ class StateStore:
             except Exception:
                 session.rollback()
                 raise
+
+    _CONTRACT_TABLES = ("fix_attempts", "re_reviews", "escalations")
+    """Tables whose contract identity moved from the round to the stage."""
+
+    def _migrate_contract_uniqueness(self) -> None:
+        """Rebuild contract tables that still make a round unique.
+
+        A round can legitimately be run twice, so the older unique keys rejected
+        an honest second verdict as a changed contract and stranded the finding.
+        Rebuild in place: the rows are kept, only the constraint changes.
+        """
+
+        inspector = inspect(self._engine)
+        for table in self._CONTRACT_TABLES:
+            if not inspector.has_table(table):
+                continue
+            constraints = inspector.get_unique_constraints(table)
+            if all(item["column_names"] == ["stage_id"] for item in constraints):
+                continue
+            columns = [item["name"] for item in inspector.get_columns(table)]
+            names = ", ".join(columns)
+            indexes = [item["name"] for item in inspector.get_indexes(table) if item["name"]]
+            with self._engine.begin() as connection:
+                # A renamed table keeps its indexes, and create_all would then
+                # refuse to build the replacement's own.
+                for index in indexes:
+                    connection.exec_driver_sql(f"DROP INDEX {index}")
+                connection.exec_driver_sql(f"ALTER TABLE {table} RENAME TO {table}_superseded")
+            SQLModel.metadata.create_all(self._engine)
+            with self._engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"INSERT INTO {table} ({names}) SELECT {names} FROM {table}_superseded"
+                )
+                connection.exec_driver_sql(f"DROP TABLE {table}_superseded")
 
     def _migrate_additive_columns(self) -> None:
         """Keep existing v2 databases readable without destructive migration."""

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
@@ -1047,21 +1046,13 @@ class ExecutionController:
 
     def _ensure_dynamic_stages(self, run_id: str) -> None:
         stages = self._store.stages(run_id)
-        # A retry re-runs a round the fixer already had a stage for, whether it
-        # was a rebase after a conflict or a supervised second attempt at the
-        # ceiling. Count what has already settled rather than what caused it.
-        settled_fixes = Counter(
-            (stage.lane_id, stage.finding_id, stage.round, stage.attempt_kind)
-            for stage in stages
-            if stage.role is StageKind.FIXER and stage.phase in _SETTLED_STAGES
-        )
-        # Re-review and adjudication belong to one fix attempt, so they carry the
-        # ordinal of the attempt that just settled rather than a per-kind count.
-        settled_rounds = Counter(
-            (stage.lane_id, stage.finding_id, stage.round)
-            for stage in stages
-            if stage.role is StageKind.FIXER and stage.phase in _SETTLED_STAGES
-        )
+        # Every round can be re-run: a fix rebased after a conflict, a re-review
+        # of that rebase, an adjudication of a fix that conflicted again. Each
+        # such stage names work already settled under its own key, and
+        # `ensure_stage` keys off `stage_key`, so a repeat needs a fresh one or
+        # the graph silently never dispatches it. Count the settled keys of the
+        # same shape and let the base key carry that ordinal.
+        settled = {stage.stage_key for stage in stages if stage.phase in _SETTLED_STAGES}
         by_lane: dict[str, list[StageRecord]] = {}
         for stage in stages:
             by_lane.setdefault(stage.lane_id, []).append(stage)
@@ -1093,19 +1084,14 @@ class ExecutionController:
                         if finding.escalation_reason is FindingReason.CAPABILITY_FALLBACK
                         else AttemptKind.PRIMARY
                     )
-                    # A retry re-lands a round that already had a stage, so the key
-                    # carries the retry ordinal or ensure_stage would find the
-                    # settled one and never dispatch a fixer again.
-                    retried = settled_fixes[
-                        (lane.lane_id, finding.finding_id, finding.round, attempt_kind)
-                    ]
+                    base = (
+                        f"{lane.lane_id}:{finding.finding_id}:fix:"
+                        f"{finding.round}:{attempt_kind.value}"
+                    )
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:fix:"
-                            f"{finding.round}:{attempt_kind.value}{_retry_suffix(retried)}"
-                        ),
+                        stage_key=_next_key(settled, base),
                         role=StageKind.FIXER,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -1113,14 +1099,11 @@ class ExecutionController:
                         attempt_kind=attempt_kind,
                     )
                 elif finding.phase is FindingPhase.PENDING_RE_REVIEW:
-                    attempts = settled_rounds[(lane.lane_id, finding.finding_id, finding.round)]
-                    cycle = _retry_suffix(max(attempts - 1, 0))
+                    base = f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}"
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}{cycle}"
-                        ),
+                        stage_key=_next_key(settled, base),
                         role=StageKind.RE_REVIEWER,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -1128,15 +1111,14 @@ class ExecutionController:
                     )
                 elif finding.phase is FindingPhase.PENDING_ESCALATION:
                     reason = finding.escalation_reason or FindingReason.AMBIGUOUS_RESULT
-                    attempts = settled_rounds[(lane.lane_id, finding.finding_id, finding.round)]
-                    cycle = _retry_suffix(max(attempts - 1, 0))
+                    base = (
+                        f"{lane.lane_id}:{finding.finding_id}:escalate:"
+                        f"{finding.round}:{reason.value}"
+                    )
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=(
-                            f"{lane.lane_id}:{finding.finding_id}:escalate:"
-                            f"{finding.round}:{reason.value}{cycle}"
-                        ),
+                        stage_key=_next_key(settled, base),
                         role=StageKind.ESCALATION,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -1608,11 +1590,19 @@ class ExecutionController:
 _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})
 """Stage phases that will never advance again, so a retry needs a new key."""
 
+_RETRY_MARKER = ":retry"
+"""Separates a stage key from the ordinal that makes a repeat of it dispatchable."""
 
-def _retry_suffix(settled: int) -> str:
-    """Name a retry at a round without renaming the first attempt at it."""
 
-    return f":retry{settled}" if settled else ""
+def _next_key(settled: set[str], base: str) -> str:
+    """Name the next stage under `base`, keeping the first attempt's key intact.
+
+    Only keys still under `base` count. A stage retired by a reopen was renamed
+    out of this family on purpose, which frees the base key again.
+    """
+
+    retried = sum(1 for key in settled if key == base or key.startswith(f"{base}{_RETRY_MARKER}"))
+    return f"{base}{_RETRY_MARKER}{retried}" if retried else base
 
 
 def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
