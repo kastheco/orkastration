@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from kasgraph.git import GitError, worktree_path
-from kasgraph.models import LanePhase, LaneRecord, PublicationReceipt
-from kasgraph.publication import (
+from orkastrator.git import GitError, worktree_path
+from orkastrator.models import LanePhase, LaneRecord, PublicationReceipt
+from orkastrator.publication import (
     CommandResult,
     GitHubPublisher,
     PublicationError,
@@ -85,7 +85,7 @@ async def test_create_draft_pr_observe_exact_checks_and_mark_ready(tmp_path: Pat
     ready = await publisher.mark_ready(receipt)
 
     assert receipt.draft is True
-    assert receipt.branch == "kasgraph/run-12345678/issue-123"
+    assert receipt.branch == "orkastrator/run-12345678/issue-123"
     assert checks.status == "passed"
     assert [item.name for item in checks.checks] == ["tests"]
     assert ready.draft is False
@@ -101,7 +101,7 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
         base_branch="main",
-        branch="kasgraph/run-12345678/issue-123",
+        branch="orkastrator/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha=old_sha,
         draft=True,
@@ -118,7 +118,7 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
                         "url": previous.pull_request_url,
                         "isDraft": True,
                         "state": "OPEN",
-                        "body": "Kasgraph run: `run-1234567890`",
+                        "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
@@ -146,7 +146,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
         base_branch="main",
-        branch="kasgraph/run-12345678/issue-123",
+        branch="orkastrator/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha="a" * 40,
         draft=True,
@@ -185,7 +185,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
 
 async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path) -> None:
     sha = "b" * 40
-    branch = "kasgraph/run-12345678/issue-123"
+    branch = "orkastrator/run-12345678/issue-123"
     runner = QueueRunner(
         result("git@github.com:owner/repo.git"),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
@@ -197,7 +197,7 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
                         "url": "https://github.com/owner/repo/pull/7",
                         "isDraft": True,
                         "state": "OPEN",
-                        "body": "Kasgraph run: `run-1234567890`",
+                        "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
@@ -224,7 +224,7 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
                         "url": receipt.pull_request_url,
                         "isDraft": True,
                         "state": "OPEN",
-                        "body": "Kasgraph run: `run-1234567890`",
+                        "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
@@ -248,7 +248,7 @@ async def test_missing_required_check_stays_pending() -> None:
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
         base_branch="main",
-        branch="kasgraph/run-12345678/issue-123",
+        branch="orkastrator/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha=sha,
         draft=True,
@@ -283,7 +283,7 @@ async def test_ready_transition_recovers_after_remote_success() -> None:
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
         base_branch="main",
-        branch="kasgraph/run-12345678/issue-123",
+        branch="orkastrator/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha="b" * 40,
         draft=True,
@@ -300,7 +300,7 @@ async def test_ready_transition_recovers_after_remote_success() -> None:
 
 async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path) -> None:
     sha = "b" * 40
-    branch = "kasgraph/run-12345678/issue-123"
+    branch = "orkastrator/run-12345678/issue-123"
     runner = QueueRunner(
         result("git@github.com:owner/repo.git"),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
@@ -312,7 +312,7 @@ async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path)
                         "url": "https://github.com/owner/repo/pull/7",
                         "isDraft": True,
                         "state": "CLOSED",
-                        "body": "Kasgraph run: `run-1234567890`",
+                        "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
@@ -332,7 +332,7 @@ async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> Non
         lane="issue-123",
         remote_url="git@github.com:owner/repo.git",
         base_branch="main",
-        branch="kasgraph/run-12345678/issue-123",
+        branch="orkastrator/run-12345678/issue-123",
         pull_request_url="https://github.com/owner/repo/pull/7",
         head_sha=sha,
         draft=False,

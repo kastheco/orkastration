@@ -1,4 +1,4 @@
-"""SQLModel correlation ledger for dynamic Kasgraph convergence workflows."""
+"""SQLModel correlation ledger for dynamic orkastrator convergence workflows."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Literal, TypeVar
 from sqlalchemy import event, func, inspect
 from sqlmodel import Session, SQLModel, col, create_engine, select
 
-from kasgraph.db import (
+from orkastrator.db import (
     AcceptanceAuthorizationRow,
     CiFailureRow,
     CiReceiptRow,
@@ -32,7 +32,7 @@ from kasgraph.db import (
     WorkerResultRow,
     WorkflowStageRow,
 )
-from kasgraph.models import (
+from orkastrator.models import (
     AcceptanceAuthorization,
     AttemptKind,
     CiFailureFinding,
@@ -58,7 +58,7 @@ from kasgraph.models import (
     ValidationResult,
     WorkerResult,
 )
-from kasgraph.scope import scopes_overlap
+from orkastrator.scope import scopes_overlap
 
 
 class UnsupportedStateError(RuntimeError):

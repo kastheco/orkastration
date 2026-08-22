@@ -1,5 +1,5 @@
 [project]
-name = "kasgraph"
+name = "orkastrator"
 version = "0.1.0"
 description = "Typed execution-graph controller for Orca-managed agent lanes"
 readme = "README.md"
@@ -23,18 +23,19 @@ dev = [
 ]
 
 [project.scripts]
-kasgraph = "kasgraph.cli:app"
-kasgraph-eval = "evals.planner:main"
+orkastrator = "orkastrator.cli:app"
+orkas = "orkastrator.cli:app"
+orkastrator-eval = "evals.contracts:main"
 
 [build-system]
 requires = ["hatchling>=1.28,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kasgraph", "evals"]
+packages = ["src/orkastrator", "evals"]
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config --cov=kasgraph --cov-report=term-missing --cov-fail-under=90"
+addopts = "--strict-markers --strict-config --cov=orkastrator --cov-report=term-missing --cov-fail-under=90"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 

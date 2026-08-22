@@ -9,9 +9,9 @@ from typing import Protocol, cast
 
 from pydantic import ValidationError
 
-from kasgraph.config import AgentProfile, GraphConfig
-from kasgraph.git import GitError, LocalGit
-from kasgraph.models import (
+from orkastrator.config import AgentProfile, GraphConfig
+from orkastrator.git import GitError, LocalGit
+from orkastrator.models import (
     AcceptanceAuthorization,
     AllowedWriteScope,
     AttemptKind,
@@ -43,14 +43,14 @@ from kasgraph.models import (
     ValidationRequirement,
     WorkerResult,
 )
-from kasgraph.orca import JsonObject
-from kasgraph.publication import GitHubPublisher, LanePublisher, PublicationError
-from kasgraph.scope import path_allowed
-from kasgraph.store import IntegrationBusyError, StateStore
+from orkastrator.orca import JsonObject
+from orkastrator.publication import GitHubPublisher, LanePublisher, PublicationError
+from orkastrator.scope import path_allowed
+from orkastrator.store import IntegrationBusyError, StateStore
 
 
 class OrcaGraphController(Protocol):
-    """Narrow Orca orchestration surface used by Kasgraph."""
+    """Narrow Orca orchestration surface used by orkastrator."""
 
     async def create_run(self, objective: str) -> tuple[str, JsonObject]: ...
 
@@ -1257,7 +1257,7 @@ def _task_id(task: JsonObject) -> str:
 def _orca_run_objective(run_id: str, objective: str) -> str:
     """Embed a stable local correlation key in the remote Run objective."""
 
-    return f"{objective}\n\nKasgraph run: {run_id}"
+    return f"{objective}\n\norkastrator run: {run_id}"
 
 
 def _task_phase(task: JsonObject) -> StagePhase:

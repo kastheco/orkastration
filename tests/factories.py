@@ -1,4 +1,4 @@
-"""Typed test-data factories shared across Kasgraph contract suites."""
+"""Typed test-data factories shared across orkastrator contract suites."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ def graph_config_data(*, max_parallel_lanes: int = 2) -> dict[str, object]:
         "version": 2,
         "max_parallel_lanes": max_parallel_lanes,
         "max_parallel_workers": 4,
-        "planner": profile,
         "review_cycle": {
             "initial_scope": "lane_changeset",
             "freeze_findings_after_initial_review": True,

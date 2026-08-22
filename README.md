@@ -1,73 +1,49 @@
-# kasgraph
+# orkastrator
 
-Kasgraph is a small execution-graph controller for supervised Orca workers.
+orkastrator is a supervised execution-graph controller for Orca-managed software-delivery lanes.
 
-The supervisor is the interactive agent you talk to. It can use its installed
-Linear and Notion connectors directly, or invoke Kasgraph's subscription-backed
-`codex exec` or `claude -p` planner, to discover work, resolve dependencies, and
-propose parallel lanes. Kasgraph creates Orca Tasks only after explicit
-acceptance and monitors each accepted lane through a persisted convergence loop.
+The supervisor is the interactive agent you are talking to through `$orkastrate`, `$orkas`,
+`/orkastrate`, or `/orkas`. It reads Linear and Notion, discusses priorities and tradeoffs with
+you, proposes independent lanes, and waits for exact acceptance. The Python controller begins at
+that accepted proposal: it creates and monitors the Orca work, persists evidence, publishes lane
+branches, and enforces the review and CI convergence policy.
 
 ```text
-interactive supervisor (Linear + Notion)
+you <-> interactive orkastrator supervisor
               |
-              | optional typed planning turn
+              | reads Linear/Notion, answers questions, proposes lanes
               v
-  codex exec (read-only) or claude -p (plan mode)
-              |
-              | reviewed proposal
-              v
-        Kasgraph acceptance
-              |
-              +-- worker -> one full initial review
-              |                    |
-              |                    +-- no findings -> publish
-              |                    `-- frozen findings
-              |                              |
-              |                        fix -> scoped re-review
-              |                              |
-              |                      resolve, retry, or escalate
-              v
-      persisted Orca Tasks/Dispatches
+       exact owner acceptance
               |
               v
- deterministic branch -> draft PR -> exact-SHA GitHub checks
-                                      |
-                                      +-- pass -> ready / complete
-                                      `-- fail -> scoped CI fix (max 2)
+       deterministic controller
+              |
+              +-- worker -> initial review
+              |                 |
+              |                 `-- frozen findings -> fix -> scoped re-review
+              v
+         persisted Orca tasks
+              |
+              v
+  orkastrator/<run>/<lane> -> draft PR -> exact-SHA GitHub checks
+                                          |
+                                          +-- pass -> ready
+                                          `-- fail -> scoped CI fix, max 2
 ```
 
-Kasgraph does not call model APIs directly and does not own API credentials. Its
-planner invokes either the installed Codex CLI or Claude Code CLI using their
-saved authentication, supplies `SupervisorPlan.model_json_schema()`, and
-validates the final JSON with Pydantic. It is one non-persistent subprocess per
-planning cycle. Orca remains the execution and worker-lifecycle authority.
-SQLModel provides the typed persistence layer over SQLite for proposals,
-immutable finding contracts, attempts, verdicts, escalation decisions, validated
-lifecycle receipts, publication/CI receipts, and transition evidence. Raw SQL is
-limited to SQLite locking and additive compatibility migrations.
+There is no separate planner agent. The supervisor uses its current conversation model and its
+existing connectors. It records the proposal with `orkas propose`; the YAML config controls only
+the execution roles and convergence policy.
 
 ## Configuration
 
-The strict v2 policy and every planner/execution profile are in
-[`kasgraph.yaml`](kasgraph.yaml). Its main sections are:
+The default policy is [`orkastrator.yaml`](orkastrator.yaml). An all-Claude execution-role example
+is [`orkastrator.claude.yaml`](orkastrator.claude.yaml).
 
 ```yaml
 version: 2
 max_parallel_lanes: 3
 max_parallel_workers: 6
-
-planner:
-  agent: codex
-  model: gpt-5.6-terra
-  strength: medium
-  fast: false
-
-review_cycle:
-  initial_scope: lane_changeset
-  freeze_findings_after_initial_review: true
-  max_fix_rounds_per_finding: 2
-  # See kasgraph.yaml for scope, isolation, integration, and escalation policy.
 
 roles:
   worker:
@@ -78,7 +54,6 @@ roles:
     agent: claude
     model: opus
     strength: high
-    fast: false
   fixer:
     agent: codex
     model: gpt-5.6-luna
@@ -94,150 +69,91 @@ roles:
     agent: claude
     model: sonnet
     strength: medium
-    fast: false
-
-# publication and final_gate define the accepted-run external-write boundary.
 ```
 
-Every profile accepts an optional `fast` value that defaults to `false`. The
-execution-role values map to Orca's supervised worker launch. A fast role uses
-Orca's custom-argv path so the provider-native fast setting is active before the
-terminal is attached to its Task Dispatch. The top-level `planner` profile
-selects the planner backend. For Codex, `fast: true` selects the `priority`
-service tier; for Claude, it requests Claude Code fast mode. Claude may decline
-the request when fast mode is unavailable for the account or model.
-`agent: codex` maps to `codex exec --model` and `model_reasoning_effort`;
-`agent: claude` maps to `claude -p --model --effort`. Set `KASGRAPH_CONFIG` to
-use a different YAML file. The surrounding interactive session still controls
-the model you are talking to.
+Every execution profile accepts optional `fast`, defaulting to `false`. Codex fast mode uses the
+priority service tier; Claude fast mode requests Claude Code fast mode. The surrounding supervisor
+model is selected by the interactive session, not this file.
 
-The v2 controller materializes stages dynamically from persisted finding state.
-A capability mismatch uses the configured fallback without consuming a fix
-round. A finding can consume at most two semantic rounds; invalid output, scope
-escape, and exhausted rounds route to escalation. Unrelated re-review findings
-are recorded as deferred instead of reopening the full review. Version 1 YAML is
-intentionally unsupported. An accepted database from the fixed-stage scheduler
-fails with an explicit unsupported-state error instead of resuming incorrectly.
+The review cycle freezes initial findings, limits each finding to two semantic fix rounds, rejects
+out-of-scope path changes, serializes overlapping fixers, and defers unrelated re-review findings.
+Accepted fixes integrate serially into the lane checkout. Publication uses non-force deterministic
+branches and one draft GitHub PR per lane. Exact-SHA checks are the final gate. orkastrator never
+merges or deploys.
 
-Every ready fixer receives an isolated Orca child worktree at its exact assigned
-base SHA. Literal path boundaries are checked against Git's actual changed paths
-before re-review. Disjoint findings may use the configured per-lane concurrency
-ceiling; overlapping directory or file boundaries are serialized. Symbol scopes
-remain advisory until an explicit language adapter is installed, while path
-scope is always the hard portable boundary.
-
-Re-review runs in the fixer worktree at the exact reported commit. Only a
-resolved verdict reserves that commit for serial `cherry-pick -x` integration
-into the lane checkout. Kasgraph refuses dirty integration checkouts, aborts its
-own conflicting cherry-pick without resetting unrelated work, runs validation
-commands without a shell, and persists the base SHA, fixer SHA, integrated SHA,
-validation output, and conflict state.
-
-After local convergence, acceptance authorizes a deterministic
-`kasgraph/<run>/<lane>` branch and one draft GitHub pull request for that lane.
-Kasgraph never force-pushes: an existing unowned branch or a remote head that no
-longer matches the last publication receipt blocks the lane. It observes checks
-through the GitHub CLI using the exact published commit SHA, ignores stale check
-runs, and marks the pull request ready only after every observed check passes.
-A failed check becomes a typed, path-scoped CI finding without restarting the
-initial review. CI fixes republish and rerun the gate, with at most two fix
-rounds. Ambiguous multi-fix attribution, exhausted rounds, authentication
-failures, unsupported remotes, and divergence stop the lane with evidence in
-`kasgraph show` and the SQLite event ledger. Kasgraph never merges or deploys.
-
-Inspect the generated agent-result contracts with:
-
-```bash
-uv run kasgraph schemas --json
-```
-
-An all-Claude example is provided in
-[`kasgraph.claude.yaml`](kasgraph.claude.yaml):
-
-```bash
-KASGRAPH_CONFIG=kasgraph.claude.yaml uv run kasgraph plan \
-  --objective "find the currently unblocked lanes" --json
-```
+SQLModel provides the typed SQLite ledger for proposals, findings, attempts, verdicts, integration,
+publication, CI, and transition evidence. Raw SQL is limited to SQLite locking and additive
+compatibility migrations.
 
 ## Setup
 
 ```bash
+cd /home/kas/dev/orkastrator
 uv sync --extra dev
-export KASGRAPH_CONFIG=kasgraph.yaml
-codex login status
-claude --version
-gh auth status
-```
 
-Inside an Orca-managed terminal, `orca` is resolved automatically. On Linux
-outside Orca, the default is `orca-ide`. Override it when required:
-
-```bash
+export ORKASTRATOR_CONFIG=/home/kas/dev/orkastrator/orkastrator.yaml
 export ORCA_CLI_COMMAND=orca-ide
+
+uv run orkas doctor --json
+uv run orkas snapshot --json
 ```
 
-Kasgraph does not load `.env` files or own connector credentials.
+`uv run orkastrator` and `uv run orkas` are equivalent. orkastrator does not load `.env` files or
+own connector credentials.
 
-## Operator workflow
+## Supervisor workflow
 
-The repository includes an explicit operator skill at
-[`skills/kasgraph/SKILL.md`](skills/kasgraph/SKILL.md). It tells the interactive
-supervisor how to use its existing Linear/Notion connectors, produce a typed
-proposal, stop at the owner decision, and monitor accepted Orca graphs.
+Invoke the installed operator skill with details:
 
-1. Generate and record a typed proposal using saved Codex authentication:
+```text
+$orkastrate find the unblocked KASHH lanes and explain why they can run together
+$orkas show me what is blocked and what decision you need from me
+/orkastrate propose one low-risk lane for KASHH; do not accept it
+/orkas resume monitoring run <run-id>
+```
 
-   ```bash
-   uv run kasgraph plan --objective "find the unblocked assistant lanes" --json
-   ```
-
-   The Codex planner runs in a read-only sandbox. The Claude planner runs with
-   `--permission-mode plan`. Neither planner may mutate connector data, git,
-   files, or Orca. If the interactive supervisor already assembled the plan,
-   create a proposal shaped like [`proposal.example.yaml`](proposal.example.yaml)
-   and record it directly:
-
-   ```bash
-   uv run kasgraph propose --file proposal.yaml --json
-   ```
-
-2. Review the returned proposal and run ID. Nothing has been created in Orca.
-3. After the owner explicitly accepts that run:
-
-   ```bash
-   uv run kasgraph accept <run-id> --json
-   ```
-
-4. Advance and reconcile once:
-
-   ```bash
-   uv run kasgraph monitor <run-id> --json
-   ```
-
-   Or keep the controller attached until the graph completes, fails, or blocks:
-
-   ```bash
-   uv run kasgraph monitor <run-id> --watch --interval 5 --json
-   ```
-
-Other useful commands:
+The supervisor reads authoritative Linear issues and relevant Notion context, answers questions,
+and presents the proposal before recording it. It creates a proposal matching
+[`proposal.example.yaml`](proposal.example.yaml), then runs:
 
 ```bash
-uv run kasgraph doctor --json
-uv run kasgraph snapshot --json
-uv run kasgraph show <run-id> --json
+uv run --project /home/kas/dev/orkastrator orkas propose \
+  --file <proposal.yaml> --json
 ```
 
-Every lane begins in one independent top-level Orca worktree at the proposal's
-required `base_ref`. The worker result must report that ref's exact resolved SHA,
-then freezes the review head and the
-initial integration head before one full changeset review. A clean review
-completes the lane without a fixer. Otherwise, each frozen finding receives its
-own bounded isolated fixer/re-review loop with stable IDs and persisted evidence.
-`kasgraph show` includes the final integrated head and every contributing
-integration receipt. Every agent reports through Orca `worker_done`; structured
-stages put only their JSON contract in the report body, which Kasgraph validates
-before advancing.
+Nothing is created in Orca until you explicitly accept the returned run ID:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas accept <run-id> --json
+```
+
+Advance once or watch until the graph reaches a terminal state:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas monitor <run-id> --json
+uv run --project /home/kas/dev/orkastrator orkas monitor \
+  <run-id> --watch --interval 5 --json
+```
+
+Inspect persisted state without touching Orca:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas show <run-id> --json
+uv run --project /home/kas/dev/orkastrator orkas schemas --json
+```
+
+## Communication boundary
+
+The interactive supervisor can answer questions because it owns the conversation and the
+Linear/Notion evidence used to make the proposal. You can challenge a dependency, ask why lanes are
+independent, narrow scope, or revise the proposal before acceptance.
+
+Execution workers do not have Linear or Notion authority. They receive bounded task prompts and
+return typed results through Orca. There is not yet a live question-and-reply channel between a
+running worker and the supervisor. A worker that cannot proceed returns blocked or escalation
+evidence; the supervisor reads that evidence, explains it, and asks you what to do next. Adding live
+steering would require an explicit Orca messaging/interrupt protocol and is separate from the
+current convergence loop.
 
 ## Verification
 
@@ -246,10 +162,5 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run kasgraph-eval
+uv run orkastrator-eval
 ```
-
-`pydantic-evals` remains a dependency for deterministic and later model-backed
-planner evaluations. Persistent Codex app-server or Claude sessions are
-intentionally deferred until thread steering, streaming events, or approval
-handling justify their larger protocol surfaces.

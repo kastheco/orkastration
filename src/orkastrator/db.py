@@ -1,4 +1,4 @@
-"""SQLModel tables for the Kasgraph correlation ledger."""
+"""SQLModel tables for the orkastrator correlation ledger."""
 
 from __future__ import annotations
 

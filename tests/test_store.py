@@ -5,14 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from kasgraph.models import (
+from orkastrator.models import (
     InitialReviewReport,
     LanePhase,
     StageKind,
     StagePhase,
     SupervisorPlan,
 )
-from kasgraph.store import IntegrationBusyError, StateStore, UnsupportedStateError
+from orkastrator.store import IntegrationBusyError, StateStore, UnsupportedStateError
 from tests.factories import initial_review_report_json, review_finding_data
 
 

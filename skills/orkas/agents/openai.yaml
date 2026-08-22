@@ -1,0 +1,6 @@
+interface:
+  display_name: "orkas"
+  short_description: "short alias for the orkastrator supervisor"
+  default_prompt: "Use $orkas to discuss and supervise the requested delivery lanes."
+policy:
+  allow_implicit_invocation: false

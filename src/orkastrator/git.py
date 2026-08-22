@@ -8,7 +8,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from kasgraph.models import ValidationRequirement, ValidationResult
+from orkastrator.models import ValidationRequirement, ValidationResult
 
 
 class GitError(RuntimeError):
@@ -111,7 +111,7 @@ class LocalGit:
         return await self._git(worktree_id, "cherry-pick", "-x", *commit_shas, check=False)
 
     async def abort_cherry_pick(self, worktree_id: str) -> None:
-        """Abort only the cherry-pick started by Kasgraph."""
+        """Abort only the cherry-pick started by orkastrator."""
 
         result = await self._git(worktree_id, "cherry-pick", "--abort", check=False)
         if result.returncode != 0:

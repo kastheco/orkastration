@@ -29,10 +29,6 @@ class AgentProfile(BaseModel):
     fast: bool = False
 
 
-class PlannerProfile(AgentProfile):
-    """Planner launch profile."""
-
-
 class FallbackProfile(AgentProfile):
     """A bounded replacement used only for a declared capability mismatch."""
 
@@ -193,7 +189,6 @@ class GraphConfig(BaseModel):
     version: Literal[2] = 2
     max_parallel_lanes: int = Field(default=2, ge=1, le=32)
     max_parallel_workers: int = Field(default=6, ge=1, le=128)
-    planner: PlannerProfile
     review_cycle: ReviewCycleConfig
     roles: RoleProfiles
     publication: PublicationConfig
@@ -215,37 +210,30 @@ class Settings:
     config_path: Path
     graph: GraphConfig
     database_path: Path
-    claude_command: tuple[str, ...]
-    codex_command: tuple[str, ...]
     github_command: tuple[str, ...]
     orca_command: tuple[str, ...]
     command_timeout_seconds: float
-    planner_timeout_seconds: float
 
     @classmethod
     def from_env(cls) -> Settings:
         """Build settings from explicit environment variables."""
 
-        timeout = _positive_float("KASGRAPH_COMMAND_TIMEOUT_SECONDS", default=30.0)
-        planner_timeout = _positive_float("KASGRAPH_PLANNER_TIMEOUT_SECONDS", default=300.0)
-        config_path = Path(os.environ.get("KASGRAPH_CONFIG", "kasgraph.yaml")).expanduser()
+        timeout = _positive_float("ORKASTRATOR_COMMAND_TIMEOUT_SECONDS", default=30.0)
+        config_path = Path(os.environ.get("ORKASTRATOR_CONFIG", "orkastrator.yaml")).expanduser()
         graph = load_graph_config(config_path)
         database_path = Path(
             os.environ.get(
-                "KASGRAPH_DB_PATH",
-                str(Path.home() / ".local" / "share" / "kasgraph" / "state.sqlite3"),
+                "ORKASTRATOR_DB_PATH",
+                str(Path.home() / ".local" / "share" / "orkastrator" / "state.sqlite3"),
             )
         ).expanduser()
         return cls(
             config_path=config_path,
             graph=graph,
             database_path=database_path,
-            claude_command=_command("KASGRAPH_CLAUDE_COMMAND", default=("claude",)),
-            codex_command=_command("KASGRAPH_CODEX_COMMAND", default=("codex",)),
-            github_command=_command("KASGRAPH_GITHUB_COMMAND", default=("gh",)),
+            github_command=_command("ORKASTRATOR_GITHUB_COMMAND", default=("gh",)),
             orca_command=_orca_command(),
             command_timeout_seconds=timeout,
-            planner_timeout_seconds=planner_timeout,
         )
 
 
@@ -255,15 +243,15 @@ def load_graph_config(path: Path) -> GraphConfig:
     try:
         raw = yaml.safe_load(path.read_text())
     except FileNotFoundError as exc:
-        raise ConfigError(f"Kasgraph config does not exist: {path}") from exc
+        raise ConfigError(f"orkastrator config does not exist: {path}") from exc
     except (OSError, yaml.YAMLError) as exc:
-        raise ConfigError(f"Could not read Kasgraph config {path}: {exc}") from exc
+        raise ConfigError(f"Could not read orkastrator config {path}: {exc}") from exc
     if not isinstance(raw, dict):
-        raise ConfigError(f"Kasgraph config must be a YAML mapping: {path}")
+        raise ConfigError(f"orkastrator config must be a YAML mapping: {path}")
     try:
         return GraphConfig.model_validate(raw)
     except ValidationError as exc:
-        raise ConfigError(f"Invalid Kasgraph config {path}: {exc}") from exc
+        raise ConfigError(f"Invalid orkastrator config {path}: {exc}") from exc
 
 
 def _orca_command() -> tuple[str, ...]:

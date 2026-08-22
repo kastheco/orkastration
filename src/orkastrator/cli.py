@@ -12,22 +12,14 @@ import typer
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from kasgraph import __version__
-from kasgraph.config import ConfigError, Settings
-from kasgraph.execution import ExecutionController
-from kasgraph.git import GitError
-from kasgraph.models import SupervisorPlan, workflow_contract_schemas
-from kasgraph.orca import OrcaClient, OrcaError, SubprocessRunner
-from kasgraph.planner import (
-    ClaudeCliPlanner,
-    CodexCliPlanner,
-    PlannerError,
-    SchemaCliPlanner,
-    SubprocessClaudeRunner,
-    SubprocessCodexRunner,
-)
-from kasgraph.publication import GitHubPublisher, PublicationError
-from kasgraph.store import StateStore, UnsupportedStateError
+from orkastrator import __version__
+from orkastrator.config import ConfigError, Settings
+from orkastrator.execution import ExecutionController
+from orkastrator.git import GitError
+from orkastrator.models import SupervisorPlan, workflow_contract_schemas
+from orkastrator.orca import OrcaClient, OrcaError, SubprocessRunner
+from orkastrator.publication import GitHubPublisher, PublicationError
+from orkastrator.store import StateStore, UnsupportedStateError
 
 app = typer.Typer(
     help="Record, accept, and monitor Orca execution graphs.",
@@ -49,7 +41,7 @@ def main(
         typer.Option("--version", callback=_version_callback, is_eager=True),
     ] = None,
 ) -> None:
-    """Run the Kasgraph CLI."""
+    """Run the orkastrator CLI."""
 
 
 @app.command()
@@ -65,14 +57,11 @@ def doctor(
             "ok": True,
             "config_path": str(settings.config_path),
             "roles": settings.graph.roles.model_dump(mode="json"),
-            "planner": settings.graph.planner.model_dump(mode="json"),
             "max_parallel_lanes": settings.graph.max_parallel_lanes,
             "max_parallel_workers": settings.graph.max_parallel_workers,
             "database_path": str(settings.database_path),
             "database": store.counts(),
             "orca_command": list(settings.orca_command),
-            "claude_command": list(settings.claude_command),
-            "codex_command": list(settings.codex_command),
             "github_command": list(settings.github_command),
             "orca_reachable": status.get("ok") is True,
         }
@@ -100,20 +89,6 @@ def schemas(
     """Emit every agent-facing workflow result schema."""
 
     _emit(workflow_contract_schemas(), json_output=json_output)
-
-
-@app.command()
-def plan(
-    objective: Annotated[str, typer.Option("--objective", "-o", help="Work to coordinate.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
-) -> None:
-    """Use authenticated Codex to generate and record a typed proposal."""
-
-    async def create() -> BaseModel:
-        proposal = await _planner().plan(objective)
-        return _controller().propose(proposal)
-
-    _run(create(), json_output=json_output)
 
 
 @app.command()
@@ -226,28 +201,6 @@ def _controller() -> ExecutionController:
     )
 
 
-def _planner() -> SchemaCliPlanner:
-    settings = Settings.from_env()
-    profile = settings.graph.planner
-    if profile.agent == "codex":
-        runner = SubprocessCodexRunner(
-            command=settings.codex_command,
-            cwd=Path.cwd(),
-            profile=profile,
-            timeout_seconds=settings.planner_timeout_seconds,
-        )
-        return CodexCliPlanner(runner)
-    if profile.agent == "claude":
-        claude_runner = SubprocessClaudeRunner(
-            command=settings.claude_command,
-            cwd=Path.cwd(),
-            profile=profile,
-            timeout_seconds=settings.planner_timeout_seconds,
-        )
-        return ClaudeCliPlanner(claude_runner)
-    raise ConfigError(f"unsupported planner agent: {profile.agent}")
-
-
 def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
     try:
         result = asyncio.run(awaitable)
@@ -255,7 +208,6 @@ def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
         ConfigError,
         GitError,
         OrcaError,
-        PlannerError,
         PublicationError,
         UnsupportedStateError,
         KeyError,

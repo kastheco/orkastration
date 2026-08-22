@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
-from kasgraph.git import GitError, worktree_path
-from kasgraph.models import CiCheckResult, CiReceipt, LaneRecord, PublicationReceipt
+from orkastrator.git import GitError, worktree_path
+from orkastrator.models import CiCheckResult, CiReceipt, LaneRecord, PublicationReceipt
 
 
 class PublicationError(RuntimeError):
@@ -94,7 +94,7 @@ class GitHubPublisher:
         remote_url = await self._required(path, "git", "remote", "get-url", "origin")
         repository = _github_repository(remote_url.strip())
         default_branch = await self._default_branch(path, repository)
-        branch = f"kasgraph/{run_id[:12]}/{lane.name}"
+        branch = f"orkastrator/{run_id[:12]}/{lane.name}"
         if previous is not None and (
             previous.branch != branch
             or previous.remote_url != remote_url.strip()
@@ -134,7 +134,7 @@ class GitHubPublisher:
         if pull_requests:
             pull_request = pull_requests[0]
             pull_request_url = str(pull_request["url"])
-            marker = f"Kasgraph run: `{run_id}`"
+            marker = f"orkastrator run: `{run_id}`"
             if previous is None and marker not in str(pull_request.get("body") or ""):
                 raise PublicationError("existing pull request is not owned by this accepted run")
             if previous is not None and pull_request_url != previous.pull_request_url:
@@ -299,13 +299,13 @@ def _github_repository(remote_url: str) -> str:
         if match:
             return match.group("repo")
     raise PublicationError(
-        "unsupported remote provider; Kasgraph publication currently supports GitHub remotes"
+        "unsupported remote provider; orkastrator publication currently supports GitHub remotes"
     )
 
 
 def _pull_request_body(run_id: str, lane: LaneRecord, head_sha: str) -> str:
     return (
-        f"Kasgraph run: `{run_id}`\n\n"
+        f"orkastrator run: `{run_id}`\n\n"
         f"Lane: `{lane.name}`\n"
         f"Issue: `{lane.issue_id}`\n"
         f"Published head: `{head_sha}`\n\n"

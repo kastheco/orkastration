@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from kasgraph.config import AgentProfile, GraphConfig
-from kasgraph.execution import ExecutionController
-from kasgraph.git import GitCommandResult, LocalGit
-from kasgraph.models import (
+from orkastrator.config import AgentProfile, GraphConfig
+from orkastrator.execution import ExecutionController
+from orkastrator.git import GitCommandResult, LocalGit
+from orkastrator.models import (
     CiCheckResult,
     CiReceipt,
     FindingPhase,
@@ -24,9 +24,9 @@ from kasgraph.models import (
     ValidationRequirement,
     ValidationResult,
 )
-from kasgraph.orca import JsonObject
-from kasgraph.publication import PublicationError
-from kasgraph.store import StateStore
+from orkastrator.orca import JsonObject
+from orkastrator.publication import PublicationError
+from orkastrator.store import StateStore
 from tests.factories import (
     graph_config_data,
     initial_review_report_json,
@@ -182,7 +182,7 @@ class FakeOrca:
         self.fail_after_worker_start = False
 
     async def create_run(self, objective: str) -> tuple[str, JsonObject]:
-        assert objective.startswith("Do work\n\nKasgraph run: ")
+        assert objective.startswith("Do work\n\norkastrator run: ")
         run_id = f"orca-run-{len(self.runs_by_id) + 1}"
         self.runs_by_id[run_id] = {"id": run_id, "objective": objective}
         if self.fail_after_run_create:
@@ -421,7 +421,7 @@ class FakePublisher:
             lane=lane.name,
             remote_url="git@github.com:example/repo.git",
             base_branch="main",
-            branch=f"kasgraph/{run_id[:12]}/{lane.name}",
+            branch=f"orkastrator/{run_id[:12]}/{lane.name}",
             pull_request_url="https://github.com/example/repo/pull/1",
             head_sha=head_sha,
             draft=True,

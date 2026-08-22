@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from kasgraph.config import ConfigError, Settings, load_graph_config
+from orkastrator.config import ConfigError, Settings, load_graph_config
 
 
 def write_config(path: Path, *, strength: str = "high") -> None:
@@ -13,7 +13,6 @@ def write_config(path: Path, *, strength: str = "high") -> None:
 version: 2
 max_parallel_lanes: 2
 max_parallel_workers: 4
-planner: {{agent: codex, model: gpt-planner, strength: high}}
 review_cycle:
   initial_scope: lane_changeset
   freeze_findings_after_initial_review: true
@@ -76,19 +75,15 @@ def test_settings_load_yaml_and_explicit_orca_command(
 ) -> None:
     config_path = tmp_path / "graph.yaml"
     write_config(config_path)
-    monkeypatch.setenv("KASGRAPH_CONFIG", str(config_path))
-    monkeypatch.setenv("KASGRAPH_CLAUDE_COMMAND", "claude-dev --profile planner")
+    monkeypatch.setenv("ORKASTRATOR_CONFIG", str(config_path))
     monkeypatch.setenv("ORCA_CLI_COMMAND", "orca-dev --profile test")
-    monkeypatch.setenv("KASGRAPH_CODEX_COMMAND", "codex-dev --profile planner")
-    monkeypatch.setenv("KASGRAPH_DB_PATH", str(tmp_path / "state.sqlite3"))
+    monkeypatch.setenv("ORKASTRATOR_GITHUB_COMMAND", "gh-dev --profile test")
+    monkeypatch.setenv("ORKASTRATOR_DB_PATH", str(tmp_path / "state.sqlite3"))
 
     settings = Settings.from_env()
 
     assert settings.orca_command == ("orca-dev", "--profile", "test")
-    assert settings.claude_command == ("claude-dev", "--profile", "planner")
-    assert settings.codex_command == ("codex-dev", "--profile", "planner")
-    assert settings.graph.planner.model == "gpt-planner"
-    assert settings.graph.planner.fast is False
+    assert settings.github_command == ("gh-dev", "--profile", "test")
     assert settings.graph.max_parallel_workers == 4
     assert settings.graph.roles.worker.model == "gpt-test"
     assert settings.graph.roles.worker.fast is True
@@ -116,9 +111,9 @@ def test_invalid_config_is_rejected(tmp_path: Path, contents: str) -> None:
 
 
 def test_current_repository_config_is_valid() -> None:
-    config = load_graph_config(Path("kasgraph.yaml"))
+    config = load_graph_config(Path("orkastrator.yaml"))
     assert config.version == 2
-    assert config.planner.model == "gpt-5.6-terra"
+    assert config.roles.worker.model == "gpt-5.6-sol"
 
 
 def test_parallel_fixer_limit_cannot_exceed_global_limit(tmp_path: Path) -> None:
@@ -133,7 +128,7 @@ def test_parallel_fixer_limit_cannot_exceed_global_limit(tmp_path: Path) -> None
 def test_invalid_timeout_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str) -> None:
     config_path = tmp_path / "graph.yaml"
     write_config(config_path)
-    monkeypatch.setenv("KASGRAPH_CONFIG", str(config_path))
-    monkeypatch.setenv("KASGRAPH_COMMAND_TIMEOUT_SECONDS", value)
+    monkeypatch.setenv("ORKASTRATOR_CONFIG", str(config_path))
+    monkeypatch.setenv("ORKASTRATOR_COMMAND_TIMEOUT_SECONDS", value)
     with pytest.raises(ConfigError, match="TIMEOUT"):
         Settings.from_env()

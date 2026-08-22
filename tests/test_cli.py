@@ -5,19 +5,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
 
 import pytest
 import yaml
 from pydantic import BaseModel
 from typer.testing import CliRunner
 
-from kasgraph import __version__, cli
-from kasgraph.config import GraphConfig
-from kasgraph.models import OrcaSnapshot, ProposalReceipt, SupervisorPlan
-from kasgraph.orca import OrcaError
-from kasgraph.planner import ClaudeCliPlanner, CodexCliPlanner
-from kasgraph.store import StateStore
+from orkastrator import __version__, cli
+from orkastrator.config import GraphConfig
+from orkastrator.models import OrcaSnapshot, ProposalReceipt, SupervisorPlan
+from orkastrator.orca import OrcaError
+from orkastrator.store import StateStore
 from tests.factories import graph_config_data
 
 runner = CliRunner()
@@ -62,12 +60,6 @@ class FakeOrca:
         return OrcaSnapshot(worktrees=[])
 
 
-class FakePlanner:
-    async def plan(self, objective: str) -> SupervisorPlan:
-        assert objective == "coordinate this"
-        return proposal()
-
-
 class FakeController:
     def propose(self, value: SupervisorPlan) -> ProposalReceipt:
         return ProposalReceipt(run_id="run-1", proposal=value)
@@ -87,17 +79,14 @@ class StatusResult(BaseModel):
 @pytest.fixture
 def fake_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     settings = SimpleNamespace(
-        config_path=tmp_path / "kasgraph.yaml",
+        config_path=tmp_path / "orkastrator.yaml",
         graph=graph_config(),
         database_path=tmp_path / "state.sqlite3",
-        claude_command=("claude",),
         orca_command=("orca-ide",),
-        codex_command=("codex",),
         github_command=("gh",),
     )
     monkeypatch.setattr(cli, "_components", lambda: (settings, FakeStore(), FakeOrca()))
     monkeypatch.setattr(cli, "_controller", FakeController)
-    monkeypatch.setattr(cli, "_planner", FakePlanner)
 
 
 def test_version() -> None:
@@ -110,7 +99,7 @@ def test_doctor_and_snapshot_emit_json(fake_wiring: None) -> None:
     doctor = runner.invoke(cli.app, ["doctor", "--json"])
     snapshot = runner.invoke(cli.app, ["snapshot", "--json"])
     assert doctor.exit_code == 0
-    assert json.loads(doctor.stdout)["planner"]["model"] == "gpt-test"
+    assert json.loads(doctor.stdout)["roles"]["worker"]["model"] == "gpt-test"
     assert json.loads(snapshot.stdout)["worktrees"] == []
 
 
@@ -120,12 +109,6 @@ def test_schemas_emit_strict_workflow_contracts() -> None:
     payload = json.loads(result.stdout)
     assert payload["initial_review_report"]["additionalProperties"] is False
     assert payload["fix_attempt"]["title"] == "FixAttempt"
-
-
-def test_plan_records_codex_result(fake_wiring: None) -> None:
-    result = runner.invoke(cli.app, ["plan", "--objective", "coordinate this", "--json"])
-    assert result.exit_code == 0
-    assert json.loads(result.stdout)["run_id"] == "run-1"
 
 
 def test_propose_accept_and_monitor(fake_wiring: None, tmp_path: Path) -> None:
@@ -154,6 +137,16 @@ lanes:
     assert json.loads(monitored.stdout)["status"] == "complete"
 
 
+def test_propose_rejects_non_mapping_yaml(tmp_path: Path) -> None:
+    proposal_path = tmp_path / "proposal.yaml"
+    proposal_path.write_text("[]")
+
+    result = runner.invoke(cli.app, ["propose", "-f", str(proposal_path), "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stderr)["ok"] is False
+
+
 def test_show_reads_local_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     store.setup()
@@ -180,29 +173,10 @@ def test_runtime_error_is_clean_json(monkeypatch: pytest.MonkeyPatch) -> None:
     assert json.loads(result.stderr) == {"ok": False, "error": "offline"}
 
 
-def test_controller_and_planner_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    config_path = tmp_path / "kasgraph.yaml"
+def test_controller_wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "orkastrator.yaml"
     config_path.write_text(yaml.safe_dump(graph_config_data(), sort_keys=False))
-    monkeypatch.setenv("KASGRAPH_CONFIG", str(config_path))
-    monkeypatch.setenv("KASGRAPH_DB_PATH", str(tmp_path / "state.sqlite3"))
+    monkeypatch.setenv("ORKASTRATOR_CONFIG", str(config_path))
+    monkeypatch.setenv("ORKASTRATOR_DB_PATH", str(tmp_path / "state.sqlite3"))
     monkeypatch.setenv("ORCA_CLI_COMMAND", "orca-ide")
     assert cli._controller() is not None
-    assert isinstance(cli._planner(), CodexCliPlanner)
-
-    raw = graph_config_data()
-    planner = raw["planner"]
-    assert isinstance(planner, dict)
-    planner["agent"] = "claude"
-    config_path.write_text(yaml.safe_dump(raw, sort_keys=False))
-    assert isinstance(cli._planner(), ClaudeCliPlanner)
-
-
-def test_plan_rejects_non_model_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    class BadPlanner:
-        async def plan(self, objective: str) -> Any:
-            return {"invalid": True}
-
-    monkeypatch.setattr(cli, "_planner", cast(Any, BadPlanner))
-    monkeypatch.setattr(cli, "_controller", FakeController)
-    result = runner.invoke(cli.app, ["plan", "-o", "coordinate this"])
-    assert result.exit_code == 1

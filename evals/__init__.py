@@ -1,1 +1,1 @@
-"""Local Kasgraph evaluation suites."""
+"""Local orkastrator evaluation suites."""

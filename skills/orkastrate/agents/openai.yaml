@@ -1,0 +1,6 @@
+interface:
+  display_name: "orkastrate"
+  short_description: "Discuss, propose, and supervise Orca lanes"
+  default_prompt: "Use $orkastrate to answer my delivery questions, propose unblocked lanes, and stop for my acceptance."
+policy:
+  allow_implicit_invocation: false

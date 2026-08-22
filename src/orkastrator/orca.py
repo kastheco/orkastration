@@ -12,8 +12,8 @@ from typing import Protocol, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from kasgraph.config import AgentProfile
-from kasgraph.models import OrcaSnapshot, OrcaWorktree
+from orkastrator.config import AgentProfile
+from orkastrator.models import OrcaSnapshot, OrcaWorktree
 
 JsonObject = dict[str, object]
 

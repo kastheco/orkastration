@@ -1,4 +1,4 @@
-"""Deterministic contract eval for subscription-backed planner output."""
+"""Deterministic orkastrator contract evaluations."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import EqualsExpected
 
-from kasgraph.models import (
+from orkastrator.models import (
     InitialReviewReport,
     ReReviewResult,
     SupervisorPlan,
@@ -26,7 +26,7 @@ class WorkflowContractInput(TypedDict):
 
 
 def validates_supervisor_plan(value: ContractInput) -> bool:
-    """Return whether a candidate satisfies the exact planner contract."""
+    """Return whether a candidate satisfies the exact supervisor proposal contract."""
 
     try:
         SupervisorPlan.model_validate(value["plan"])
@@ -148,7 +148,7 @@ workflow_dataset: Dataset[WorkflowContractInput, bool, None] = Dataset(
 
 
 def main() -> None:
-    """Run the local planner and workflow contract evals."""
+    """Run the local supervisor-proposal and workflow contract evals."""
 
     report = dataset.evaluate_sync(validates_supervisor_plan)
     report.print(include_input=True, include_output=True)

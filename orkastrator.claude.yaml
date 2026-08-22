@@ -2,12 +2,6 @@ version: 2
 max_parallel_lanes: 3
 max_parallel_workers: 6
 
-planner:
-  agent: claude
-  model: sonnet
-  strength: high
-  fast: false
-
 review_cycle:
   initial_scope: lane_changeset
   freeze_findings_after_initial_review: true

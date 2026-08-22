@@ -147,7 +147,7 @@ class SupervisorPlan(BaseModel):
 
 
 class WorkflowContract(BaseModel):
-    """Strict base for data exchanged between workflow agents and Kasgraph."""
+    """Strict base for data exchanged between workflow agents and orkastrator."""
 
     model_config = ConfigDict(extra="forbid")
 

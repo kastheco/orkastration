@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from kasgraph.config import AgentProfile
-from kasgraph.orca import JsonObject, OrcaClient, OrcaError, SubprocessRunner
+from orkastrator.config import AgentProfile
+from orkastrator.orca import JsonObject, OrcaClient, OrcaError, SubprocessRunner
 
 
 class FakeRunner:

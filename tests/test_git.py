@@ -5,8 +5,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from kasgraph.git import LocalGit
-from kasgraph.models import ValidationRequirement
+from orkastrator.git import LocalGit
+from orkastrator.models import ValidationRequirement
 
 
 def run(cwd: Path, *arguments: str) -> str:
@@ -27,8 +27,8 @@ def repository(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
     run(repo, "git", "init", "-b", "main")
-    run(repo, "git", "config", "user.name", "Kasgraph Test")
-    run(repo, "git", "config", "user.email", "kasgraph@example.test")
+    run(repo, "git", "config", "user.name", "orkastrator test")
+    run(repo, "git", "config", "user.email", "orkastrator@example.test")
     base = commit(repo, "src/shared.py", "base\n", "base")
     return repo, base
 
