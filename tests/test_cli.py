@@ -15,7 +15,14 @@ from typer.testing import CliRunner
 from orkastrator import __version__, cli
 from orkastrator.config import GraphConfig
 from orkastrator.locks import run_lock
-from orkastrator.models import OrcaSnapshot, ProposalReceipt, SupervisorPlan
+from orkastrator.models import (
+    AcceptanceAuthorization,
+    ConfigChange,
+    OrcaSnapshot,
+    PolicyReauthorization,
+    ProposalReceipt,
+    SupervisorPlan,
+)
 from orkastrator.orca import OrcaError
 from orkastrator.store import StateStore
 from tests.factories import graph_config_data
@@ -87,6 +94,24 @@ class FakeController:
             run_id=run_id,
             status=type(self).monitor_status,
             questions=list(type(self).parked_question),
+        )
+
+
+class FakeReauthorizingController(FakeController):
+    calls: ClassVar[list[tuple[str, str, bool]]] = []
+
+    def reauthorize(self, run_id: str, note: str, *, apply: bool = True) -> object:
+        type(self).calls.append((run_id, note, apply))
+        return PolicyReauthorization(
+            authorization=AcceptanceAuthorization(
+                run_id=run_id, proposal_sha256="a" * 64, config_sha256="b" * 64
+            ),
+            changes=[
+                ConfigChange(
+                    path="final_gate.advisory_checks", before="[]", after='["conformance"]'
+                )
+            ],
+            applied=apply,
         )
 
 
@@ -290,3 +315,43 @@ def test_questions_says_so_when_there_are_none(fake_wiring: None) -> None:
 
     assert result.exit_code == 0, result.output
     assert "no unanswered questions" in result.output
+
+
+def test_reauthorize_shows_the_change_before_it_will_make_it(
+    monkeypatch: pytest.MonkeyPatch, fake_wiring: None
+) -> None:
+    """A digest pair is not something an owner can judge, so nothing applies until they see one.
+
+    `--note` used to be the only argument, which made the operator's typed claim
+    about the change stand in for a reading of it. The default is now a preview.
+    """
+
+    monkeypatch.setattr(cli, "_controller", FakeReauthorizingController)
+    FakeReauthorizingController.calls.clear()
+
+    preview = runner.invoke(cli.app, ["reauthorize", "run-1"])
+
+    assert preview.exit_code == 0
+    assert 'final_gate.advisory_checks: [] -> ["conformance"]' in preview.stdout
+    assert "--confirm" in preview.stdout
+    assert FakeReauthorizingController.calls == [("run-1", "", False)]
+
+    applied = runner.invoke(
+        cli.app, ["reauthorize", "run-1", "--confirm", "--note", "advisory suite is flaking"]
+    )
+
+    assert applied.exit_code == 0
+    assert FakeReauthorizingController.calls[-1] == ("run-1", "advisory suite is flaking", True)
+
+
+def test_confirming_a_policy_change_without_a_reason_is_refused(
+    monkeypatch: pytest.MonkeyPatch, fake_wiring: None
+) -> None:
+    monkeypatch.setattr(cli, "_controller", FakeReauthorizingController)
+    FakeReauthorizingController.calls.clear()
+
+    result = runner.invoke(cli.app, ["reauthorize", "run-1", "--confirm"])
+
+    assert result.exit_code == 1
+    assert "--confirm needs --note" in result.stderr
+    assert FakeReauthorizingController.calls == []

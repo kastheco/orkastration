@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -12,6 +13,8 @@ from typing import Literal, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from orkastrator.models import ConfigChange
 
 
 class ConfigError(ValueError):
@@ -341,3 +344,46 @@ def _positive_float(name: str, *, default: float) -> float:
     if value <= 0:
         raise ConfigError(f"{name} must be greater than zero")
     return value
+
+
+def config_changes(before: object, after: object) -> list[ConfigChange]:
+    """Every changed leaf between two dumped configurations, as dotted paths.
+
+    Lists are compared whole rather than walked. A per-index diff of
+    `advisory_checks` reads as three unrelated changes when what moved is one
+    setting, and an owner authorizing a policy change is judging the setting.
+    """
+
+    changes: list[ConfigChange] = []
+    _walk("", before, after, changes)
+    return sorted(changes, key=lambda item: item.path)
+
+
+def _walk(path: str, before: object, after: object, changes: list[ConfigChange]) -> None:
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in sorted(set(before) | set(after)):
+            child = f"{path}.{key}" if path else str(key)
+            _walk(child, before.get(key, _ABSENT), after.get(key, _ABSENT), changes)
+        return
+    if before == after:
+        return
+    changes.append(ConfigChange(path=path or ".", before=_render(before), after=_render(after)))
+
+
+def _render(value: object) -> str:
+    if value is _ABSENT:
+        return "(unset)"
+    try:
+        return json.dumps(value, sort_keys=True)[:2_048]
+    except TypeError:
+        return str(value)[:2_048]
+
+
+class _Absent:
+    """A key present on one side only, which is not the same as a null."""
+
+    def __repr__(self) -> str:
+        return "(unset)"
+
+
+_ABSENT = _Absent()

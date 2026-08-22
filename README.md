@@ -191,13 +191,34 @@ under a policy nobody accepted. When only the policy moved and you meant it, re-
 than throwing it away:
 
 ```bash
-uv run --project /home/kas/dev/orkastrator orkas reauthorize <run-id> \
-  --note "why this policy change is authorized" --json
+# Read what moved. Applies nothing.
+uv run --project /home/kas/dev/orkastrator orkas reauthorize <run-id>
+
+# Authorize what that printed.
+uv run --project /home/kas/dev/orkastrator orkas reauthorize <run-id> --confirm \
+  --note "why this policy change is authorized"
 ```
 
-The same lanes, findings and worktrees continue under the new policy, and the change is recorded as a
-`supervisor_reauthorized_policy` event carrying both digests and the note. If the *proposal* changed
-rather than the config, this refuses, because that is a different plan and wants a new proposal.
+The first form prints the changed leaves, field by field:
+
+```
+run 1f13dd37…: 1 policy change(s) since acceptance
+  final_gate.advisory_checks: [] -> ["packages/browser Chrome conformance (advisory)"]
+nothing applied; re-run with --confirm --note "..." to authorize this
+```
+
+That is a sentence you can judge. `fc391e6e… -> 9bc80b6d…` is not, which is why `--note` on its own
+is no longer enough: a reason typed before seeing the diff is a claim about the change rather than a
+reading of it.
+
+Confirming carries the same lanes, findings and worktrees into the new policy and records a
+`supervisor_reauthorized_policy` event with both digests, the note, and the field-level changes. If
+the *proposal* changed rather than the config, this refuses, because that is a different plan and
+wants a new proposal.
+
+A run accepted before the policy payload was stored has nothing to diff against. It says so rather
+than printing an empty change list, and records its policy the first time it is read while unchanged,
+so the next change is readable.
 
 A lane can block with every one of its findings already settled — on a required-check query made a
 second after pushing its branch, or on a pull request somebody merged out from under it. `reopen` and

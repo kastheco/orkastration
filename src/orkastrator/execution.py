@@ -10,7 +10,7 @@ from typing import Literal, Protocol, cast
 
 from pydantic import ValidationError
 
-from orkastrator.config import AgentProfile, GraphConfig
+from orkastrator.config import AgentProfile, GraphConfig, config_changes
 from orkastrator.git import GitError, LocalGit
 from orkastrator.models import (
     SHELL_OPERATORS,
@@ -35,6 +35,7 @@ from orkastrator.models import (
     OrcaWorkerResult,
     OverdueStage,
     PendingQuestion,
+    PolicyReauthorization,
     ProposalReceipt,
     PublicationReceipt,
     ReReviewResult,
@@ -139,6 +140,7 @@ class ExecutionController:
                     proposal_sha256=_sha256_json(run.proposal.model_dump(mode="json")),
                     config_sha256=_sha256_json(self._config.model_dump(mode="json")),
                 ),
+                config=self._config.model_dump(mode="json"),
             )
             objective = _orca_run_objective(run_id, run.proposal.objective)
             matches = [
@@ -1717,8 +1719,8 @@ class ExecutionController:
             item.phase in {FindingPhase.RESOLVED, FindingPhase.DEFERRED} for item in findings
         )
 
-    def reauthorize(self, run_id: str, note: str) -> AcceptanceAuthorization:
-        """Re-freeze a live run against the policy it is now configured with.
+    def reauthorize(self, run_id: str, note: str, *, apply: bool = True) -> PolicyReauthorization:
+        """Read a mid-run policy change field by field, and freeze it once the owner sees it.
 
         The authorization digests the proposal and the config together, so
         editing `orkastrator.yaml` while a run is in flight fails every tick
@@ -1726,16 +1728,46 @@ class ExecutionController:
         *plan* changed. When only the policy changed, and the owner meant it,
         this is the answer: same lanes, same findings, same worktrees, one
         audited note saying which policy the rest of the run ran under.
+
+        `apply=False` reads the change without making it, which is the whole
+        point of the split: an owner authorizing a policy change should be
+        judging `final_gate.advisory_checks: [] -> [...]`, not two digests. A
+        note typed before seeing the diff is a claim about the change rather
+        than a reading of it.
         """
 
         run = self._store.run(run_id)
+        current = self._config.model_dump(mode="json")
         authorization = AcceptanceAuthorization(
             run_id=run_id,
             proposal_sha256=_sha256_json(run.proposal.model_dump(mode="json")),
-            config_sha256=_sha256_json(self._config.model_dump(mode="json")),
+            config_sha256=_sha256_json(current),
         )
-        self._store.reauthorize_acceptance(run_id, authorization, note)
-        return authorization
+        frozen = self._store.acceptance_authorization(run_id)
+        if frozen is None:
+            raise KeyError(f"run {run_id} has no frozen acceptance authorization")
+        if (
+            self._store.accepted_config(run_id) is None
+            and frozen.config_sha256 == authorization.config_sha256
+        ):
+            # The digest already proves the config on disk is the one this run
+            # was accepted under, so it can be recorded without authorizing
+            # anything. That is how a run started before the payload existed
+            # becomes readable: the first time it is looked at while unchanged.
+            self._store.record_acceptance_authorization(run_id, frozen, config=current)
+        accepted = self._store.accepted_config(run_id)
+        changes = [] if accepted is None else config_changes(accepted, current)
+        result = PolicyReauthorization(
+            authorization=authorization,
+            changes=changes,
+            comparable=accepted is not None,
+            applied=apply,
+        )
+        if apply:
+            self._store.reauthorize_acceptance(
+                run_id, authorization, note, config=current, changes=changes
+            )
+        return result
 
     def resume(self, run_id: str, lane_name: str | None, note: str) -> list[LaneRecord]:
         """Clear a lane block the owner has looked at, and let the run advance again.

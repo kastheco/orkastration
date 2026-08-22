@@ -20,6 +20,7 @@ from orkastrator.locks import RunLockedError, held_runs, run_lock
 from orkastrator.models import (
     FindingPhase,
     FindingReason,
+    PolicyReauthorization,
     SupervisorPlan,
     workflow_contract_schemas,
 )
@@ -250,22 +251,41 @@ def resume(
 @app.command()
 def reauthorize(
     run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
-    note: Annotated[str, typer.Option("--note", help="Why this policy change is authorized.")],
+    note: Annotated[
+        str | None, typer.Option("--note", help="Why this policy change is authorized.")
+    ] = None,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Apply the change shown by a previous run of this command."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Re-freeze a live run against a configuration the owner changed on purpose.
+    """Show what a mid-run policy change actually moved, and freeze it once you have seen it.
 
     Acceptance digests the proposal and the config together, so editing
     `orkastrator.yaml` mid-run fails every subsequent tick. Use this when only
     the policy moved. If the proposal itself changed, this refuses and the
     honest answer is a new proposal.
+
+    Without `--confirm` this reads the change and applies nothing, because two
+    digests are not something an owner can judge and a note typed before seeing
+    the diff is a claim rather than a reading. Re-run with `--confirm --note`
+    to authorize what it printed.
     """
 
+    if confirm and not note:
+        _fail(
+            "--confirm needs --note saying why this policy change is authorized",
+            json_output=json_output,
+        )
     try:
-        authorization = _controller().reauthorize(run_id, note)
+        result = _controller().reauthorize(run_id, note or "", apply=confirm)
     except (ConfigError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
-    _emit(authorization.model_dump(mode="json"), json_output=json_output)
+    if not json_output:
+        for line in _policy_change_lines(run_id, result):
+            typer.echo(line)
+    _emit(result.model_dump(mode="json"), json_output=json_output)
 
 
 @app.command(name="show")
@@ -451,6 +471,24 @@ def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
     ) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(result, json_output=json_output)
+
+
+def _policy_change_lines(run_id: str, result: PolicyReauthorization) -> list[str]:
+    """Render a policy change as sentences an owner can judge."""
+
+    if not result.comparable:
+        return [
+            f"run {run_id} was accepted before the policy payload was recorded, so what "
+            "changed cannot be read; only the digests differ",
+            f"  config_sha256 -> {result.authorization.config_sha256}",
+        ]
+    if not result.changes:
+        return [f"run {run_id}: the configuration on disk matches the one it was accepted under"]
+    lines = [f"run {run_id}: {len(result.changes)} policy change(s) since acceptance"]
+    lines.extend(f"  {item.path}: {item.before} -> {item.after}" for item in result.changes)
+    if not result.applied:
+        lines.append('nothing applied; re-run with --confirm --note "..." to authorize this')
+    return lines
 
 
 def _emit(value: object, *, json_output: bool) -> None:

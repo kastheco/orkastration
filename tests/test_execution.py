@@ -10,7 +10,7 @@ import pytest
 from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
-from orkastrator.db import EventRow
+from orkastrator.db import AcceptanceAuthorizationRow, EventRow
 from orkastrator.execution import ExecutionController, _next_key
 from orkastrator.git import GitCommandResult, LocalGit
 from orkastrator.models import (
@@ -2191,8 +2191,22 @@ async def test_reauthorizing_a_policy_change_lets_the_same_run_continue(
     with pytest.raises(ValueError, match="policy changed after acceptance"):
         await changed.monitor(run_id)
 
-    after = changed.reauthorize(run_id, "raised max_workers on purpose")
+    # Reading the change is separate from making it, so a preview leaves the
+    # run exactly as broken as it was.
+    preview = changed.reauthorize(run_id, "", apply=False)
+    assert preview.applied is False
+    assert [(item.path, item.before, item.after) for item in preview.changes] == [
+        ("max_parallel_workers", "4", "3")
+    ]
+    with pytest.raises(ValueError, match="policy changed after acceptance"):
+        await changed.monitor(run_id)
 
+    result = changed.reauthorize(run_id, "raised max_workers on purpose")
+    after = result.authorization
+
+    assert result.applied is True
+    assert result.comparable is True
+    assert [item.path for item in result.changes] == ["max_parallel_workers"]
     assert after.config_sha256 != before.config_sha256
     assert after.proposal_sha256 == before.proposal_sha256
     await changed.monitor(run_id)
@@ -3037,3 +3051,90 @@ async def test_a_lane_published_onto_a_merged_pull_request_never_asks_for_checks
     assert result.status == "complete", store.events(run_id)
     assert publisher.ready_calls == []
     assert store.publications(run_id)[-1].landed is True
+
+
+async def test_a_run_accepted_before_the_policy_was_stored_says_so_rather_than_nothing(
+    tmp_path: Path,
+) -> None:
+    """An empty change list and an unreadable one must not print the same.
+
+    Every run live when this shipped was accepted without its policy payload,
+    so the diff cannot be computed for them. Reporting "no changes" there would
+    tell an owner the config matches when the digests say it does not.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    with Session(store._engine) as session:
+        row = session.get(AcceptanceAuthorizationRow, run_id)
+        assert row is not None
+        row.config_json = None
+        session.add(row)
+        session.commit()
+
+    changed = ExecutionController(
+        config=config(max_workers=3),
+        orca=orca,
+        store=store,
+        git=FakeGit(),
+        publisher=FakePublisher(),
+    )
+    preview = changed.reauthorize(run_id, "", apply=False)
+
+    assert preview.comparable is False
+    assert preview.changes == []
+
+    applied = changed.reauthorize(run_id, "raised max_workers on purpose")
+
+    # Applying it stores the policy, so the next change is readable.
+    assert applied.applied is True
+    assert store.accepted_config(run_id) == changed._config.model_dump(mode="json")
+    again = ExecutionController(
+        config=config(max_workers=2),
+        orca=orca,
+        store=store,
+        git=FakeGit(),
+        publisher=FakePublisher(),
+    ).reauthorize(run_id, "", apply=False)
+    assert again.comparable is True
+    assert [(item.path, item.before, item.after) for item in again.changes] == [
+        ("max_parallel_workers", "3", "2")
+    ]
+    recorded = [
+        item for item in store.events(run_id) if item["kind"] == "supervisor_reauthorized_policy"
+    ]
+    assert recorded[-1]["payload"]["changes"] == []
+
+
+async def test_an_unchanged_run_records_the_policy_it_was_accepted_under(tmp_path: Path) -> None:
+    """A run started before the payload existed becomes readable without authorizing anything.
+
+    The digest already proves the config on disk is the accepted one, so
+    recording it changes nothing about what the run is allowed to do. It just
+    means the *next* policy change can be read as fields instead of digests.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    with Session(store._engine) as session:
+        row = session.get(AcceptanceAuthorizationRow, run_id)
+        assert row is not None
+        row.config_json = None
+        session.add(row)
+        session.commit()
+    assert store.accepted_config(run_id) is None
+
+    preview = value.reauthorize(run_id, "", apply=False)
+
+    assert preview.comparable is True
+    assert preview.changes == []
+    assert preview.applied is False
+    assert store.accepted_config(run_id) == config().model_dump(mode="json")
+    # Reading is not authorizing: nothing was re-frozen.
+    assert [
+        item for item in store.events(run_id) if item["kind"] == "supervisor_reauthorized_policy"
+    ] == []

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from orkastrator.config import ConfigError, Settings, load_graph_config
+from orkastrator.config import ConfigError, Settings, config_changes, load_graph_config
 
 
 def write_config(path: Path, *, strength: str = "high") -> None:
@@ -157,3 +157,35 @@ def test_a_hard_budget_before_its_soft_budget_is_rejected(tmp_path: Path) -> Non
     )
     with pytest.raises(ConfigError, match="hard_minutes"):
         load_graph_config(path)
+
+
+def test_config_changes_reads_nested_leaves_and_leaves_lists_whole() -> None:
+    """One setting that moved should read as one change, at a path you can look up."""
+
+    before = {
+        "max_parallel_workers": 4,
+        "final_gate": {"advisory_checks": [], "required": True},
+        "roles": {"worker": {"model": "gpt-test"}},
+    }
+    after = {
+        "max_parallel_workers": 4,
+        "final_gate": {"advisory_checks": ["conformance", "chrome"], "required": True},
+        "roles": {"worker": {"model": "gpt-test", "fast": True}},
+    }
+
+    changes = config_changes(before, after)
+
+    assert [(item.path, item.before, item.after) for item in changes] == [
+        ("final_gate.advisory_checks", "[]", '["conformance", "chrome"]'),
+        ("roles.worker.fast", "(unset)", "true"),
+    ]
+
+
+def test_config_changes_distinguishes_an_absent_key_from_a_null_one() -> None:
+    """`(unset)` and `null` are different facts, and a budget of null is a real setting."""
+
+    changes = config_changes({"budget": None}, {})
+    assert [(item.path, item.before, item.after) for item in changes] == [
+        ("budget", "null", "(unset)")
+    ]
+    assert config_changes({"a": 1}, {"a": 1}) == []

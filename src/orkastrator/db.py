@@ -188,6 +188,11 @@ class AcceptanceAuthorizationRow(SQLModel, table=True):
 
     run_id: str = Field(foreign_key="supervisor_runs.run_id", primary_key=True)
     payload_json: str
+    # The accepted policy itself, not only its digest. A digest cannot be
+    # diffed, so without this the owner authorizing a mid-run policy change is
+    # shown two hex strings and asked to judge them. Nullable because runs
+    # accepted before this column existed have no payload to show.
+    config_json: str | None = None
     created_at: datetime
 
 

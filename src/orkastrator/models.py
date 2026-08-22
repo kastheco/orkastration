@@ -506,6 +506,32 @@ class AcceptanceAuthorization(WorkflowContract):
     config_sha256: Sha256Digest
 
 
+class ConfigChange(WorkflowContract):
+    """One changed leaf between the accepted policy and the policy on disk.
+
+    Values are rendered as compact JSON rather than kept typed, because this
+    exists to be read by an owner deciding whether to authorize the change.
+    `final_gate.advisory_checks: [] -> ["conformance"]` is a sentence somebody
+    can judge; two digests are not.
+    """
+
+    path: str = Field(min_length=1, max_length=512)
+    before: str = Field(max_length=2_048)
+    after: str = Field(max_length=2_048)
+
+
+class PolicyReauthorization(WorkflowContract):
+    """What `reauthorize` was asked to do, what it read, and whether it did it."""
+
+    authorization: AcceptanceAuthorization
+    changes: list[ConfigChange] = Field(default_factory=list, max_length=512)
+    # False when the accepted run predates the stored config payload, so the
+    # change cannot be read - only the digests differ. Saying so is the point:
+    # an empty `changes` list would otherwise claim nothing moved.
+    comparable: bool = True
+    applied: bool = False
+
+
 class PublicationReceipt(WorkflowContract):
     """Auditable external mutations authorized by one accepted run."""
 

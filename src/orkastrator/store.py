@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Literal, TypeVar, cast
 
 from sqlalchemy import event, func, inspect
 from sqlmodel import Session, SQLModel, col, create_engine, select
@@ -37,6 +37,7 @@ from orkastrator.models import (
     AttemptKind,
     CiFailureFinding,
     CiReceipt,
+    ConfigChange,
     EscalationDecision,
     FindingPhase,
     FindingReason,
@@ -298,7 +299,10 @@ class StateStore:
             self._event(session, run_id, None, "proposal_accepted", {"orca_run_id": orca_run_id})
 
     def record_acceptance_authorization(
-        self, run_id: str, authorization: AcceptanceAuthorization
+        self,
+        run_id: str,
+        authorization: AcceptanceAuthorization,
+        config: object | None = None,
     ) -> None:
         if authorization.run_id != run_id:
             raise ValueError("acceptance authorization does not match its run")
@@ -308,14 +312,30 @@ class StateStore:
             if row is not None:
                 if row.payload_json != payload:
                     raise ValueError("accepted proposal or publication policy changed")
+                # A run accepted before the policy payload was stored can still
+                # gain it: the digest already proves this is the same policy, so
+                # writing it makes the next reauthorization readable.
+                if row.config_json is None and config is not None:
+                    row.config_json = json.dumps(config, sort_keys=True)
                 return
             session.add(
-                AcceptanceAuthorizationRow(run_id=run_id, payload_json=payload, created_at=_now())
+                AcceptanceAuthorizationRow(
+                    run_id=run_id,
+                    payload_json=payload,
+                    config_json=None if config is None else json.dumps(config, sort_keys=True),
+                    created_at=_now(),
+                )
             )
             self._event(session, run_id, None, "acceptance_authorized", authorization.model_dump())
 
     def reauthorize_acceptance(
-        self, run_id: str, authorization: AcceptanceAuthorization, note: str
+        self,
+        run_id: str,
+        authorization: AcceptanceAuthorization,
+        note: str,
+        *,
+        config: object | None = None,
+        changes: list[ConfigChange] | None = None,
     ) -> None:
         """Re-freeze one run's authorization against a policy the owner changed on purpose.
 
@@ -345,6 +365,8 @@ class StateStore:
                     "record and accept a new proposal"
                 )
             row.payload_json = authorization.model_dump_json()
+            if config is not None:
+                row.config_json = json.dumps(config, sort_keys=True)
             self._event(
                 session,
                 run_id,
@@ -354,6 +376,9 @@ class StateStore:
                     "from_config_sha256": previous.config_sha256,
                     "to_config_sha256": authorization.config_sha256,
                     "note": note[:4_000],
+                    # What moved, not only that something did. A digest pair in
+                    # the audit trail cannot be read back into a decision.
+                    "changes": [item.model_dump() for item in changes or []],
                 },
             )
             session.commit()
@@ -366,6 +391,19 @@ class StateStore:
                 if row is None
                 else AcceptanceAuthorization.model_validate_json(row.payload_json)
             )
+
+    def accepted_config(self, run_id: str) -> object | None:
+        """The policy this run was accepted under, when it was recorded.
+
+        `None` means the run predates the stored payload, which is not the same
+        as "nothing changed" and must not be reported as it.
+        """
+
+        with self._session() as session:
+            row = session.get(AcceptanceAuthorizationRow, run_id)
+            if row is None or row.config_json is None:
+                return None
+            return cast(object, json.loads(row.config_json))
 
     def record_publication(self, run_id: str, lane_id: str, receipt: PublicationReceipt) -> None:
         payload = receipt.model_dump_json()
@@ -2043,6 +2081,7 @@ class StateStore:
             ),
             "workflow_stages": (("worktree_id", "TEXT"),),
             "findings": (("dispatch_base_sha", "TEXT"),),
+            "acceptance_authorizations": (("config_json", "TEXT"),),
             "integrations": (
                 ("source_commits_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("source_finding_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
