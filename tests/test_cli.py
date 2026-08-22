@@ -39,6 +39,7 @@ def proposal() -> SupervisorPlan:
                     "name": "issue-123",
                     "issue_id": "ISSUE-123",
                     "repo_selector": "id:repo",
+                    "base_ref": "main",
                     "dependencies": [],
                     "prompt": "Implement it.",
                     "stop_condition": "Tests pass.",
@@ -138,6 +139,7 @@ lanes:
   - name: issue-123
     issue_id: ISSUE-123
     repo_selector: id:repo
+    base_ref: main
     dependencies: []
     prompt: Implement it.
     stop_condition: Tests pass.

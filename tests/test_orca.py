@@ -184,6 +184,47 @@ async def test_start_worker_reuses_lane_worktree() -> None:
     assert "id:repo::/tmp/issue-123" in runner.calls[0]
 
 
+async def test_start_fixer_uses_child_worktree_at_exact_review_head() -> None:
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "dispatchId": "dispatch-3",
+                    "worker": {"worktreeId": "repo::/tmp/finding-1"},
+                },
+            }
+        ]
+    )
+    client = OrcaClient(runner)
+    _, worktree_id, _ = await client.start_worker(
+        task_id="task-3",
+        lane_name="finding-1-fixer-r1",
+        repo_selector="id:repo",
+        worktree_id=None,
+        profile=profile(),
+        base_ref="b" * 40,
+        parent_worktree_id="repo::/tmp/issue-123",
+    )
+
+    assert worktree_id == "repo::/tmp/finding-1"
+    assert runner.calls[0][0:12] == (
+        "orchestration",
+        "worker-start",
+        "--task",
+        "task-3",
+        "--worktree",
+        "new-child",
+        "--repo",
+        "id:repo",
+        "--name",
+        "finding-1-fixer-r1",
+        "--setup",
+        "run",
+    )
+    assert runner.calls[0][12:14] == ("--base-branch", "b" * 40)
+
+
 async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -> None:
     runner = FakeRunner(
         [

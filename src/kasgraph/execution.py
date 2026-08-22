@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Protocol, cast
 
 from pydantic import ValidationError
 
 from kasgraph.config import AgentProfile, GraphConfig
+from kasgraph.git import GitError, LocalGit
 from kasgraph.models import (
     AttemptKind,
     EscalationDecision,
@@ -19,6 +21,7 @@ from kasgraph.models import (
     InitialReviewReport,
     LanePhase,
     LaneProposal,
+    LaneRecord,
     OrcaWorkerResult,
     ProposalReceipt,
     ReReviewResult,
@@ -27,10 +30,12 @@ from kasgraph.models import (
     StagePhase,
     StageRecord,
     SupervisorPlan,
+    ValidationRequirement,
     WorkerResult,
 )
 from kasgraph.orca import JsonObject
-from kasgraph.store import StateStore
+from kasgraph.scope import path_allowed
+from kasgraph.store import IntegrationBusyError, StateStore
 
 
 class OrcaGraphController(Protocol):
@@ -52,6 +57,8 @@ class OrcaGraphController(Protocol):
         repo_selector: str,
         worktree_id: str | None,
         profile: AgentProfile,
+        base_ref: str | None = None,
+        parent_worktree_id: str | None = None,
     ) -> tuple[str, str, JsonObject]: ...
 
     async def release_worker(self, dispatch_id: str) -> JsonObject: ...
@@ -59,13 +66,30 @@ class OrcaGraphController(Protocol):
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerPlacement:
+    """Named Orca checkout placement for one workflow stage."""
+
+    worktree_id: str | None
+    base_ref: str | None = None
+    parent_worktree_id: str | None = None
+
+
 class ExecutionController:
     """Turn accepted proposals into persisted, bounded convergence workflows."""
 
-    def __init__(self, *, config: GraphConfig, orca: OrcaGraphController, store: StateStore):
+    def __init__(
+        self,
+        *,
+        config: GraphConfig,
+        orca: OrcaGraphController,
+        store: StateStore,
+        git: LocalGit | None = None,
+    ):
         self._config = config
         self._orca = orca
         self._store = store
+        self._git = git or LocalGit()
 
     def propose(self, proposal: SupervisorPlan) -> ProposalReceipt:
         """Record a proposal without mutating Orca."""
@@ -119,7 +143,9 @@ class ExecutionController:
                     self._store.reset_stage_reservation(run_id, stage)
                     continue
                 dispatch_id, recovered_worktree = recovered
-                worktree_id = recovered_worktree or lanes[stage.lane_id].worktree_id
+                worktree_id = _recovered_worktree(
+                    stage, recovered_worktree, lanes[stage.lane_id].worktree_id
+                )
                 if worktree_id is None:
                     raise ValueError(
                         f"Orca Dispatch {dispatch_id} omitted its worker worktree identity"
@@ -144,7 +170,9 @@ class ExecutionController:
                         f"Orca task {stage.orca_task_id} has {phase.value} state without a Dispatch"
                     )
                 dispatch_id, recovered_worktree = recovered
-                worktree_id = recovered_worktree or lanes[stage.lane_id].worktree_id
+                worktree_id = _recovered_worktree(
+                    stage, recovered_worktree, lanes[stage.lane_id].worktree_id
+                )
                 if worktree_id is None:
                     raise ValueError(
                         f"Orca Dispatch {dispatch_id} omitted its worker worktree identity"
@@ -163,7 +191,7 @@ class ExecutionController:
                 _task_result_json(task),
             )
 
-        self._process_results(run_id)
+        await self._process_results(run_id)
         await self._release_settled(run_id)
         self._ensure_dynamic_stages(run_id)
         await self._ensure_tasks(run_id)
@@ -182,7 +210,7 @@ class ExecutionController:
             findings=self._store.findings(run_id),
         )
 
-    def _process_results(self, run_id: str) -> None:
+    async def _process_results(self, run_id: str) -> None:
         for stage in self._store.stages(run_id):
             if stage.processed or stage.phase not in {StagePhase.COMPLETED, StagePhase.FAILED}:
                 continue
@@ -193,15 +221,20 @@ class ExecutionController:
                 result = OrcaWorkerResult.model_validate_json(stage.result_json)
                 if result.outcome != "succeeded":
                     raise ValueError("worker reported a failed outcome")
-                self._apply_contract(run_id, stage, result)
-            except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                await self._apply_contract(run_id, stage, result)
+            except IntegrationBusyError:
+                continue
+            except (GitError, ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._reject_stage(run_id, stage, f"invalid structured result: {exc}")
                 continue
             self._store.record_lifecycle_receipt(run_id, stage, result)
 
-    def _apply_contract(self, run_id: str, stage: StageRecord, lifecycle: OrcaWorkerResult) -> None:
+    async def _apply_contract(
+        self, run_id: str, stage: StageRecord, lifecycle: OrcaWorkerResult
+    ) -> None:
         if stage.role is StageKind.WORKER:
             result = WorkerResult.model_validate_json(lifecycle.body)
+            await self._validate_worker_result(run_id, stage, result)
             self._store.record_worker_result(run_id, stage.lane_id, result)
             return
         if stage.role is StageKind.INITIAL_REVIEWER:
@@ -209,6 +242,10 @@ class ExecutionController:
             worker = self._store.worker_result(stage.lane_id)
             if report.review_revision != worker.review_revision:
                 raise ValueError("initial review revision does not match the worker changeset")
+            if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
+                raise ValueError("initial review checkout contains uncommitted changes")
+            if await self._git.head(stage.worktree_id) != report.review_revision.head_sha:
+                raise ValueError("initial review checkout drifted from the frozen worker head")
             self._store.record_initial_review(run_id, stage.lane_id, report)
             return
         finding = self._finding_for_stage(run_id, stage)
@@ -217,9 +254,11 @@ class ExecutionController:
                 f"stage round {stage.round} does not match finding round {finding.round}"
             )
         if stage.role is StageKind.FIXER:
-            self._apply_fix(run_id, finding, stage, FixAttempt.model_validate_json(lifecycle.body))
+            await self._apply_fix(
+                run_id, finding, stage, FixAttempt.model_validate_json(lifecycle.body)
+            )
         elif stage.role is StageKind.RE_REVIEWER:
-            self._apply_re_review(
+            await self._apply_re_review(
                 run_id, finding, stage, ReReviewResult.model_validate_json(lifecycle.body)
             )
         elif stage.role is StageKind.ESCALATION:
@@ -227,13 +266,16 @@ class ExecutionController:
                 run_id, finding, stage, EscalationDecision.model_validate_json(lifecycle.body)
             )
 
-    def _apply_fix(
+    async def _apply_fix(
         self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
     ) -> None:
         if attempt.finding_id != finding.finding_id or attempt.round != finding.round:
             raise ValueError("fix attempt does not match its persisted finding and round")
         self._store.record_fix_attempt(run_id, finding, stage, attempt)
         if attempt.status == "fixed":
+            if not await self._validate_fixer_commit(run_id, finding, stage, attempt):
+                self._escalate(run_id, finding, FindingReason.SCOPE_ESCAPE)
+                return
             self._store.set_finding_state(
                 run_id, finding.finding_key, phase=FindingPhase.PENDING_RE_REVIEW
             )
@@ -249,7 +291,7 @@ class ExecutionController:
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
 
-    def _apply_re_review(
+    async def _apply_re_review(
         self,
         run_id: str,
         finding: FindingRecord,
@@ -261,6 +303,12 @@ class ExecutionController:
         attempt = self._store.latest_fix_attempt(finding.finding_key)
         if attempt is None or attempt.commit_sha != result.reviewed_commit_sha:
             raise ValueError("re-review is not pinned to the persisted fixer commit")
+        if stage.worktree_id is None:
+            raise ValueError("re-review stage omitted its isolated fixer worktree")
+        if not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("re-review worktree contains uncommitted changes")
+        if await self._git.head(stage.worktree_id) != result.reviewed_commit_sha:
+            raise ValueError("re-review worktree is not pinned to the persisted fixer commit")
         existing = self._store.findings(run_id, finding.lane_id)
         _validate_discovered_findings(existing, result)
         existing_ids = {item.finding_id for item in existing}
@@ -286,7 +334,7 @@ class ExecutionController:
                     run_id, finding.lane_id, discovered.finding, origin="unrelated"
                 )
         if result.verdict == "resolved":
-            self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.RESOLVED)
+            await self._integrate_fix(run_id, finding, attempt)
         elif result.verdict == "still_open":
             if finding.round < self._config.review_cycle.max_fix_rounds_per_finding:
                 self._store.set_finding_state(
@@ -305,7 +353,7 @@ class ExecutionController:
                 self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
             else:
                 self._store.set_finding_state(
-                    run_id, finding.finding_key, phase=FindingPhase.RESOLVED
+                    run_id, finding.finding_key, phase=FindingPhase.PENDING_COMPOSITE
                 )
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
@@ -340,8 +388,10 @@ class ExecutionController:
                 )
         elif decision.action == "defer":
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.DEFERRED)
+            self._settle_predecessors(run_id, finding, FindingPhase.DEFERRED)
         else:
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+            self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
 
     def _reject_stage(self, run_id: str, stage: StageRecord, reason: str) -> None:
         if stage.finding_id is None:
@@ -365,6 +415,305 @@ class ExecutionController:
             escalation_reason=reason,
         )
 
+    async def _validate_fixer_commit(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        stage: StageRecord,
+        attempt: FixAttempt,
+    ) -> bool:
+        """Verify the exact fixer head and enforce portable literal path boundaries."""
+
+        if stage.worktree_id is None or attempt.commit_sha is None:
+            raise ValueError("fixed attempt omitted its isolated worktree or commit")
+        expected_base = self._fix_base_sha(finding)
+        actual_head = await self._git.head(stage.worktree_id)
+        if not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("fixer worktree contains uncommitted changes")
+        if attempt.base_sha != expected_base or actual_head != attempt.commit_sha:
+            raise ValueError("fixer result is not pinned to its assigned base and exact head")
+        if not await self._git.is_ancestor(stage.worktree_id, attempt.base_sha, attempt.commit_sha):
+            raise ValueError("fixer commit does not descend from its assigned base")
+        if (
+            await self._git.commit_count(stage.worktree_id, attempt.base_sha, attempt.commit_sha)
+            != 1
+        ):
+            raise ValueError("fixer attempt must produce exactly one commit")
+        actual_paths = await self._git.changed_paths(
+            stage.worktree_id, attempt.base_sha, attempt.commit_sha
+        )
+        declared_paths = sorted(set(attempt.changed_paths))
+        allowed = finding.effective_contract.allowed_write_scope.paths
+        forbidden = finding.effective_contract.forbidden_scope
+        accepted = actual_paths == declared_paths and all(
+            path_allowed(path, allowed) and not path_allowed(path, forbidden)
+            for path in actual_paths
+        )
+        self._store.record_scope_check(
+            run_id,
+            finding,
+            declared_paths=declared_paths,
+            actual_paths=actual_paths,
+            accepted=accepted,
+        )
+        return accepted
+
+    async def _integrate_fix(
+        self, run_id: str, finding: FindingRecord, attempt: FixAttempt
+    ) -> None:
+        """Serially integrate one re-review-approved commit into the lane checkout."""
+
+        if attempt.commit_sha is None:
+            raise ValueError("approved fixer attempt omitted its commit")
+        lane = next(item for item in self._store.lanes(run_id) if item.lane_id == finding.lane_id)
+        if lane.worktree_id is None or lane.integration_head_sha is None:
+            raise ValueError("lane omitted its integration checkout or frozen head")
+        fixer_worktree = self._fixer_worktree(run_id, finding)
+        _, source_commits, source_finding_ids = await self._integration_sources(
+            run_id, finding, attempt, fixer_worktree
+        )
+        receipt = self._store.integration(finding.finding_key, finding.round)
+        if receipt is None:
+            receipt = self._store.begin_integration(
+                run_id,
+                finding,
+                fixer_commit_sha=attempt.commit_sha,
+                source_commits=source_commits,
+                source_finding_ids=source_finding_ids,
+                base_sha=lane.integration_head_sha,
+            )
+        elif (
+            receipt.fixer_commit_sha != attempt.commit_sha
+            or receipt.source_commits != source_commits
+            or receipt.source_finding_ids != source_finding_ids
+        ):
+            raise ValueError("integration sources changed after persistence")
+        if receipt.status == "integrated":
+            self._settle_source_findings(
+                run_id,
+                finding.lane_id,
+                receipt.source_finding_ids,
+                FindingPhase.RESOLVED,
+            )
+            return
+        if receipt.status == "conflict":
+            self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
+            return
+        if receipt.status == "validation_failed":
+            self._escalate(run_id, finding, FindingReason.VALIDATION_FAILED)
+            return
+
+        integrated_sha = await self._git.find_cherry_pick(lane.worktree_id, attempt.commit_sha)
+        if integrated_sha is None:
+            active_sequence = await self._git.cherry_pick_in_progress_commits(lane.worktree_id)
+            if active_sequence is not None:
+                if not active_sequence or not set(active_sequence).issubset(receipt.source_commits):
+                    self._store.finish_integration(
+                        run_id,
+                        finding,
+                        status="conflict",
+                        integrated_sha=None,
+                        validation_results=[],
+                    )
+                    self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
+                    return
+                await self._git.abort_cherry_pick(lane.worktree_id)
+            current_head = await self._git.head(lane.worktree_id)
+            if current_head != receipt.base_sha or not await self._git.is_clean(lane.worktree_id):
+                self._store.finish_integration(
+                    run_id,
+                    finding,
+                    status="conflict",
+                    integrated_sha=None,
+                    validation_results=[],
+                )
+                self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
+                return
+            applied = await self._git.cherry_pick_many(lane.worktree_id, source_commits)
+            if applied.returncode != 0:
+                await self._git.abort_cherry_pick(lane.worktree_id)
+                self._store.finish_integration(
+                    run_id,
+                    finding,
+                    status="conflict",
+                    integrated_sha=None,
+                    validation_results=[],
+                )
+                self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
+                return
+            integrated_sha = await self._git.head(lane.worktree_id)
+
+        validation = await self._git.validate(
+            lane.worktree_id,
+            self._integrated_validation_requirements(run_id, finding.lane_id, source_finding_ids),
+        )
+        if any(result.status != "passed" for result in validation):
+            self._store.finish_integration(
+                run_id,
+                finding,
+                status="validation_failed",
+                integrated_sha=integrated_sha,
+                validation_results=validation,
+            )
+            self._escalate(run_id, finding, FindingReason.VALIDATION_FAILED)
+            return
+        self._store.finish_integration(
+            run_id,
+            finding,
+            status="integrated",
+            integrated_sha=integrated_sha,
+            validation_results=validation,
+        )
+        self._settle_source_findings(
+            run_id,
+            finding.lane_id,
+            receipt.source_finding_ids,
+            FindingPhase.RESOLVED,
+        )
+
+    async def _validate_worker_result(
+        self, run_id: str, stage: StageRecord, result: WorkerResult
+    ) -> None:
+        """Freeze only a Git-verified lane head, ancestry, path set, and diff identity."""
+
+        if stage.worktree_id is None:
+            raise ValueError("worker result omitted its lane worktree")
+        if not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("worker worktree contains uncommitted changes")
+        revision = result.review_revision
+        lane = next(item for item in self._store.lanes(run_id) if item.lane_id == stage.lane_id)
+        if await self._git.resolve_ref(stage.worktree_id, lane.base_ref) != revision.base_sha:
+            raise ValueError("worker review base does not match the configured lane base_ref")
+        if await self._git.head(stage.worktree_id) != revision.head_sha:
+            raise ValueError("worker review head does not match the lane checkout")
+        if not await self._git.is_ancestor(stage.worktree_id, revision.base_sha, revision.head_sha):
+            raise ValueError("worker review head does not descend from its base")
+        actual_paths = await self._git.changed_paths(
+            stage.worktree_id, revision.base_sha, revision.head_sha
+        )
+        if actual_paths != sorted(set(result.changed_paths)):
+            raise ValueError("worker changed paths do not match the frozen Git diff")
+        actual_diff = await self._git.diff_sha256(
+            stage.worktree_id, revision.base_sha, revision.head_sha
+        )
+        if actual_diff != revision.diff_sha256:
+            raise ValueError("worker diff digest does not match the frozen Git diff")
+
+    async def _integration_sources(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        attempt: FixAttempt,
+        fixer_worktree: str,
+    ) -> tuple[str, list[str], list[str]]:
+        """Resolve an introduced-fix ancestry chain into auditable source commits."""
+
+        if attempt.commit_sha is None:
+            raise ValueError("integration source omitted its fixer commit")
+        findings = self._store.findings(run_id, finding.lane_id)
+        source_findings = [finding]
+        source_base = finding.effective_contract.review_revision.head_sha
+        visited = {finding.finding_key}
+        while True:
+            predecessor = next(
+                (
+                    item
+                    for item in findings
+                    if item.finding_key not in visited
+                    and (prior := self._store.latest_fix_attempt(item.finding_key)) is not None
+                    and prior.commit_sha == source_base
+                ),
+                None,
+            )
+            if predecessor is None:
+                break
+            visited.add(predecessor.finding_key)
+            source_findings.insert(0, predecessor)
+            source_base = predecessor.effective_contract.review_revision.head_sha
+        commits = await self._git.commits_between(fixer_worktree, source_base, attempt.commit_sha)
+        if not commits or commits[-1] != attempt.commit_sha:
+            raise ValueError("accepted integration source chain does not end at the fixer commit")
+        return source_base, commits, [item.finding_id for item in source_findings]
+
+    def _integrated_validation_requirements(
+        self, run_id: str, lane_id: str, source_finding_ids: list[str]
+    ) -> list[ValidationRequirement]:
+        """Return deduplicated checks for the complete integrated fix set."""
+
+        finding_ids = set(source_finding_ids)
+        for receipt in self._store.integrations(run_id):
+            if receipt.lane_id == lane_id and receipt.status == "integrated":
+                finding_ids.update(receipt.source_finding_ids)
+        requirements: list[ValidationRequirement] = []
+        seen: set[tuple[str, str]] = set()
+        for item in self._store.findings(run_id, lane_id):
+            if item.finding_id not in finding_ids:
+                continue
+            for requirement in item.effective_contract.validation:
+                key = (requirement.command, requirement.expected)
+                if key not in seen:
+                    seen.add(key)
+                    requirements.append(requirement)
+        return sorted(requirements, key=lambda item: (item.command, item.expected))
+
+    def _fixer_worktree(self, run_id: str, finding: FindingRecord) -> str:
+        candidates = [
+            stage
+            for stage in self._store.stages(run_id)
+            if stage.finding_id == finding.finding_id
+            and stage.round == finding.round
+            and stage.role is StageKind.FIXER
+            and stage.processed
+            and stage.worktree_id is not None
+        ]
+        if not candidates:
+            raise ValueError("integration has no settled fixer worktree")
+        assert candidates[-1].worktree_id is not None
+        return candidates[-1].worktree_id
+
+    def _settle_predecessors(
+        self, run_id: str, finding: FindingRecord, phase: FindingPhase
+    ) -> None:
+        """Settle unresolved composite predecessors when their correction cannot integrate."""
+
+        source_head = finding.effective_contract.review_revision.head_sha
+        findings = self._store.findings(run_id, finding.lane_id)
+        visited: set[str] = set()
+        while True:
+            predecessor = next(
+                (
+                    item
+                    for item in findings
+                    if item.finding_key not in visited
+                    and item.phase is FindingPhase.PENDING_COMPOSITE
+                    and (attempt := self._store.latest_fix_attempt(item.finding_key)) is not None
+                    and attempt.commit_sha == source_head
+                ),
+                None,
+            )
+            if predecessor is None:
+                return
+            visited.add(predecessor.finding_key)
+            self._store.set_finding_state(run_id, predecessor.finding_key, phase=phase)
+            source_head = predecessor.effective_contract.review_revision.head_sha
+
+    def _settle_source_findings(
+        self,
+        run_id: str,
+        lane_id: str,
+        finding_ids: list[str],
+        phase: FindingPhase,
+    ) -> None:
+        """Idempotently settle every finding represented by an integration receipt."""
+
+        selected = set(finding_ids)
+        for item in self._store.findings(run_id, lane_id):
+            if item.finding_id in selected:
+                self._store.set_finding_state(run_id, item.finding_key, phase=phase)
+
+    def _fix_base_sha(self, finding: FindingRecord) -> str:
+        return finding.effective_contract.review_revision.head_sha
+
     def _ensure_dynamic_stages(self, run_id: str) -> None:
         stages = self._store.stages(run_id)
         by_lane: dict[str, list[StageRecord]] = {}
@@ -376,7 +725,7 @@ class ExecutionController:
                 stage.role is StageKind.WORKER and stage.processed for stage in lane_stages
             )
             reviewer_exists = any(stage.role is StageKind.INITIAL_REVIEWER for stage in lane_stages)
-            if worker_done and not reviewer_exists:
+            if worker_done and lane.phase is not LanePhase.FAILED and not reviewer_exists:
                 self._store.ensure_stage(
                     run_id,
                     lane.lane_id,
@@ -493,17 +842,29 @@ class ExecutionController:
                 stage,
                 max_workers=self._config.max_parallel_workers,
                 max_lanes=self._config.max_parallel_lanes,
-                max_lane_fixers=1,
+                max_lane_fixers=self._config.review_cycle.parallel_fixers.max_per_lane,
+                write_paths=(
+                    tuple(
+                        self._finding_for_stage(
+                            run_id, stage
+                        ).effective_contract.allowed_write_scope.paths
+                    )
+                    if stage.role is StageKind.FIXER
+                    else ()
+                ),
             ):
                 continue
             if stage.orca_task_id is None:
                 raise ValueError(f"ready stage {stage.stage_id} has no Orca task")
             lane = lanes[stage.lane_id]
+            placement = self._placement(run_id, lane, stage)
             dispatch_id, worktree_id, payload = await self._orca.start_worker(
                 task_id=stage.orca_task_id,
                 lane_name=_worker_name(lane.name, stage),
                 repo_selector=lane.repo_selector,
-                worktree_id=lane.worktree_id,
+                worktree_id=placement.worktree_id,
+                base_ref=placement.base_ref,
+                parent_worktree_id=placement.parent_worktree_id,
                 profile=self._profile(stage),
             )
             self._store.mark_stage_started(
@@ -532,6 +893,36 @@ class ExecutionController:
                 )
             )
         return started
+
+    def _placement(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> WorkerPlacement:
+        """Resolve the exact existing or isolated checkout for one role."""
+
+        if stage.role is StageKind.WORKER:
+            return WorkerPlacement(worktree_id=None, base_ref=lane.base_ref)
+        if stage.role is StageKind.FIXER:
+            if lane.worktree_id is None:
+                raise ValueError("fixer lane has no integration checkout")
+            finding = self._finding_for_stage(run_id, stage)
+            return WorkerPlacement(
+                worktree_id=None,
+                base_ref=self._fix_base_sha(finding),
+                parent_worktree_id=lane.worktree_id,
+            )
+        if stage.role is StageKind.RE_REVIEWER:
+            candidates = [
+                item
+                for item in self._store.stages(run_id)
+                if item.lane_id == stage.lane_id
+                and item.finding_id == stage.finding_id
+                and item.round == stage.round
+                and item.role is StageKind.FIXER
+                and item.processed
+                and item.worktree_id is not None
+            ]
+            if not candidates:
+                raise ValueError("re-review has no settled isolated fixer worktree")
+            return WorkerPlacement(worktree_id=candidates[-1].worktree_id)
+        return WorkerPlacement(worktree_id=lane.worktree_id)
 
     def _derive_status(self, run_id: str) -> str:
         stages = self._store.stages(run_id)
@@ -597,8 +988,10 @@ class ExecutionController:
         if stage.role is StageKind.WORKER:
             schema = json.dumps(WorkerResult.model_json_schema(), sort_keys=True)
             return (
-                "Implement the scoped issue, verify it, and commit the result. Send worker_done "
-                "with an explicit outcome and body set to only the exact changeset JSON matching "
+                "Implement the scoped issue, verify it, and commit the result. Compute "
+                "diff_sha256 over the raw output of `git diff --binary --full-index "
+                "<base>..<head> --` and report the exact sorted changed paths. Send worker_done "
+                "with an explicit outcome and body set to only the changeset JSON matching "
                 f"this schema: {schema}\n\n{context}"
             )
         if stage.role is StageKind.INITIAL_REVIEWER:
@@ -612,9 +1005,13 @@ class ExecutionController:
         contract = finding.effective_contract.model_dump_json()
         if stage.role is StageKind.FIXER:
             schema = json.dumps(FixAttempt.model_json_schema(), sort_keys=True)
+            prior = self._store.fix_attempt(finding.finding_key, finding.round - 1)
             return (
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
-                "Do not widen scope. Send worker_done with body set to only the JSON contract "
+                f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
+                "Start from the assigned frozen review head and produce exactly one commit that "
+                "fully resolves the finding. Do not widen scope. Send worker_done with body set "
+                "to only the JSON contract "
                 f"matching this schema: {schema}\n\n{context}"
             )
         if stage.role is StageKind.RE_REVIEWER:
@@ -727,3 +1124,13 @@ def _worker_name(lane_name: str, stage: StageRecord) -> str:
     if stage.finding_id is not None:
         suffix = f"{stage.finding_id}-{suffix}-r{stage.round}"
     return f"{lane_name}-{suffix}"[:64]
+
+
+def _recovered_worktree(
+    stage: StageRecord, recovered: str | None, lane_worktree: str | None
+) -> str | None:
+    """Never reinterpret a missing isolated fixer identity as the lane checkout."""
+
+    if stage.role in {StageKind.FIXER, StageKind.RE_REVIEWER}:
+        return recovered
+    return recovered or lane_worktree

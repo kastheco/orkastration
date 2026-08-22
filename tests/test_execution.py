@@ -10,12 +10,15 @@ import pytest
 
 from kasgraph.config import AgentProfile, GraphConfig
 from kasgraph.execution import ExecutionController
+from kasgraph.git import GitCommandResult, LocalGit
 from kasgraph.models import (
     FindingPhase,
     FindingReason,
     ReReviewResult,
     StageKind,
     SupervisorPlan,
+    ValidationRequirement,
+    ValidationResult,
 )
 from kasgraph.orca import JsonObject
 from kasgraph.store import StateStore
@@ -57,6 +60,7 @@ def proposal(*, lane_count: int = 1, next_action: str = "propose_lanes") -> Supe
             "name": f"issue-{number}",
             "issue_id": f"ISSUE-{number}",
             "repo_selector": "id:repo",
+            "base_ref": "main",
             "dependencies": [],
             "prompt": f"Implement ISSUE-{number}.",
             "stop_condition": "Tests pass.",
@@ -86,15 +90,29 @@ def worker_result() -> str:
     )
 
 
-def fix_attempt(finding_id: str = "finding-1", *, round: int = 1, status: str = "fixed") -> str:
+def fixer_sha(finding_id: str, round: int) -> str:
+    number = int(finding_id.rsplit("-", maxsplit=1)[-1])
+    return f"{1_000 + round * 100 + number:040x}"
+
+
+def fix_attempt(
+    finding_id: str = "finding-1",
+    *,
+    round: int = 1,
+    status: str = "fixed",
+    base_sha: str | None = None,
+) -> str:
+    commit = fixer_sha(finding_id, round)
+    base = base_sha or "b" * 40
+    path_number = finding_id.rsplit("-", maxsplit=1)[-1]
     return json.dumps(
         {
             "finding_id": finding_id,
             "round": round,
             "status": status,
-            "base_sha": "b" * 40,
-            "commit_sha": "d" * 40 if status == "fixed" else None,
-            "changed_paths": ["src/file1.py"] if status == "fixed" else [],
+            "base_sha": base,
+            "commit_sha": commit if status == "fixed" else None,
+            "changed_paths": [f"src/file{path_number}.py"] if status == "fixed" else [],
             "validation_results": [],
             "scope_expansion_required": (
                 {"paths": ["src/shared.py"], "reason": "Required."}
@@ -116,7 +134,7 @@ def re_review(
         {
             "finding_id": finding_id,
             "round": round,
-            "reviewed_commit_sha": "d" * 40,
+            "reviewed_commit_sha": fixer_sha(finding_id, round),
             "verdict": verdict,
             "rationale": "Checked the exact fix.",
             "evidence": [],
@@ -125,10 +143,16 @@ def re_review(
     )
 
 
-def escalation(reason: str, action: str = "block", *, round: int = 1) -> str:
+def escalation(
+    reason: str,
+    action: str = "block",
+    *,
+    round: int = 1,
+    finding_id: str = "finding-1",
+) -> str:
     return json.dumps(
         {
-            "finding_id": "finding-1",
+            "finding_id": finding_id,
             "round": round,
             "reason": reason,
             "action": action,
@@ -184,7 +208,13 @@ class FakeOrca:
     async def start_worker(self, **kwargs: object) -> tuple[str, str, JsonObject]:
         task_id = str(kwargs["task_id"])
         self.tasks_by_id[task_id]["status"] = "dispatched"
-        worktree_id = str(kwargs.get("worktree_id") or "repo::/tmp/issue")
+        requested = kwargs.get("worktree_id")
+        if requested is not None:
+            worktree_id = str(requested)
+        elif kwargs.get("parent_worktree_id") is not None:
+            worktree_id = f"repo::/tmp/{kwargs['lane_name']}"
+        else:
+            worktree_id = "repo::/tmp/issue"
         dispatch_id = f"dispatch-{len(self.starts) + 1}"
         self.starts.append({**kwargs, "dispatch_id": dispatch_id, "worktree_id": worktree_id})
         if self.fail_after_worker_start:
@@ -224,6 +254,25 @@ class FakeOrca:
             )
         self._refresh_ready()
 
+    def complete_task(self, task_id: str, body: str) -> None:
+        task = self.tasks_by_id[task_id]
+        task["status"] = "completed"
+        task["result"] = json.dumps(
+            {
+                "provenance": "worker_report",
+                "outcome": "succeeded",
+                "messageId": f"message-{task_id}",
+                "reportedBy": "terminal-1",
+                "subject": "done",
+                "body": body,
+                "completedBy": "terminal-1",
+                "filesModified": [],
+                "reportPath": None,
+                "completedAt": datetime.now(UTC).isoformat(),
+            }
+        )
+        self._refresh_ready()
+
     def _refresh_ready(self) -> None:
         for task_id, dependencies in self.dependencies.items():
             if self.tasks_by_id[task_id]["status"] != "pending":
@@ -232,16 +281,129 @@ class FakeOrca:
                 self.tasks_by_id[task_id]["status"] = "ready"
 
 
+class FakeGit(LocalGit):
+    def __init__(self) -> None:
+        self.heads: dict[str, str] = {"repo::/tmp/issue": "b" * 40}
+        self.integrated: dict[str, str] = {}
+        self.changed_override: list[str] | None = None
+        self.head_override: str | None = None
+        self.lane_head_override: str | None = None
+        self.conflict = False
+        self.crash_after_cherry_pick = False
+        self.integration_count = 0
+        self.commit_count_override: int | None = None
+        self.commit_chain_override: list[str] | None = None
+        self.validation_calls: list[list[str]] = []
+        self.clean_override: bool | None = None
+        self.lane_clean_override: bool | None = None
+        self.in_progress = False
+        self.pre_sequence_head: str | None = None
+        self.crash_mid_sequence = False
+        self.active_sequence_commits: list[str] | None = None
+        self.abort_calls = 0
+
+    async def head(self, worktree_id: str) -> str:
+        if worktree_id == "repo::/tmp/issue" and self.lane_head_override is not None:
+            return self.lane_head_override
+        if self.head_override is not None and "finding-" in worktree_id:
+            return self.head_override
+        if worktree_id in self.heads:
+            return self.heads[worktree_id]
+        for number in range(1, 10):
+            if f"finding-{number}" in worktree_id:
+                return fixer_sha(f"finding-{number}", 2 if "r2" in worktree_id else 1)
+        raise AssertionError(f"unexpected fake worktree: {worktree_id}")
+
+    async def changed_paths(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
+        if self.changed_override is not None and "finding-" in worktree_id:
+            return self.changed_override
+        for number in range(1, 10):
+            if f"finding-{number}" in worktree_id:
+                return [f"src/file{number}.py"]
+        return ["src/file1.py"]
+
+    async def resolve_ref(self, worktree_id: str, ref: str) -> str:
+        return "a" * 40
+
+    async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
+        return "c" * 64
+
+    async def is_ancestor(self, worktree_id: str, base_sha: str, head_sha: str) -> bool:
+        return True
+
+    async def commit_count(self, worktree_id: str, base_sha: str, head_sha: str) -> int:
+        return self.commit_count_override if self.commit_count_override is not None else 1
+
+    async def commits_between(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
+        return self.commit_chain_override or [head_sha]
+
+    async def is_clean(self, worktree_id: str) -> bool:
+        if worktree_id == "repo::/tmp/issue" and self.lane_clean_override is not None:
+            return self.lane_clean_override
+        if self.clean_override is not None and "finding-" in worktree_id:
+            return self.clean_override
+        return not self.in_progress if worktree_id == "repo::/tmp/issue" else True
+
+    async def cherry_pick(self, worktree_id: str, commit_sha: str) -> GitCommandResult:
+        return await self.cherry_pick_many(worktree_id, [commit_sha])
+
+    async def cherry_pick_many(self, worktree_id: str, commit_shas: list[str]) -> GitCommandResult:
+        self.pre_sequence_head = self.heads[worktree_id]
+        if self.conflict:
+            self.in_progress = True
+            self.active_sequence_commits = list(commit_shas)
+            return GitCommandResult(1, "", "conflict")
+        if self.crash_mid_sequence:
+            self.crash_mid_sequence = False
+            self.in_progress = True
+            self.active_sequence_commits = list(commit_shas)
+            self.heads[worktree_id] = "8" * 40
+            raise RuntimeError("crash mid cherry-pick sequence")
+        self.integration_count += 1
+        integrated_sha = f"{self.integration_count + 100:040x}"
+        self.heads[worktree_id] = integrated_sha
+        self.integrated[commit_shas[-1]] = integrated_sha
+        if self.crash_after_cherry_pick:
+            self.crash_after_cherry_pick = False
+            raise RuntimeError("crash after cherry-pick")
+        return GitCommandResult(0, "", "")
+
+    async def abort_cherry_pick(self, worktree_id: str) -> None:
+        self.abort_calls += 1
+        self.in_progress = False
+        self.active_sequence_commits = None
+        if self.pre_sequence_head is not None:
+            self.heads[worktree_id] = self.pre_sequence_head
+
+    async def cherry_pick_in_progress_commits(self, worktree_id: str) -> list[str] | None:
+        return self.active_sequence_commits if self.in_progress else None
+
+    async def find_cherry_pick(self, worktree_id: str, commit_sha: str) -> str | None:
+        return self.integrated.get(commit_sha)
+
+    async def validate(
+        self, worktree_id: str, requirements: list[ValidationRequirement]
+    ) -> list[ValidationResult]:
+        self.validation_calls.append([item.command for item in requirements])
+        return [
+            ValidationResult(command="pytest", status="passed", output="passed")
+            for _ in requirements
+        ]
+
+
 def controller(
     tmp_path: Path,
     orca: FakeOrca,
     *,
     graph_config: GraphConfig | None = None,
+    git: FakeGit | None = None,
 ) -> tuple[ExecutionController, StateStore]:
     store = StateStore(tmp_path / "state.sqlite3")
     store.setup()
     return (
-        ExecutionController(config=graph_config or config(), orca=orca, store=store),
+        ExecutionController(
+            config=graph_config or config(), orca=orca, store=store, git=git or FakeGit()
+        ),
         store,
     )
 
@@ -305,6 +467,65 @@ async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Pat
 
     assert result.status == "failed"
     assert result.findings == []
+
+
+async def test_initial_review_requires_the_clean_frozen_lane_head(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    git.lane_clean_override = False
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+
+
+async def test_initial_review_rejects_lane_head_drift(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    git.lane_head_override = "9" * 40
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+
+
+async def test_worker_revision_must_match_the_actual_lane_head(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_head_override = "9" * 40
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_result())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+    assert all(stage.role is not StageKind.INITIAL_REVIEWER for stage in result.stages)
+
+
+async def test_dirty_worker_checkout_cannot_freeze_a_review_revision(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_clean_override = False
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_result())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
 
 
 async def test_resolved_finding_converges_in_one_round(tmp_path: Path) -> None:
@@ -410,7 +631,7 @@ async def test_re_review_accepts_introduced_and_defers_unrelated_findings(
 
     phases = {item.finding_id: item.phase for item in result.findings}
     assert phases == {
-        "finding-1": FindingPhase.RESOLVED,
+        "finding-1": FindingPhase.PENDING_COMPOSITE,
         "finding-2": FindingPhase.FIXING,
         "finding-3": FindingPhase.DEFERRED,
     }
@@ -449,7 +670,7 @@ async def test_partial_re_review_discovery_replays_idempotently(tmp_path: Path) 
     result = await value.monitor(run_id)
 
     phases = {item.finding_id: item.phase for item in result.findings}
-    assert phases["finding-1"] is FindingPhase.RESOLVED
+    assert phases["finding-1"] is FindingPhase.PENDING_COMPOSITE
     assert phases["finding-2"] is FindingPhase.FIXING
     assert phases["finding-3"] is FindingPhase.DEFERRED
 
@@ -487,7 +708,7 @@ async def test_invalid_introduced_dependency_graph_escalates(
     assert result.findings[0].escalation_reason is FindingReason.AMBIGUOUS_RESULT
 
 
-async def test_finding_fanout_stays_serial_before_worktree_isolation(tmp_path: Path) -> None:
+async def test_disjoint_finding_fanout_uses_isolated_worktrees(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, _ = controller(tmp_path, orca, graph_config=config(max_workers=2, max_fixers=2))
     run_id = value.propose(proposal()).run_id
@@ -502,7 +723,357 @@ async def test_finding_fanout_stays_serial_before_worktree_isolation(tmp_path: P
     )
 
     fixer_starts = [item for item in orca.starts if "finding-" in str(item["lane_name"])]
+    assert len(fixer_starts) == 2
+    assert len({str(item["worktree_id"]) for item in fixer_starts}) == 2
+    assert all(item["parent_worktree_id"] == "repo::/tmp/issue" for item in fixer_starts)
+
+
+async def test_overlapping_finding_scopes_are_serialized(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca, graph_config=config(max_workers=2, max_fixers=2))
+    second = review_finding_data(2)
+    scope = second["allowed_write_scope"]
+    assert isinstance(scope, dict)
+    scope["paths"] = ["src/file1.py"]
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(1), second)
+
+    fixer_starts = [item for item in orca.starts if "finding-" in str(item["lane_name"])]
     assert len(fixer_starts) == 1
+
+
+async def test_out_of_scope_diff_is_rejected_and_escalated(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.changed_override = ["src/outside.py"]
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.ESCALATION
+    assert result.findings[0].escalation_reason is FindingReason.SCOPE_ESCAPE
+    scope_event = next(
+        item for item in store.events(run_id) if item["kind"] == "fixer_scope_checked"
+    )
+    payload = scope_event["payload"]
+    assert isinstance(payload, dict)
+    assert payload["actual_paths"] == ["src/outside.py"]
+
+
+async def test_exact_fixer_head_is_required_before_re_review(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.head_override = "9" * 40
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.ESCALATION
+    assert result.findings[0].escalation_reason is FindingReason.AMBIGUOUS_RESULT
+
+
+async def test_multi_commit_fixer_attempt_is_rejected_before_re_review(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.commit_count_override = 2
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.ESCALATION
+    assert result.findings[0].escalation_reason is FindingReason.AMBIGUOUS_RESULT
+
+
+async def test_dirty_fixer_worktree_is_rejected_before_re_review(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.clean_override = False
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.ESCALATION
+    assert result.findings[0].escalation_reason is FindingReason.AMBIGUOUS_RESULT
+
+
+async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(
+        tmp_path, orca, graph_config=config(max_workers=2, max_fixers=2), git=git
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    second = review_finding_data(2)
+    second["validation"] = [{"command": "pytest tests/test_two.py", "expected": "passes"}]
+    await advance_to_fixer(value, orca, run_id, review_finding_data(1), second)
+    fixer_starts = [item for item in orca.starts if "fixer" in str(item["lane_name"])]
+    for start in fixer_starts:
+        finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
+        orca.complete_task(str(start["task_id"]), fix_attempt(finding_id))
+    result = await value.monitor(run_id)
+    assert [item.role for item in result.started] == [StageKind.RE_REVIEWER], store.events(run_id)
+
+    first_stage = next(
+        item for item in store.stages(run_id) if item.orca_task_id == result.started[0].task_id
+    )
+    assert first_stage.finding_id is not None
+    orca.complete_task(
+        result.started[0].task_id,
+        re_review("resolved", finding_id=first_stage.finding_id),
+    )
+    result = await value.monitor(run_id)
+    assert [item.role for item in result.started] == [StageKind.RE_REVIEWER]
+    second_stage = next(
+        item for item in store.stages(run_id) if item.orca_task_id == result.started[0].task_id
+    )
+    assert second_stage.finding_id is not None
+    orca.complete_task(
+        result.started[0].task_id,
+        re_review("resolved", finding_id=second_stage.finding_id),
+    )
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    receipts = store.integrations(run_id)
+    assert [item.status for item in receipts] == ["integrated", "integrated"]
+    assert len({item.integrated_sha for item in receipts}) == 2
+    assert store.lanes(run_id)[0].integration_head_sha == receipts[-1].integrated_sha
+    assert git.validation_calls[-1] == ["pytest", "pytest tests/test_two.py"]
+
+
+async def test_introduced_regression_integrates_the_approved_composite_chain(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    original_commit = fixer_sha("finding-1", 1)
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    introduced = review_finding_data(2)
+    revision = introduced["review_revision"]
+    assert isinstance(revision, dict)
+    revision["head_sha"] = original_commit
+    introduced["validation"] = [{"command": "pytest tests/regression.py", "expected": "passes"}]
+    orca.complete_dispatched(
+        re_review(
+            "regression_introduced_by_fix",
+            new_findings=[{"origin": "introduced_by_fix", "finding": introduced}],
+        )
+    )
+    result = await value.monitor(run_id)
+    assert result.started[0].role is StageKind.FIXER
+    corrected_commit = fixer_sha("finding-2", 1)
+    git.commit_chain_override = [original_commit, corrected_commit]
+    orca.complete_dispatched(fix_attempt("finding-2", base_sha=original_commit))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    receipt = store.integrations(run_id)[0]
+    assert receipt.source_commits == [original_commit, corrected_commit]
+    assert receipt.source_finding_ids == ["finding-1", "finding-2"]
+    assert git.validation_calls[-1] == ["pytest", "pytest tests/regression.py"]
+
+
+async def test_integrated_receipt_replay_settles_every_composite_finding(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    original_commit = fixer_sha("finding-1", 1)
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    introduced = review_finding_data(2)
+    revision = introduced["review_revision"]
+    assert isinstance(revision, dict)
+    revision["head_sha"] = original_commit
+    orca.complete_dispatched(
+        re_review(
+            "regression_introduced_by_fix",
+            new_findings=[{"origin": "introduced_by_fix", "finding": introduced}],
+        )
+    )
+    await value.monitor(run_id)
+    corrected_commit = fixer_sha("finding-2", 1)
+    orca.complete_dispatched(fix_attempt("finding-2", base_sha=original_commit))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
+    current = next(item for item in store.findings(run_id) if item.finding_id == "finding-2")
+    git.commit_chain_override = [original_commit, corrected_commit]
+    store.begin_integration(
+        run_id,
+        current,
+        fixer_commit_sha=corrected_commit,
+        source_commits=[original_commit, corrected_commit],
+        source_finding_ids=["finding-1", "finding-2"],
+        base_sha="b" * 40,
+    )
+    store.finish_integration(
+        run_id,
+        current,
+        status="integrated",
+        integrated_sha="f" * 40,
+        validation_results=[],
+    )
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert all(item.phase is FindingPhase.RESOLVED for item in result.findings)
+
+
+async def test_deferring_introduced_regression_defers_its_composite_predecessor(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    original_commit = fixer_sha("finding-1", 1)
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    introduced = review_finding_data(2)
+    revision = introduced["review_revision"]
+    assert isinstance(revision, dict)
+    revision["head_sha"] = original_commit
+    orca.complete_dispatched(
+        re_review(
+            "regression_introduced_by_fix",
+            new_findings=[{"origin": "introduced_by_fix", "finding": introduced}],
+        )
+    )
+    await value.monitor(run_id)
+    orca.complete_dispatched(
+        fix_attempt("finding-2", status="blocked_scope", base_sha=original_commit)
+    )
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("scope_escape", action="defer", finding_id="finding-2"))
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert {item.finding_id: item.phase for item in result.findings} == {
+        "finding-1": FindingPhase.DEFERRED,
+        "finding-2": FindingPhase.DEFERRED,
+    }
+
+
+async def test_integration_conflict_maps_to_the_finding(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    assert store.integrations(run_id)[0].status == "conflict"
+
+
+async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.crash_after_cherry_pick = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+
+    with pytest.raises(RuntimeError, match="crash after cherry-pick"):
+        await value.monitor(run_id)
+
+    restarted = ExecutionController(config=config(), orca=orca, store=store, git=git)
+    result = await restarted.monitor(run_id)
+    assert result.status == "complete"
+    assert store.integrations(run_id)[0].status == "integrated"
+
+
+async def test_restart_aborts_partial_composite_then_retries_from_reserved_base(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.crash_mid_sequence = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+
+    with pytest.raises(RuntimeError, match="crash mid cherry-pick sequence"):
+        await value.monitor(run_id)
+    assert git.in_progress
+
+    restarted = ExecutionController(config=config(), orca=orca, store=store, git=git)
+    result = await restarted.monitor(run_id)
+
+    assert result.status == "complete"
+    assert not git.in_progress
+    assert store.integrations(run_id)[0].status == "integrated"
+
+
+async def test_restart_does_not_abort_an_unrelated_cherry_pick(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.crash_mid_sequence = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    with pytest.raises(RuntimeError, match="crash mid cherry-pick sequence"):
+        await value.monitor(run_id)
+    git.active_sequence_commits = ["9" * 40]
+
+    restarted = ExecutionController(config=config(), orca=orca, store=store, git=git)
+    result = await restarted.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    assert git.abort_calls == 0
+    assert git.in_progress
+    assert store.integrations(run_id)[0].status == "conflict"
 
 
 async def test_restart_reconciliation_does_not_duplicate_tasks_or_receipts(tmp_path: Path) -> None:

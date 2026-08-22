@@ -12,7 +12,7 @@ from kasgraph.models import (
     StagePhase,
     SupervisorPlan,
 )
-from kasgraph.store import StateStore, UnsupportedStateError
+from kasgraph.store import IntegrationBusyError, StateStore, UnsupportedStateError
 from tests.factories import initial_review_report_json, review_finding_data
 
 
@@ -28,6 +28,7 @@ def sample_proposal() -> SupervisorPlan:
                     "name": "issue-123",
                     "issue_id": "ISSUE-123",
                     "repo_selector": "id:repo",
+                    "base_ref": "main",
                     "dependencies": [],
                     "prompt": "Implement ISSUE-123.",
                     "stop_condition": "Tests pass.",
@@ -125,6 +126,62 @@ def test_stage_start_reservation_atomically_enforces_global_capacity(tmp_path: P
 
     store.reset_stage_reservation(run_id, store.stages(run_id)[0])
     assert store.active_worker_count() == 0
+
+
+def test_lane_integration_reservation_is_serial(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "integration.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    report = InitialReviewReport.model_validate_json(
+        initial_review_report_json(review_finding_data(1), review_finding_data(2))
+    )
+    store.record_initial_review(run_id, lane.lane_id, report)
+    first, second = store.findings(run_id)
+
+    first_receipt = store.begin_integration(
+        run_id,
+        first,
+        fixer_commit_sha="d" * 40,
+        source_commits=["d" * 40],
+        source_finding_ids=["finding-1"],
+        base_sha="b" * 40,
+    )
+    replayed = store.begin_integration(
+        run_id,
+        first,
+        fixer_commit_sha="d" * 40,
+        source_commits=["d" * 40],
+        source_finding_ids=["finding-1"],
+        base_sha="b" * 40,
+    )
+    assert replayed.integration_id == first_receipt.integration_id
+    with pytest.raises(IntegrationBusyError, match="integrating another finding"):
+        store.begin_integration(
+            run_id,
+            second,
+            fixer_commit_sha="e" * 40,
+            source_commits=["e" * 40],
+            source_finding_ids=["finding-2"],
+            base_sha="b" * 40,
+        )
+
+    store.finish_integration(
+        run_id,
+        first,
+        status="integrated",
+        integrated_sha="f" * 40,
+        validation_results=[],
+    )
+    receipt = store.begin_integration(
+        run_id,
+        second,
+        fixer_commit_sha="e" * 40,
+        source_commits=["e" * 40],
+        source_finding_ids=["finding-2"],
+        base_sha="f" * 40,
+    )
+    assert receipt.status == "starting"
 
 
 def test_store_rejects_duplicate_accept_unknown_rows_and_changed_bindings(

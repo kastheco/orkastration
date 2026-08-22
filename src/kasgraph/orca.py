@@ -157,6 +157,8 @@ class OrcaClient:
         repo_selector: str,
         worktree_id: str | None,
         profile: AgentProfile,
+        base_ref: str | None = None,
+        parent_worktree_id: str | None = None,
     ) -> tuple[str, str, JsonObject]:
         """Start one supervised worker with an explicit model and effort."""
 
@@ -166,15 +168,18 @@ class OrcaClient:
                 lane_name=lane_name,
                 repo_selector=repo_selector,
                 worktree_id=worktree_id,
+                base_ref=base_ref,
+                parent_worktree_id=parent_worktree_id,
                 profile=profile,
             )
 
         arguments = ["orchestration", "worker-start", "--task", task_id]
         if worktree_id is None:
+            placement = "new-child" if parent_worktree_id is not None else "new-top-level"
             arguments.extend(
                 (
                     "--worktree",
-                    "new-top-level",
+                    placement,
                     "--repo",
                     repo_selector,
                     "--name",
@@ -183,6 +188,8 @@ class OrcaClient:
                     "run",
                 )
             )
+            if base_ref is not None:
+                arguments.extend(("--base-branch", base_ref))
         else:
             arguments.extend(("--worktree", f"id:{worktree_id}"))
         arguments.extend(
@@ -210,24 +217,24 @@ class OrcaClient:
         lane_name: str,
         repo_selector: str,
         worktree_id: str | None,
+        base_ref: str | None,
+        parent_worktree_id: str | None,
         profile: AgentProfile,
     ) -> tuple[str, str, JsonObject]:
         """Launch fast provider argv, then attach it to a supervised Dispatch."""
 
         resolved_worktree = worktree_id
         if resolved_worktree is None:
-            worktree_response = await self._ok(
-                "worktree",
-                "create",
-                "--name",
-                lane_name,
-                "--no-parent",
-                "--repo",
-                repo_selector,
-                "--setup",
-                "run",
-                "--json",
-            )
+            arguments = ["worktree", "create", "--name", lane_name]
+            if parent_worktree_id is None:
+                arguments.append("--no-parent")
+            else:
+                arguments.extend(("--parent-worktree", f"id:{parent_worktree_id}"))
+            arguments.extend(("--repo", repo_selector, "--setup", "run"))
+            if base_ref is not None:
+                arguments.extend(("--base-branch", base_ref))
+            arguments.append("--json")
+            worktree_response = await self._ok(*arguments)
             resolved_worktree = _worktree_id(worktree_response)
 
         terminal_response = await self._ok(

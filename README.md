@@ -111,11 +111,20 @@ are recorded as deferred instead of reopening the full review. Version 1 YAML is
 intentionally unsupported. An accepted database from the fixed-stage scheduler
 fails with an explicit unsupported-state error instead of resuming incorrectly.
 
-Fixer worktree isolation, deterministic path-scope rejection, serial commit
-integration, publication, and remote CI belong to the remaining delivery slices
-and are not live yet. The scheduler reserves capacity atomically and currently
-starts at most one fixer per lane; KAS-571 can raise that toward the configured
-ceiling after it supplies isolated worktrees and overlap checks.
+Every ready fixer receives an isolated Orca child worktree at its exact assigned
+base SHA. Literal path boundaries are checked against Git's actual changed paths
+before re-review. Disjoint findings may use the configured per-lane concurrency
+ceiling; overlapping directory or file boundaries are serialized. Symbol scopes
+remain advisory until an explicit language adapter is installed, while path
+scope is always the hard portable boundary.
+
+Re-review runs in the fixer worktree at the exact reported commit. Only a
+resolved verdict reserves that commit for serial `cherry-pick -x` integration
+into the lane checkout. Kasgraph refuses dirty integration checkouts, aborts its
+own conflicting cherry-pick without resetting unrelated work, runs validation
+commands without a shell, and persists the base SHA, fixer SHA, integrated SHA,
+validation output, and conflict state. Publication and remote CI remain later
+delivery slices and are not live yet.
 
 Inspect the generated agent-result contracts with:
 
@@ -199,12 +208,16 @@ uv run kasgraph snapshot --json
 uv run kasgraph show <run-id> --json
 ```
 
-Every lane begins in one independent top-level Orca worktree. The worker result
-starts one full changeset review. A clean review completes the lane without a
-fixer. Otherwise, each frozen finding receives its own bounded fixer/re-review
-loop with stable IDs and persisted evidence. Every agent reports through Orca
-`worker_done`; structured stages put only their JSON contract in the report body,
-which Kasgraph validates before advancing.
+Every lane begins in one independent top-level Orca worktree at the proposal's
+required `base_ref`. The worker result must report that ref's exact resolved SHA,
+then freezes the review head and the
+initial integration head before one full changeset review. A clean review
+completes the lane without a fixer. Otherwise, each frozen finding receives its
+own bounded isolated fixer/re-review loop with stable IDs and persisted evidence.
+`kasgraph show` includes the final integrated head and every contributing
+integration receipt. Every agent reports through Orca `worker_done`; structured
+stages put only their JSON contract in the report body, which Kasgraph validates
+before advancing.
 
 ## Verification
 

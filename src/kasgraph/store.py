@@ -19,6 +19,7 @@ from kasgraph.models import (
     FindingRecord,
     FixAttempt,
     InitialReviewReport,
+    IntegrationRecord,
     LanePhase,
     LaneRecord,
     OrcaWorkerResult,
@@ -29,12 +30,18 @@ from kasgraph.models import (
     StagePhase,
     StageRecord,
     SupervisorPlan,
+    ValidationResult,
     WorkerResult,
 )
+from kasgraph.scope import scopes_overlap
 
 
 class UnsupportedStateError(RuntimeError):
     """Raised when an accepted fixed-DAG database cannot resume safely."""
+
+
+class IntegrationBusyError(RuntimeError):
+    """Raised when another approved commit owns a lane's integration lock."""
 
 
 FindingOrigin = Literal["initial_review", "introduced_by_fix", "unrelated"]
@@ -58,6 +65,32 @@ class StateStore:
             }
             if "orca_run_id" not in columns:
                 connection.execute("ALTER TABLE supervisor_runs ADD COLUMN orca_run_id TEXT")
+            lane_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(lanes)").fetchall()
+            }
+            for name, declaration in (
+                ("base_ref", "TEXT NOT NULL DEFAULT 'HEAD'"),
+                ("review_head_sha", "TEXT"),
+                ("integration_head_sha", "TEXT"),
+            ):
+                if name not in lane_columns:
+                    connection.execute(f"ALTER TABLE lanes ADD COLUMN {name} {declaration}")
+            stage_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(workflow_stages)").fetchall()
+            }
+            if "worktree_id" not in stage_columns:
+                connection.execute("ALTER TABLE workflow_stages ADD COLUMN worktree_id TEXT")
+            integration_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(integrations)").fetchall()
+            }
+            for name in ("source_commits_json", "source_finding_ids_json"):
+                if name not in integration_columns:
+                    connection.execute(
+                        f"ALTER TABLE integrations ADD COLUMN {name} TEXT NOT NULL DEFAULT '[]'"
+                    )
             accepted = connection.execute(
                 """
                 SELECT runs.run_id FROM supervisor_runs AS runs
@@ -100,9 +133,9 @@ class StateStore:
                 connection.execute(
                     """
                     INSERT INTO lanes
-                        (lane_id, run_id, name, issue_id, repo_selector, agent_id, phase,
-                         worktree_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'graph', ?, NULL, ?, ?)
+                        (lane_id, run_id, name, issue_id, repo_selector, base_ref, agent_id, phase,
+                         worktree_id, review_head_sha, integration_head_sha, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'graph', ?, NULL, NULL, NULL, ?, ?)
                     """,
                     (
                         lane_id,
@@ -110,6 +143,7 @@ class StateStore:
                         lane.name,
                         lane.issue_id,
                         lane.repo_selector,
+                        lane.base_ref,
                         LanePhase.PROPOSED.value,
                         now,
                         now,
@@ -277,7 +311,7 @@ class StateStore:
         now = _now()
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT lane_id, orca_dispatch_id FROM workflow_stages WHERE stage_id = ?",
+                "SELECT lane_id, role, orca_dispatch_id FROM workflow_stages WHERE stage_id = ?",
                 (stage_id,),
             ).fetchone()
             if row is None:
@@ -290,15 +324,17 @@ class StateStore:
             lane_id = str(row["lane_id"])
             connection.execute(
                 """
-                UPDATE workflow_stages SET phase = ?, orca_dispatch_id = ?, updated_at = ?
+                UPDATE workflow_stages SET phase = ?, orca_dispatch_id = ?, worktree_id = ?,
+                    updated_at = ?
                 WHERE stage_id = ?
                 """,
-                (StagePhase.DISPATCHED.value, dispatch_id, now, stage_id),
+                (StagePhase.DISPATCHED.value, dispatch_id, worktree_id, now, stage_id),
             )
-            connection.execute(
-                "UPDATE lanes SET phase = ?, worktree_id = ?, updated_at = ? WHERE lane_id = ?",
-                (LanePhase.ACTIVE.value, worktree_id, now, lane_id),
-            )
+            if str(row["role"]) == StageKind.WORKER.value:
+                connection.execute(
+                    "UPDATE lanes SET phase = ?, worktree_id = ?, updated_at = ? WHERE lane_id = ?",
+                    (LanePhase.ACTIVE.value, worktree_id, now, lane_id),
+                )
             self._event(connection, run_id, lane_id, "stage_started", payload)
 
     def reserve_stage_start(
@@ -309,6 +345,7 @@ class StateStore:
         max_workers: int,
         max_lanes: int,
         max_lane_fixers: int,
+        write_paths: tuple[str, ...] = (),
     ) -> bool:
         """Atomically reserve global, lane, and fixer capacity before an external start."""
 
@@ -354,6 +391,21 @@ class StateStore:
                 )
                 if lane_fixers >= max_lane_fixers:
                     return False
+                active_finders = connection.execute(
+                    """
+                    SELECT findings.effective_contract_json FROM workflow_stages
+                    JOIN findings USING (finding_key)
+                    WHERE workflow_stages.lane_id = ? AND workflow_stages.role = ?
+                      AND workflow_stages.phase IN (?, ?)
+                    """,
+                    (stage.lane_id, StageKind.FIXER.value, *active_phases),
+                ).fetchall()
+                for row in active_finders:
+                    contract = ReviewFinding.model_validate_json(
+                        str(row["effective_contract_json"])
+                    )
+                    if scopes_overlap(write_paths, tuple(contract.allowed_write_scope.paths)):
+                        return False
             elif stage.lane_id in active_lanes:
                 return False
             changed = connection.execute(
@@ -548,6 +600,18 @@ class StateStore:
                     lane_id,
                     "worker_result_frozen",
                     result.model_dump(mode="json"),
+                )
+                connection.execute(
+                    """
+                    UPDATE lanes SET review_head_sha = ?, integration_head_sha = ?, updated_at = ?
+                    WHERE lane_id = ?
+                    """,
+                    (
+                        result.review_revision.head_sha,
+                        result.review_revision.head_sha,
+                        now,
+                        lane_id,
+                    ),
                 )
 
     def worker_result(self, lane_id: str) -> WorkerResult:
@@ -770,6 +834,194 @@ class StateStore:
                 (finding_key,),
             ).fetchone()
         return None if row is None else FixAttempt.model_validate_json(str(row["payload_json"]))
+
+    def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
+        """Return the effective primary or fallback attempt for one semantic round."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM fix_attempts
+                WHERE finding_key = ? AND round = ?
+                ORDER BY CASE attempt_kind WHEN 'fallback' THEN 1 ELSE 0 END DESC LIMIT 1
+                """,
+                (finding_key, round),
+            ).fetchone()
+        return None if row is None else FixAttempt.model_validate_json(str(row["payload_json"]))
+
+    def record_scope_check(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        *,
+        declared_paths: list[str],
+        actual_paths: list[str],
+        accepted: bool,
+    ) -> None:
+        """Persist deterministic path-scope evidence for a fixer result."""
+
+        self._append_event(
+            run_id,
+            finding.lane_id,
+            "fixer_scope_checked",
+            {
+                "finding_id": finding.finding_id,
+                "round": finding.round,
+                "declared_paths": declared_paths,
+                "actual_paths": actual_paths,
+                "accepted": accepted,
+            },
+        )
+
+    def integration(self, finding_key: str, round: int) -> IntegrationRecord | None:
+        """Return serial integration state for restart reconciliation."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM integrations WHERE finding_key = ? AND round = ?",
+                (finding_key, round),
+            ).fetchone()
+        return None if row is None else _integration(row)
+
+    def integrations(self, run_id: str) -> list[IntegrationRecord]:
+        """Return every integration receipt for one run in stable order."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT integrations.* FROM integrations JOIN lanes USING (lane_id)
+                WHERE lanes.run_id = ? ORDER BY integrations.created_at, integration_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [_integration(row) for row in rows]
+
+    def begin_integration(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        *,
+        fixer_commit_sha: str,
+        source_commits: list[str],
+        source_finding_ids: list[str],
+        base_sha: str,
+    ) -> IntegrationRecord:
+        """Reserve one approved commit for serial lane integration."""
+
+        now = _now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM integrations WHERE finding_key = ? AND round = ?",
+                (finding.finding_key, finding.round),
+            ).fetchone()
+            if existing is not None:
+                record = _integration(existing)
+                if record.fixer_commit_sha != fixer_commit_sha or record.base_sha != base_sha:
+                    raise ValueError("integration identity changed after reservation")
+                if (
+                    record.source_commits != source_commits
+                    or record.source_finding_ids != source_finding_ids
+                ):
+                    raise ValueError("integration sources changed after reservation")
+                return record
+            active = connection.execute(
+                """
+                SELECT finding_key FROM integrations
+                WHERE lane_id = ? AND status = 'starting' LIMIT 1
+                """,
+                (finding.lane_id,),
+            ).fetchone()
+            if active is not None:
+                raise IntegrationBusyError(f"lane {finding.lane_id} is integrating another finding")
+            integration_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO integrations
+                    (integration_id, finding_key, lane_id, round, fixer_commit_sha,
+                     source_commits_json, source_finding_ids_json, base_sha, integrated_sha,
+                     status, validation_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'starting', '[]', ?, ?)
+                """,
+                (
+                    integration_id,
+                    finding.finding_key,
+                    finding.lane_id,
+                    finding.round,
+                    fixer_commit_sha,
+                    json.dumps(source_commits),
+                    json.dumps(source_finding_ids),
+                    base_sha,
+                    now,
+                    now,
+                ),
+            )
+            self._event(
+                connection,
+                run_id,
+                finding.lane_id,
+                "integration_started",
+                {"finding_id": finding.finding_id, "commit_sha": fixer_commit_sha},
+            )
+            row = connection.execute(
+                "SELECT * FROM integrations WHERE integration_id = ?", (integration_id,)
+            ).fetchone()
+        assert row is not None
+        return _integration(row)
+
+    def finish_integration(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        *,
+        status: Literal["integrated", "conflict", "validation_failed"],
+        integrated_sha: str | None,
+        validation_results: list[ValidationResult],
+    ) -> None:
+        """Settle an integration and advance the auditable lane head when accepted."""
+
+        now = _now()
+        with self._connection() as connection:
+            changed = connection.execute(
+                """
+                UPDATE integrations SET status = ?, integrated_sha = ?, validation_json = ?,
+                    updated_at = ? WHERE finding_key = ? AND round = ? AND status = 'starting'
+                """,
+                (
+                    status,
+                    integrated_sha,
+                    json.dumps([item.model_dump(mode="json") for item in validation_results]),
+                    now,
+                    finding.finding_key,
+                    finding.round,
+                ),
+            ).rowcount
+            if not changed:
+                existing = connection.execute(
+                    "SELECT * FROM integrations WHERE finding_key = ? AND round = ?",
+                    (finding.finding_key, finding.round),
+                ).fetchone()
+                if existing is None or _integration(existing).status != status:
+                    raise ValueError("integration changed after settlement")
+                return
+            if status in {"integrated", "validation_failed"}:
+                if integrated_sha is None:
+                    raise ValueError("applied integration receipt requires a head SHA")
+                connection.execute(
+                    "UPDATE lanes SET integration_head_sha = ?, updated_at = ? WHERE lane_id = ?",
+                    (integrated_sha, now, finding.lane_id),
+                )
+            self._event(
+                connection,
+                run_id,
+                finding.lane_id,
+                "integration_settled",
+                {
+                    "finding_id": finding.finding_id,
+                    "status": status,
+                    "integrated_sha": integrated_sha,
+                },
+            )
 
     def mark_released(self, run_id: str, stage_id: str) -> None:
         """Record that Orca released a settled worker terminal."""
@@ -1039,7 +1291,8 @@ CREATE TABLE IF NOT EXISTS supervisor_runs (
 CREATE TABLE IF NOT EXISTS lanes (
     lane_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES supervisor_runs(run_id),
     name TEXT NOT NULL, issue_id TEXT NOT NULL, repo_selector TEXT NOT NULL,
-    agent_id TEXT NOT NULL DEFAULT 'graph', phase TEXT NOT NULL, worktree_id TEXT,
+    base_ref TEXT NOT NULL DEFAULT 'HEAD', agent_id TEXT NOT NULL DEFAULT 'graph',
+    phase TEXT NOT NULL, worktree_id TEXT, review_head_sha TEXT, integration_head_sha TEXT,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(run_id, name)
 );
 CREATE TABLE IF NOT EXISTS lane_stages (
@@ -1060,7 +1313,8 @@ CREATE TABLE IF NOT EXISTS workflow_stages (
     lane_id TEXT NOT NULL REFERENCES lanes(lane_id), role TEXT NOT NULL,
     finding_key TEXT REFERENCES findings(finding_key), finding_id TEXT, round INTEGER,
     attempt_kind TEXT, phase TEXT NOT NULL, orca_task_id TEXT UNIQUE,
-    orca_dispatch_id TEXT UNIQUE, result_json TEXT, processed INTEGER NOT NULL DEFAULT 0,
+    orca_dispatch_id TEXT UNIQUE, worktree_id TEXT, result_json TEXT,
+    processed INTEGER NOT NULL DEFAULT 0,
     released INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS initial_reviews (
@@ -1092,6 +1346,17 @@ CREATE TABLE IF NOT EXISTS lifecycle_receipts (
     receipt_id TEXT PRIMARY KEY, stage_id TEXT NOT NULL UNIQUE REFERENCES workflow_stages(stage_id),
     orca_task_id TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS integrations (
+    integration_id TEXT PRIMARY KEY,
+    finding_key TEXT NOT NULL REFERENCES findings(finding_key),
+    lane_id TEXT NOT NULL REFERENCES lanes(lane_id), round INTEGER NOT NULL,
+    fixer_commit_sha TEXT NOT NULL, base_sha TEXT NOT NULL, integrated_sha TEXT,
+    source_commits_json TEXT NOT NULL DEFAULT '[]',
+    source_finding_ids_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL, validation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(finding_key, round)
+);
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES supervisor_runs(run_id),
     lane_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -1117,8 +1382,15 @@ def _lane(row: sqlite3.Row) -> LaneRecord:
         name=str(row["name"]),
         issue_id=str(row["issue_id"]),
         repo_selector=str(row["repo_selector"]),
+        base_ref=str(row["base_ref"]),
         phase=LanePhase(str(row["phase"])),
         worktree_id=str(row["worktree_id"]) if row["worktree_id"] is not None else None,
+        review_head_sha=(
+            str(row["review_head_sha"]) if row["review_head_sha"] is not None else None
+        ),
+        integration_head_sha=(
+            str(row["integration_head_sha"]) if row["integration_head_sha"] is not None else None
+        ),
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
     )
@@ -1139,6 +1411,7 @@ def _stage(row: sqlite3.Row) -> StageRecord:
         orca_dispatch_id=(
             str(row["orca_dispatch_id"]) if row["orca_dispatch_id"] is not None else None
         ),
+        worktree_id=str(row["worktree_id"]) if row["worktree_id"] is not None else None,
         result_json=str(row["result_json"]) if row["result_json"] is not None else None,
         processed=bool(row["processed"]),
         released=bool(row["released"]),
@@ -1162,6 +1435,27 @@ def _finding(row: sqlite3.Row) -> FindingRecord:
             if row["escalation_reason"] is not None
             else None
         ),
+        created_at=datetime.fromisoformat(str(row["created_at"])),
+        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+    )
+
+
+def _integration(row: sqlite3.Row) -> IntegrationRecord:
+    return IntegrationRecord(
+        integration_id=str(row["integration_id"]),
+        finding_key=str(row["finding_key"]),
+        lane_id=str(row["lane_id"]),
+        round=int(row["round"]),
+        fixer_commit_sha=str(row["fixer_commit_sha"]),
+        source_commits=[str(item) for item in json.loads(str(row["source_commits_json"]))],
+        source_finding_ids=[str(item) for item in json.loads(str(row["source_finding_ids_json"]))],
+        base_sha=str(row["base_sha"]),
+        integrated_sha=(str(row["integrated_sha"]) if row["integrated_sha"] is not None else None),
+        status=str(row["status"]),
+        validation_results=[
+            ValidationResult.model_validate(item)
+            for item in json.loads(str(row["validation_json"]))
+        ],
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
     )

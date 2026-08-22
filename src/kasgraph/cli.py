@@ -15,6 +15,7 @@ from pydantic import BaseModel, ValidationError
 from kasgraph import __version__
 from kasgraph.config import ConfigError, Settings
 from kasgraph.execution import ExecutionController
+from kasgraph.git import GitError
 from kasgraph.models import SupervisorPlan, workflow_contract_schemas
 from kasgraph.orca import OrcaClient, OrcaError, SubprocessRunner
 from kasgraph.planner import (
@@ -178,6 +179,9 @@ def show_graph(
             "lanes": [lane.model_dump(mode="json") for lane in store.lanes(run_id)],
             "stages": [stage.model_dump(mode="json") for stage in store.stages(run_id)],
             "findings": [finding.model_dump(mode="json") for finding in store.findings(run_id)],
+            "integrations": [
+                receipt.model_dump(mode="json") for receipt in store.integrations(run_id)
+            ],
         }
     except (ConfigError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
@@ -235,6 +239,7 @@ def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
         result = asyncio.run(awaitable)
     except (
         ConfigError,
+        GitError,
         OrcaError,
         PlannerError,
         UnsupportedStateError,

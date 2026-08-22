@@ -76,6 +76,7 @@ class FindingPhase(StrEnum):
     FIXING = "fixing"
     PENDING_RE_REVIEW = "pending_re_review"
     RE_REVIEWING = "re_reviewing"
+    PENDING_COMPOSITE = "pending_composite"
     PENDING_ESCALATION = "pending_escalation"
     ESCALATING = "escalating"
     RESOLVED = "resolved"
@@ -90,6 +91,8 @@ class FindingReason(StrEnum):
     SCOPE_ESCAPE = "scope_escape"
     AMBIGUOUS_RESULT = "ambiguous_result"
     ROUNDS_EXHAUSTED = "rounds_exhausted"
+    INTEGRATION_CONFLICT = "integration_conflict"
+    VALIDATION_FAILED = "validation_failed"
 
 
 class LaneProposal(BaseModel):
@@ -100,6 +103,7 @@ class LaneProposal(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{2,63}$")
     issue_id: str = Field(min_length=1, max_length=80)
     repo_selector: str = Field(min_length=1, max_length=256)
+    base_ref: str = Field(min_length=1, max_length=512)
     dependencies: list[str] = Field(max_length=32)
     prompt: str = Field(min_length=1, max_length=12_000)
     stop_condition: str = Field(min_length=1, max_length=2_000)
@@ -193,6 +197,13 @@ class AllowedWriteScope(WorkflowContract):
             raise ValueError("allowed write paths must be unique")
         if len(self.symbols) != len(set(self.symbols)):
             raise ValueError("allowed write symbols must be unique")
+        for path in self.paths:
+            if (
+                path.startswith("/")
+                or ".." in path.split("/")
+                or any(marker in path for marker in ("*", "?", "["))
+            ):
+                raise ValueError("allowed write paths must be relative literal boundaries")
         return self
 
 
@@ -368,7 +379,13 @@ class EscalationDecision(WorkflowContract):
 
     finding_id: FindingId
     round: int = Field(ge=1, le=2)
-    reason: Literal["scope_escape", "ambiguous_result", "rounds_exhausted"]
+    reason: Literal[
+        "scope_escape",
+        "ambiguous_result",
+        "rounds_exhausted",
+        "integration_conflict",
+        "validation_failed",
+    ]
     action: Literal["approve_scope_revision", "defer", "block"]
     rationale: str = Field(min_length=1, max_length=4_000)
     revised_finding: ReviewFinding | None = None
@@ -491,8 +508,11 @@ class LaneRecord(BaseModel):
     name: str
     issue_id: str
     repo_selector: str
+    base_ref: str
     phase: LanePhase
     worktree_id: str | None
+    review_head_sha: GitObjectId | None
+    integration_head_sha: GitObjectId | None
     created_at: datetime
     updated_at: datetime
 
@@ -512,6 +532,7 @@ class StageRecord(BaseModel):
     phase: StagePhase
     orca_task_id: str | None
     orca_dispatch_id: str | None
+    worktree_id: str | None
     result_json: str | None
     processed: bool
     released: bool
@@ -568,6 +589,26 @@ class FindingRecord(BaseModel):
     phase: FindingPhase
     round: int
     escalation_reason: FindingReason | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class IntegrationRecord(BaseModel):
+    """Auditable serial integration state for one approved finding commit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    integration_id: str
+    finding_key: str
+    lane_id: str
+    round: int
+    fixer_commit_sha: GitObjectId
+    source_commits: list[GitObjectId]
+    source_finding_ids: list[FindingId]
+    base_sha: GitObjectId
+    integrated_sha: GitObjectId | None
+    status: Literal["starting", "integrated", "conflict", "validation_failed"]
+    validation_results: list[ValidationResult]
     created_at: datetime
     updated_at: datetime
 

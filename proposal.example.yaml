@@ -9,6 +9,7 @@ lanes:
   - name: kas-501-search-filters
     issue_id: KAS-501
     repo_selector: path:/home/kas/dev/kashh
+    base_ref: main
     dependencies:
       - KAS-492
     prompt: >-
@@ -21,6 +22,7 @@ lanes:
   - name: kas-502-activity-copy
     issue_id: KAS-502
     repo_selector: path:/home/kas/dev/kashh
+    base_ref: main
     dependencies: []
     prompt: >-
       Implement the accepted activity-copy update from KAS-502 without changing

@@ -19,7 +19,7 @@ accepted execution graph and its monitoring.
    of the same parallel wave. Resolve the target repository and check for likely
    file or migration collisions before calling lanes independent.
 3. Present a compact proposal grouped by project. For every lane show the issue,
-   repo, completed dependencies, task boundary, and stop condition. Resolve any
+   repo, explicit base ref, completed dependencies, task boundary, and stop condition. Resolve any
    material ambiguity with the owner before recording it.
 4. When the current session already has the required connector evidence, write
    the proposal shape to a temporary YAML file using `proposal.example.yaml`, then run:
@@ -66,10 +66,19 @@ uv run kasgraph monitor <run-id> --watch --interval 5 --json
 
 Kasgraph validates the structured result stored by Orca after `worker_done`,
 releases settled terminals, freezes the initial findings, and starts only the
-next eligible per-finding fixer, re-reviewer, or escalation stage. Stable finding
-IDs, round bounds, capability fallback, and deferred unrelated findings survive
-monitor restarts. If the session must remain interactive, call `monitor
-<run-id> --json` at checkpoints instead.
+next eligible per-finding fixer, re-reviewer, or escalation stage. Fixers run in
+isolated child worktrees at exact SHAs. Only disjoint literal path scopes run in
+parallel; overlapping scopes serialize. Re-review is pinned to the fixer
+worktree and commit, and only resolved commits integrate serially into the lane
+checkout. Stable finding IDs, round bounds, capability fallback, integration
+receipts, and deferred unrelated findings survive monitor restarts. If the
+session must remain interactive, call `monitor <run-id> --json` at checkpoints
+instead.
+
+Treat `integration_conflict` and `validation_failed` as finding-scoped
+escalations. Never clean or reset a dirty lane checkout on Kasgraph's behalf.
+Inspect `kasgraph show <run-id> --json` for the frozen review head, current
+integration head, exact fixer commits, and validation receipts.
 
 On `blocked` or `failed`, inspect the Orca Task/Dispatch evidence before proposing
 recovery. On `complete`, summarize the exact lane results and update Linear or
