@@ -452,6 +452,13 @@ def test_settling_a_finding_records_the_decision_and_retires_its_live_stage(
     retired = next(item for item in store.stages(run_id) if item.stage_id == stage.stage_id)
     assert retired.processed
     assert retired.stage_key != "escalate:1"
+    # The dispatch loop starts from READY and reads neither `processed` nor the
+    # key, so leaving the phase alone only postponed the re-adjudication until a
+    # slot opened up.
+    assert retired.phase is StagePhase.BLOCKED
+    assert not store.reserve_stage_start(
+        run_id, retired, max_workers=4, max_lanes=4, max_lane_fixers=2
+    )
 
 
 def test_a_finding_cannot_be_settled_into_a_phase_that_is_not_a_decision(
