@@ -99,6 +99,50 @@ async def test_tasks_and_release_worker() -> None:
     )
 
 
+async def test_worker_turns_returns_bounded_signatures_not_the_transcript() -> None:
+    """The caller is asking whether turns differ, not what they said.
+
+    Returning the text would put a stalled agent's whole conversation into the
+    supervisor's, which is the cost this reading exists to avoid.
+    """
+
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "transcript": {
+                        "messages": [
+                            {"role": "user", "blocks": [{"type": "text", "text": "go"}]},
+                            {
+                                "role": "assistant",
+                                "blocks": [
+                                    {"type": "text", "text": "thinking"},
+                                    {"type": "tool-call", "name": "exec", "input": "a" * 900},
+                                ],
+                            },
+                            {
+                                "role": "assistant",
+                                "blocks": [{"type": "tool-call", "name": "read", "input": "f"}],
+                            },
+                        ]
+                    }
+                },
+            }
+        ]
+    )
+
+    turns = await OrcaClient(runner).worker_turns("dispatch-1")
+
+    assert turns == [f"exec:{'a' * 400}", "read:f"]
+    assert runner.calls[0][0:4] == ("orchestration", "worker-read", "--dispatch", "dispatch-1")
+
+
+async def test_worker_turns_reads_a_worker_with_no_transcript_as_empty() -> None:
+    runner = FakeRunner([{"ok": True, "result": {"transcript": None}}])
+    assert await OrcaClient(runner).worker_turns("dispatch-1") == []
+
+
 async def test_releasing_a_worker_closes_the_terminal_orkastrator_opened() -> None:
     """Releasing the Dispatch reclaims nothing when orkastrator started the agent.
 

@@ -204,6 +204,8 @@ class FakeOrca:
         self.starts: list[dict[str, object]] = []
         self.releases: list[str] = []
         self.released_terminals: list[str | None] = []
+        self.turns: list[str] = []
+        self.unreadable_turns = False
         self.runs_by_id: dict[str, JsonObject] = {}
         self.bound_runs: list[str] = []
         self.unreadable_dispatches: set[str] = set()
@@ -290,6 +292,11 @@ class FakeOrca:
         self.releases.append(dispatch_id)
         self.released_terminals.append(terminal_handle)
         return {"ok": True}
+
+    async def worker_turns(self, dispatch_id: str, limit: int = 50) -> list[str]:
+        if self.unreadable_turns:
+            raise OrcaError("worker-read failed")
+        return list(self.turns)
 
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
         if task_id in self.unreadable_dispatches:
@@ -2918,6 +2925,52 @@ async def test_a_stage_past_its_soft_budget_says_so_once_and_changes_nothing(
     again = await value.monitor(run_id)
     assert [item.budget for item in again.overdue] == ["soft"]
     assert len([item for item in store.events(run_id) if item["kind"] == "stage_overdue"]) == 1
+
+
+async def test_an_overdue_stage_reports_a_poll_loop_rather_than_only_minutes(
+    tmp_path: Path,
+) -> None:
+    """Minutes cannot tell a slow stage from a stuck one; repeated turns can.
+
+    A worker waiting on a subprocess by writing empty stdin every thirty seconds
+    is late and doing nothing, and the two facts read identically from the
+    ledger. Identical consecutive tool calls is a string comparison, so the
+    supervisor can say which one it is without asking anybody.
+    """
+
+    orca = FakeOrca()
+    orca.turns = ["exec:write_stdin({})"] * 8 + ["read:foo"]
+    orca.turns.append("exec:write_stdin({})")
+    value, store = controller(tmp_path, orca, graph_config=budgeted(soft=45, hard=None))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 50)
+
+    result = await value.monitor(run_id)
+
+    assert [item.activity for item in result.overdue] == [
+        "exec repeated 9/10 turns unchanged"
+    ]
+    event = next(item for item in store.events(run_id) if item["kind"] == "stage_overdue")
+    assert event["payload"]["activity"] == "exec repeated 9/10 turns unchanged"
+
+
+async def test_a_worker_that_cannot_be_read_reports_nothing_rather_than_idle(
+    tmp_path: Path,
+) -> None:
+    """Unreadable is not idle, and one Orca failure must not stop the tick."""
+
+    orca = FakeOrca()
+    orca.unreadable_turns = True
+    value, store = controller(tmp_path, orca, graph_config=budgeted(soft=45, hard=None))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 50)
+
+    result = await value.monitor(run_id)
+
+    assert [item.budget for item in result.overdue] == ["soft"]
+    assert [item.activity for item in result.overdue] == [None]
 
 
 async def test_a_stage_past_its_hard_budget_is_released_and_dispatched_again(

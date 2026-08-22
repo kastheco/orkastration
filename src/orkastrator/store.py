@@ -795,13 +795,15 @@ class StateStore:
                 clocks[stage_id] = clock.model_copy(update={"timeouts": timeouts[stage_id]})
         return clocks
 
-    def note_stage_overdue(self, run_id: str, stage: StageRecord, minutes: int) -> None:
+    def note_stage_overdue(
+        self, run_id: str, stage: StageRecord, minutes: int, activity: str | None = None
+    ) -> None:
         """Record that one dispatched stage has passed its soft budget.
 
         Soft means soft: nothing is released and nothing is failed. A stage that
         is merely slow and a stage that is wedged look identical from outside,
-        and the honest thing to do about that is say so where somebody will see
-        it rather than guess.
+        so `activity` carries what it was last observed doing. Without it the
+        event says a stage is late and leaves the useful half unwritten.
         """
 
         with self._session() as session:
@@ -815,6 +817,7 @@ class StateStore:
                     "stage_key": stage.stage_key,
                     "role": stage.role.value,
                     "minutes": minutes,
+                    "activity": activity,
                 },
             )
 

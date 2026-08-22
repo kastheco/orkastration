@@ -92,6 +92,8 @@ class OrcaGraphController(Protocol):
         self, dispatch_id: str, terminal_handle: str | None = None
     ) -> JsonObject: ...
 
+    async def worker_turns(self, dispatch_id: str, limit: int = 50) -> list[str]: ...
+
     async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None: ...
 
 
@@ -1402,8 +1404,9 @@ class ExecutionController:
             soft = budget.soft_minutes
             if soft is None or minutes < soft:
                 continue
+            activity = await self._stage_activity(stage.orca_dispatch_id)
             if not clock.warned:
-                self._store.note_stage_overdue(run_id, stage, minutes)
+                self._store.note_stage_overdue(run_id, stage, minutes, activity)
             overdue.append(
                 OverdueStage(
                     stage_key=stage.stage_key,
@@ -1411,9 +1414,38 @@ class ExecutionController:
                     role=stage.role,
                     minutes=minutes,
                     budget="soft",
+                    activity=activity,
                 )
             )
         return overdue
+
+    async def _stage_activity(self, dispatch_id: str) -> str | None:
+        """Say what an overdue stage is doing, by comparing its turns to each other.
+
+        A stage that is slow and a stage that is stuck in a poll loop both read
+        as "late" from the ledger. The difference is visible without judgement:
+        an agent making progress calls different things, and an agent waiting on
+        a subprocess by burning a turn every thirty seconds calls the same thing
+        over and over. That is a string comparison, so it is done here rather
+        than asked of a model.
+        """
+
+        try:
+            turns = await self._orca.worker_turns(dispatch_id)
+        except OrcaError:
+            # Unreadable is not the same as idle, and reporting it as idle would
+            # be worse than reporting nothing.
+            return None
+        if not turns:
+            return None
+        last = turns[-1]
+        tool = last.split(":", 1)[0]
+        repeated = sum(1 for turn in turns if turn == last)
+        if repeated < 3 or repeated * 2 <= len(turns):
+            return f"{tool} ({len(turns)} turns)"
+        # The whole point of the reading: the same call, over and over, is a
+        # stage spending the budget without moving.
+        return f"{tool} repeated {repeated}/{len(turns)} turns unchanged"
 
     async def _release_settled(self, run_id: str) -> None:
         for stage in self._store.stages(run_id):

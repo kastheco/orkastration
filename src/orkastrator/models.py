@@ -799,6 +799,11 @@ class OverdueStage(BaseModel):
     role: StageKind
     minutes: int
     budget: Literal["soft", "hard"]
+    # What the stage was doing when it went overdue. Minutes alone cannot tell a
+    # slow stage from a wedged one, and that is the only question an owner
+    # reading an overdue line actually has. None when the worker could not be
+    # read, which is not the same as "nothing to say".
+    activity: str | None = None
 
 
 class GraphResult(BaseModel):

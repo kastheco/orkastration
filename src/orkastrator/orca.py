@@ -365,6 +365,41 @@ class OrcaClient:
         dispatch_id = _required_recursive_string(response, "dispatchId")
         return dispatch_id, resolved_worktree, terminal_handle, response
 
+    async def worker_turns(self, dispatch_id: str, limit: int = 50) -> list[str]:
+        """Signatures of the recent assistant tool calls on one dispatched worker.
+
+        One string per turn, `tool:input`, bounded. This is deliberately not the
+        transcript: the caller is deciding whether a stage is making progress,
+        and for that question the only thing that matters is whether consecutive
+        turns are distinguishable from each other. Returning the text instead
+        would put a stalled agent's whole conversation into the supervisor's.
+        """
+
+        response = await self._ok(
+            "orchestration", "worker-read", "--dispatch", dispatch_id,
+            "--limit", str(limit), "--json",
+        )
+        result = _object(response.get("result"), "result")
+        transcript = result.get("transcript")
+        if not isinstance(transcript, dict):
+            return []
+        messages = transcript.get("messages")
+        if not isinstance(messages, list):
+            return []
+        turns: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            blocks = message.get("blocks")
+            if not isinstance(blocks, list):
+                continue
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool-call":
+                    continue
+                name = str(block.get("name") or "?")
+                turns.append(f"{name}:{str(block.get('input') or '')[:400]}")
+        return turns
+
     async def release_worker(
         self, dispatch_id: str, terminal_handle: str | None = None
     ) -> JsonObject:

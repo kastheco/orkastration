@@ -340,7 +340,12 @@ stage_budgets:
 ```
 
 `soft_minutes` reports and nothing else: one `stage_overdue` event, and the stage in `monitor`'s
-`overdue` list until it settles. `hard_minutes` releases the worker terminal, which puts the stage
+`overdue` list until it settles. The event and the list also carry what the stage was doing, read
+from its bounded worker transcript: an agent making progress calls different things, and an agent
+waiting on a subprocess by burning a turn every thirty seconds calls the same thing over and over.
+That is a string comparison between consecutive turns, not a judgement, so `exec repeated 9/10 turns
+unchanged` is a fact rather than a guess. A worker that cannot be read reports nothing, which is not
+the same as reporting idle. `hard_minutes` releases the worker terminal, which puts the stage
 back through the same path a dead agent takes. Neither records a result, because a stage that ran out
 of time produced none — blurring that would turn a slow machine into a false finding. After
 `max_timeouts` releases the lane blocks instead, since a stage that wedges every time is telling you
