@@ -1452,6 +1452,35 @@ async def test_a_second_acceptance_of_the_same_failed_validation_blocks(
     assert adjudications == 2
 
 
+async def test_accepting_a_fix_rechecks_it_instead_of_replaying_the_stored_verdict(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+    assert store.integrations(run_id)[0].status == "validation_failed"
+
+    # The stored failure was a fact about one check against one head, and the
+    # check has since been repaired. An acceptance has to reach Git again to find
+    # that out. Replaying the receipt instead made accept_fix a no-op, which is
+    # how a correct fix escalated on unrunnable output until it blocked.
+    git.lane_validation_fails = False
+    orca.complete_dispatched(escalation("validation_failed", "accept_fix"))
+    result = await value.monitor(run_id)
+
+    assert store.integrations(run_id)[0].status == "integrated"
+    assert result.findings[0].phase is not FindingPhase.BLOCKED
+
+
 async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:
     orca = FakeOrca()
     git = FakeGit()

@@ -670,7 +670,7 @@ class ExecutionController:
                 )
                 self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
                 return
-            await self._integrate_fix(run_id, finding, attempt)
+            await self._integrate_fix(run_id, finding, attempt, readjudicated=True)
         elif decision.action in {"approve_unchanged", "approve_scope_revision"}:
             limit = self._config.review_cycle.max_fix_rounds_per_finding
             # A conflict is a fact about the lane head moving, not about the fix,
@@ -806,6 +806,7 @@ class ExecutionController:
         attempt: FixAttempt,
         *,
         fixer_worktree: str | None = None,
+        readjudicated: bool = False,
     ) -> None:
         """Serially integrate one re-review-approved commit into the lane checkout."""
 
@@ -842,12 +843,25 @@ class ExecutionController:
                 FindingPhase.RESOLVED,
             )
             return
-        if receipt.status == "conflict":
-            self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
-            return
-        if receipt.status == "validation_failed":
-            self._escalate(run_id, finding, FindingReason.VALIDATION_FAILED)
-            return
+        if receipt.status in {"conflict", "validation_failed"}:
+            # An adjudicator who has read the commit and accepted it has overruled
+            # this verdict, so re-check the fix instead of replaying the stored
+            # outcome. Replaying it made accept_fix a no-op: this returned before
+            # reaching Git, so a repaired validation contract or a lane head that
+            # has since moved was never exercised, and the finding escalated on the
+            # same frozen output until it blocked. Only an integrated receipt above
+            # is terminal; these two are facts about one attempt.
+            if readjudicated:
+                receipt = self._store.reopen_integration(run_id, finding) or receipt
+            if receipt.status != "starting":
+                self._escalate(
+                    run_id,
+                    finding,
+                    FindingReason.INTEGRATION_CONFLICT
+                    if receipt.status == "conflict"
+                    else FindingReason.VALIDATION_FAILED,
+                )
+                return
 
         integrated_sha = await self._git.find_cherry_pick(lane.worktree_id, attempt.commit_sha)
         if integrated_sha is None:

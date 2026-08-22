@@ -1213,6 +1213,50 @@ class StateStore:
             session.flush()
             return _integration(row)
 
+    def reopen_integration(self, run_id: str, finding: FindingRecord) -> IntegrationRecord | None:
+        """Reopen a settled integration whose verdict an adjudicator has overruled.
+
+        A conflict and a failed validation are facts about one attempt against one
+        lane head, not about the fix itself. When an adjudicator reads the commit
+        and accepts it anyway, replaying the stored verdict makes that acceptance a
+        no-op: the caller returns before it reaches Git, so a repaired validation
+        contract or a moved lane head is never exercised and the finding escalates
+        on the same frozen output until it blocks. Put the receipt back to
+        ``starting`` so the next pass actually re-checks it. An integrated receipt
+        is never reopened, because that one is genuinely terminal.
+        """
+
+        with self._session(immediate=True) as session:
+            row = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.finding_key == finding.finding_key,
+                    IntegrationRow.round == finding.round,
+                )
+            ).first()
+            if row is None or row.status not in {"conflict", "validation_failed"}:
+                return None
+            active = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.lane_id == finding.lane_id,
+                    IntegrationRow.status == "starting",
+                )
+            ).first()
+            if active is not None:
+                raise IntegrationBusyError(f"lane {finding.lane_id} is integrating another finding")
+            previous = row.status
+            row.status = "starting"
+            row.validation_json = "[]"
+            row.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                finding.lane_id,
+                "integration_reopened",
+                {"finding_id": finding.finding_id, "previous_status": previous},
+            )
+            session.flush()
+            return _integration(row)
+
     def finish_integration(
         self,
         run_id: str,
