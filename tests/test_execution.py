@@ -26,7 +26,7 @@ from orkastrator.models import (
     ValidationRequirement,
     ValidationResult,
 )
-from orkastrator.orca import JsonObject, OrcaError
+from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
 from orkastrator.publication import PublicationError
 from orkastrator.store import StateStore
 from tests.factories import (
@@ -209,6 +209,8 @@ class FakeOrca:
         self.fail_after_run_create = False
         self.fail_after_task_create = False
         self.fail_after_worker_start = False
+        self.refuse_starts: set[str] = set()
+        self.timeout_starts: set[str] = set()
 
     async def create_run(self, objective: str) -> tuple[str, JsonObject]:
         assert objective.startswith("Do work\n\norkastrator run: ")
@@ -255,6 +257,9 @@ class FakeOrca:
 
     async def start_worker(self, **kwargs: object) -> tuple[str, str, JsonObject]:
         task_id = str(kwargs["task_id"])
+        if task_id in self.refuse_starts:
+            # Refused outright: no Dispatch exists and none will.
+            raise OrcaError(f"Orca command failed with rc=1: task_not_startable {task_id}")
         self.tasks_by_id[task_id]["status"] = "dispatched"
         requested = kwargs.get("worktree_id")
         if requested is not None:
@@ -265,6 +270,10 @@ class FakeOrca:
             worktree_id = "repo::/tmp/issue"
         dispatch_id = f"dispatch-{len(self.starts) + 1}"
         self.starts.append({**kwargs, "dispatch_id": dispatch_id, "worktree_id": worktree_id})
+        if task_id in self.timeout_starts:
+            # The dangerous half: Orca made the Dispatch and then lost the reply.
+            self.timeout_starts.discard(task_id)
+            raise OrcaTimeout("Orca command timed out after 600s")
         if self.fail_after_worker_start:
             self.fail_after_worker_start = False
             raise RuntimeError("crash after remote worker start")
@@ -1836,6 +1845,73 @@ async def test_restart_recovers_run_created_before_local_binding(tmp_path: Path)
     result = await restarted.accept(run_id)
     assert len(orca.runs_by_id) == 1
     assert result.orca_run_id == "orca-run-1"
+
+
+async def test_one_stage_that_cannot_start_does_not_park_the_rest_of_the_wave(
+    tmp_path: Path,
+) -> None:
+    """A refused start belongs to its own stage, not to every stage behind it.
+
+    `_start_ready` walks the whole ready set in one pass, so before this the
+    first Orca refusal raised out of that loop and nothing after it was even
+    reached. The lane that failed then sat in STARTING holding a worker slot,
+    and the run read as idle. That is the shape of an overnight stall.
+    """
+
+    orca = FakeOrca()
+    orca.refuse_starts.add("task-1")
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal(lane_count=2)).run_id
+
+    result = await value.accept(run_id)
+
+    assert [launch.task_id for launch in result.started] == ["task-2"]
+    stages = {stage.orca_task_id: stage for stage in store.stages(run_id)}
+    # Refused, so the slot goes back and the stage is tried again next tick.
+    assert stages["task-1"].phase is StagePhase.READY
+    assert stages["task-2"].phase is StagePhase.DISPATCHED
+    failures = [
+        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ]
+    # One event per attempt, and every one of them handed the slot back.
+    assert failures and all(failure["released"] is True for failure in failures)
+    assert "task_not_startable" in str(failures[0]["detail"])
+
+
+async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
+    tmp_path: Path,
+) -> None:
+    """A timeout is not a failure. It is the absence of an answer.
+
+    `worker-start` can create the Dispatch and lose the reply, so releasing the
+    reservation on a timeout races reconciliation - which is already the thing
+    that looks a STARTING stage's Dispatch up and either adopts it or frees the
+    slot. Leave the stage alone and let that decide.
+    """
+
+    orca = FakeOrca()
+    orca.timeout_starts.add("task-1")
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal(lane_count=2)).run_id
+
+    result = await value.accept(run_id)
+
+    assert [launch.task_id for launch in result.started] == ["task-2"]
+    stages = {stage.orca_task_id: stage for stage in store.stages(run_id)}
+    assert stages["task-1"].phase is StagePhase.STARTING
+    assert stages["task-1"].orca_dispatch_id is None
+    failures = [
+        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ]
+    assert [failure["released"] for failure in failures] == [False]
+
+    await value.monitor(run_id)
+
+    adopted = {stage.orca_task_id: stage for stage in store.stages(run_id)}["task-1"]
+    assert adopted.phase is StagePhase.DISPATCHED
+    assert adopted.orca_dispatch_id == "dispatch-1"
+    # Adopted, never started twice.
+    assert [start["task_id"] for start in orca.starts] == ["task-1", "task-2"]
 
 
 async def test_restart_recovers_dispatch_started_before_local_binding(tmp_path: Path) -> None:

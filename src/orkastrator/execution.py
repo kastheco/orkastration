@@ -46,7 +46,7 @@ from orkastrator.models import (
     WorkerBlocked,
     WorkerResult,
 )
-from orkastrator.orca import JsonObject, OrcaError
+from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
 from orkastrator.publication import GitHubPublisher, LanePublisher, PublicationError
 from orkastrator.scope import path_allowed
 from orkastrator.store import IntegrationBusyError, StateStore
@@ -1297,6 +1297,8 @@ class ExecutionController:
         for stage in stages:
             if stage.phase is not StagePhase.READY or stage.orca_dispatch_id is not None:
                 continue
+            if stage.orca_task_id is None:
+                raise ValueError(f"ready stage {stage.stage_id} has no Orca task")
             if not self._store.reserve_stage_start(
                 run_id,
                 stage,
@@ -1314,45 +1316,60 @@ class ExecutionController:
                 ),
             ):
                 continue
-            if stage.orca_task_id is None:
-                raise ValueError(f"ready stage {stage.stage_id} has no Orca task")
-            lane = lanes[stage.lane_id]
-            placement = self._placement(run_id, lane, stage)
-            dispatch_id, worktree_id, payload = await self._orca.start_worker(
-                task_id=stage.orca_task_id,
-                lane_name=_worker_name(lane.name, stage),
-                repo_selector=lane.repo_selector,
-                worktree_id=placement.worktree_id,
-                base_ref=placement.base_ref,
-                parent_worktree_id=placement.parent_worktree_id,
-                profile=self._profile(stage),
-            )
-            self._store.mark_stage_started(
-                run_id, stage.stage_id, dispatch_id, worktree_id, payload
-            )
-            if stage.finding_id is not None:
-                finding = self._finding_for_stage(run_id, stage)
-                phase = {
-                    StageKind.FIXER: FindingPhase.FIXING,
-                    StageKind.RE_REVIEWER: FindingPhase.RE_REVIEWING,
-                    StageKind.ESCALATION: FindingPhase.ESCALATING,
-                }[stage.role]
-                self._store.set_finding_state(
-                    run_id,
-                    finding.finding_key,
-                    phase=phase,
-                    escalation_reason=finding.escalation_reason,
-                )
-            started.append(
-                StageLaunch(
-                    lane=lane.name,
-                    role=stage.role,
-                    task_id=stage.orca_task_id,
-                    dispatch_id=dispatch_id,
-                    worktree_id=worktree_id,
-                )
-            )
+            try:
+                started.append(await self._launch(run_id, lanes[stage.lane_id], stage))
+            except OrcaTimeout as exc:
+                # A timed-out start has no outcome. Orca may have created the
+                # Dispatch and lost the reply, so handing the slot back here
+                # races reconciliation, which is already the thing that looks
+                # up a STARTING stage's Dispatch and either adopts it or frees
+                # the slot. Leave the stage where it is and let that decide.
+                self._store.record_stage_start_failure(run_id, stage, str(exc), released=False)
+            except (OrcaError, GitError, ValueError) as exc:
+                # A refused start did not happen, so give the slot back and try
+                # again next tick. Then keep walking: one stage that cannot
+                # start must not park every stage queued behind it, which is
+                # what raising out of this loop did.
+                self._store.reset_stage_reservation(run_id, stage)
+                self._store.record_stage_start_failure(run_id, stage, str(exc), released=True)
         return started
+
+    async def _launch(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> StageLaunch:
+        """Start one already-reserved stage, or raise without having started it."""
+
+        if stage.orca_task_id is None:  # already checked before the slot was reserved
+            raise ValueError(f"stage {stage.stage_id} has no Orca task")
+        placement = self._placement(run_id, lane, stage)
+        dispatch_id, worktree_id, payload = await self._orca.start_worker(
+            task_id=stage.orca_task_id,
+            lane_name=_worker_name(lane.name, stage),
+            repo_selector=lane.repo_selector,
+            worktree_id=placement.worktree_id,
+            base_ref=placement.base_ref,
+            parent_worktree_id=placement.parent_worktree_id,
+            profile=self._profile(stage),
+        )
+        self._store.mark_stage_started(run_id, stage.stage_id, dispatch_id, worktree_id, payload)
+        if stage.finding_id is not None:
+            finding = self._finding_for_stage(run_id, stage)
+            phase = {
+                StageKind.FIXER: FindingPhase.FIXING,
+                StageKind.RE_REVIEWER: FindingPhase.RE_REVIEWING,
+                StageKind.ESCALATION: FindingPhase.ESCALATING,
+            }[stage.role]
+            self._store.set_finding_state(
+                run_id,
+                finding.finding_key,
+                phase=phase,
+                escalation_reason=finding.escalation_reason,
+            )
+        return StageLaunch(
+            lane=lane.name,
+            role=stage.role,
+            task_id=stage.orca_task_id,
+            dispatch_id=dispatch_id,
+            worktree_id=worktree_id,
+        )
 
     def _placement(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> WorkerPlacement:
         """Resolve the exact existing or isolated checkout for one role."""

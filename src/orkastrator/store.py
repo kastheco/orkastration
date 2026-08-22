@@ -640,6 +640,40 @@ class StateStore:
                 {"stage_id": stage.stage_id},
             )
 
+    def record_stage_start_failure(
+        self, run_id: str, stage: StageRecord, detail: str, *, released: bool
+    ) -> None:
+        """Record that one stage could not be started, and whether its slot came back.
+
+        `_start_ready` walks every ready stage in one pass. Before this existed a
+        single failing Orca call raised out of that loop, so every stage behind
+        the failing one went unreached and the reserving stage sat in STARTING
+        with nothing anywhere saying why. The run then read as idle rather than
+        as broken, which is the failure mode that quietly stops a graph
+        overnight.
+
+        `released` is the substance, not a detail. A refused start is known not
+        to have happened, so the reservation goes back and the stage is tried
+        again next tick. A timed-out start has no outcome: the worker may be
+        running. That one stays in STARTING, where reconciliation adopts the
+        Dispatch if Orca made one and frees the slot if it did not.
+        """
+
+        with self._session() as session:
+            self._event(
+                session,
+                run_id,
+                stage.lane_id,
+                "stage_start_failed",
+                {
+                    "stage_id": stage.stage_id,
+                    "stage_key": stage.stage_key,
+                    "role": stage.role.value,
+                    "released": released,
+                    "detail": detail[:2_000],
+                },
+            )
+
     def release_dead_dispatch(self, run_id: str, stage: StageRecord) -> None:
         """Free a stage whose supervised worker died before it reported anything.
 

@@ -22,6 +22,18 @@ class OrcaError(RuntimeError):
     """Raised when an Orca CLI request fails or violates its JSON contract."""
 
 
+class OrcaTimeout(OrcaError):
+    """Raised when an Orca request produced no answer, either way.
+
+    Separate from `OrcaError` because the two mean opposite things to a caller
+    that already changed state. A refused command is known not to have run. A
+    timed-out one has no outcome at all: `worker-start` can create the Dispatch
+    and then lose the reply, so treating it as a failure and handing the slot
+    back races the recovery that would have adopted it. Callers that can tell
+    the difference should; this is what lets them.
+    """
+
+
 class CommandRunner(Protocol):
     """Execute one Orca command without a shell."""
 
@@ -55,12 +67,17 @@ class SubprocessRunner:
         except TimeoutError as exc:
             process.kill()
             await process.communicate()
-            raise OrcaError(f"Orca command timed out after {self.timeout_seconds:g}s") from exc
+            raise OrcaTimeout(f"Orca command timed out after {self.timeout_seconds:g}s") from exc
         if process.returncode != 0:
             # Orca reports command failures as a JSON envelope on stdout and leaves
             # stderr empty, so stdout is the only place the typed error code lives.
             detail = _failure_detail(stdout) or stderr.decode(errors="replace").strip()
-            raise OrcaError(f"Orca command failed with rc={process.returncode}: {detail[:2_000]}")
+            message = f"Orca command failed with rc={process.returncode}: {detail[:2_000]}"
+            # Orca times out internally too, and reports it as its own typed code
+            # rather than by making this call hang. Same undefined outcome.
+            if detail.startswith("timeout"):
+                raise OrcaTimeout(message)
+            raise OrcaError(message)
         try:
             value = json.loads(stdout)
         except json.JSONDecodeError as exc:
