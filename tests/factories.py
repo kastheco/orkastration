@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 
 def graph_config_data(*, max_parallel_lanes: int = 2) -> dict[str, object]:
     """Return a complete, minimal v2 graph configuration mapping."""
@@ -79,3 +81,42 @@ def graph_config_data(*, max_parallel_lanes: int = 2) -> dict[str, object]:
             },
         },
     }
+
+
+def review_finding_data(
+    number: int = 1, *, dependencies: list[str] | None = None
+) -> dict[str, object]:
+    """Return one valid frozen review finding mapping."""
+
+    return {
+        "id": f"finding-{number}",
+        "review_revision": {
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "diff_sha256": "c" * 64,
+        },
+        "evidence": [
+            {
+                "location": {"path": f"src/file{number}.py", "start_line": 1, "end_line": 2},
+                "claim": "The result is wrong.",
+            }
+        ],
+        "failure_mode": "Wrong result.",
+        "required_outcome": "Return the right result.",
+        "allowed_write_scope": {"paths": [f"src/file{number}.py"], "symbols": []},
+        "forbidden_scope": [],
+        "validation": [{"command": "pytest", "expected": "passes"}],
+        "dependencies": dependencies or [],
+    }
+
+
+def initial_review_report_json(*findings: dict[str, object]) -> str:
+    """Encode one valid initial review report."""
+
+    return json.dumps(
+        {
+            "review_revision": review_finding_data()["review_revision"],
+            "summary": "Reviewed.",
+            "findings": list(findings),
+        }
+    )

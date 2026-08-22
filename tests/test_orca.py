@@ -74,6 +74,12 @@ async def test_create_run_and_task_parse_nested_ids() -> None:
     )
 
 
+async def test_runs_lists_recoverable_orca_runs() -> None:
+    runner = FakeRunner([{"ok": True, "result": {"runs": [{"id": "run-1", "objective": "work"}]}}])
+    assert await OrcaClient(runner).runs() == [{"id": "run-1", "objective": "work"}]
+    assert runner.calls == [("orchestration", "run-list", "--json")]
+
+
 async def test_tasks_and_release_worker() -> None:
     runner = FakeRunner(
         [
@@ -91,6 +97,31 @@ async def test_tasks_and_release_worker() -> None:
         "dispatch-1",
         "--json",
     )
+
+
+async def test_worker_dispatch_recovers_supervised_worktree() -> None:
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"dispatch": {"id": "dispatch-1"}}},
+            {
+                "ok": True,
+                "result": {"worker": {"worktree_id": "repo::/tmp/issue-123"}},
+            },
+        ]
+    )
+
+    recovered = await OrcaClient(runner).worker_dispatch("task-1")
+
+    assert recovered == ("dispatch-1", "repo::/tmp/issue-123")
+    assert runner.calls == [
+        ("orchestration", "dispatch-show", "--task", "task-1", "--json"),
+        ("orchestration", "worker-show", "--dispatch", "dispatch-1", "--json"),
+    ]
+
+
+async def test_worker_dispatch_returns_none_for_unassigned_task() -> None:
+    client = OrcaClient(FakeRunner([{"ok": True, "result": {"dispatch": None}}]))
+    assert await client.worker_dispatch("task-1") is None
 
 
 async def test_start_worker_uses_model_effort_and_new_worktree() -> None:

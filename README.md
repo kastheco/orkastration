@@ -6,7 +6,7 @@ The supervisor is the interactive agent you talk to. It can use its installed
 Linear and Notion connectors directly, or invoke Kasgraph's subscription-backed
 `codex exec` or `claude -p` planner, to discover work, resolve dependencies, and
 propose parallel lanes. Kasgraph creates Orca Tasks only after explicit
-acceptance and monitors each accepted lane through a fixed review loop.
+acceptance and monitors each accepted lane through a persisted convergence loop.
 
 ```text
 interactive supervisor (Linear + Notion)
@@ -19,20 +19,25 @@ interactive supervisor (Linear + Notion)
               v
         Kasgraph acceptance
               |
-              +-- lane A: worker -> initial reviewer -> fixer -> re-reviewer
-              +-- lane B: worker -> initial reviewer -> fixer -> re-reviewer
-              `-- lane C: worker -> initial reviewer -> fixer -> re-reviewer
-                                  |
-                                  v
-                         Orca Tasks/Dispatches
+              +-- worker -> one full initial review
+              |                    |
+              |                    +-- no findings -> complete
+              |                    `-- frozen findings
+              |                              |
+              |                        fix -> scoped re-review
+              |                              |
+              |                      resolve, retry, or escalate
+              v
+      persisted Orca Tasks/Dispatches
 ```
 
 Kasgraph does not call model APIs directly and does not own API credentials. Its
 planner invokes either the installed Codex CLI or Claude Code CLI using their
 saved authentication, supplies `SupervisorPlan.model_json_schema()`, and
 validates the final JSON with Pydantic. It is one non-persistent subprocess per
-planning cycle. Orca remains the only execution and lifecycle authority. SQLite
-stores proposal and correlation state.
+planning cycle. Orca remains the execution and worker-lifecycle authority.
+SQLite stores proposals, immutable finding contracts, attempts, verdicts,
+escalation decisions, validated lifecycle receipts, and transition evidence.
 
 ## Configuration
 
@@ -98,12 +103,19 @@ the request when fast mode is unavailable for the account or model.
 use a different YAML file. The surrounding interactive session still controls
 the model you are talking to.
 
-The v2 schema now validates the settled convergence, publication, and CI
-policies. The current execution controller still runs the original fixed
-four-stage lane chain; dynamic per-finding scheduling, git integration, and
-remote publication are subsequent implementation slices and are not yet live.
-Version 1 YAML is intentionally unsupported; configuration errors identify the
-invalid field before Kasgraph creates local or Orca state.
+The v2 controller materializes stages dynamically from persisted finding state.
+A capability mismatch uses the configured fallback without consuming a fix
+round. A finding can consume at most two semantic rounds; invalid output, scope
+escape, and exhausted rounds route to escalation. Unrelated re-review findings
+are recorded as deferred instead of reopening the full review. Version 1 YAML is
+intentionally unsupported. An accepted database from the fixed-stage scheduler
+fails with an explicit unsupported-state error instead of resuming incorrectly.
+
+Fixer worktree isolation, deterministic path-scope rejection, serial commit
+integration, publication, and remote CI belong to the remaining delivery slices
+and are not live yet. The scheduler reserves capacity atomically and currently
+starts at most one fixer per lane; KAS-571 can raise that toward the configured
+ceiling after it supplies isolated worktrees and overlap checks.
 
 Inspect the generated agent-result contracts with:
 
@@ -187,10 +199,12 @@ uv run kasgraph snapshot --json
 uv run kasgraph show <run-id> --json
 ```
 
-Every lane uses one independent top-level Orca worktree. Later review/fix stages
-run as fresh supervised agents in that same worktree. The fixer always runs; it
-performs a verified no-op when the initial review has no findings. This keeps the
-DAG deterministic and gives every lane a fresh final review.
+Every lane begins in one independent top-level Orca worktree. The worker result
+starts one full changeset review. A clean review completes the lane without a
+fixer. Otherwise, each frozen finding receives its own bounded fixer/re-review
+loop with stable IDs and persisted evidence. Every agent reports through Orca
+`worker_done`; structured stages put only their JSON contract in the report body,
+which Kasgraph validates before advancing.
 
 ## Verification
 

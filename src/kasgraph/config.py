@@ -46,7 +46,7 @@ class FixerProfile(AgentProfile):
 
 
 class RoleProfiles(BaseModel):
-    """The four fixed execution roles in every lane graph."""
+    """The four configured roles available to dynamic lane stages."""
 
     model_config = ConfigDict(extra="forbid")
 

@@ -98,6 +98,16 @@ class OrcaClient:
         response = await self._ok("orchestration", "run-create", "--objective", objective, "--json")
         return _orchestration_id(response, "run", "runId"), response
 
+    async def runs(self) -> list[JsonObject]:
+        """List Orca Runs so acceptance can recover a create-before-bind crash."""
+
+        response = await self._ok("orchestration", "run-list", "--json")
+        result = _object(response.get("result"), "result")
+        runs = result.get("runs")
+        if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+            raise OrcaError("Orca run-list response omitted result.runs")
+        return cast(list[JsonObject], runs)
+
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         """Create one Orca Task with optional task-ID dependencies."""
 
@@ -117,6 +127,26 @@ class OrcaClient:
         if not isinstance(tasks, list) or not all(isinstance(task, dict) for task in tasks):
             raise OrcaError("Orca task-list response omitted result.tasks")
         return cast(list[JsonObject], tasks)
+
+    async def worker_dispatch(self, task_id: str) -> tuple[str, str | None] | None:
+        """Recover the supervised Dispatch and worktree already attached to a Task."""
+
+        response = await self._ok("orchestration", "dispatch-show", "--task", task_id, "--json")
+        result = _object(response.get("result"), "result")
+        raw_dispatch = result.get("dispatch")
+        if raw_dispatch is None:
+            return None
+        dispatch = _object(raw_dispatch, "result.dispatch")
+        dispatch_id = _required_string(dispatch, "id")
+        worker_response = await self._ok(
+            "orchestration", "worker-show", "--dispatch", dispatch_id, "--json"
+        )
+        worker_result = _object(worker_response.get("result"), "result")
+        worker = _object(worker_result.get("worker"), "result.worker")
+        worktree_id = worker.get("worktree_id")
+        if worktree_id is not None and not isinstance(worktree_id, str):
+            raise OrcaError("Orca worker-show returned an invalid worktree_id")
+        return dispatch_id, worktree_id
 
     async def start_worker(
         self,
@@ -252,6 +282,13 @@ def _object(value: object, field: str) -> JsonObject:
     if not isinstance(value, dict):
         raise OrcaError(f"Orca response omitted {field}")
     return cast(JsonObject, value)
+
+
+def _required_string(value: JsonObject, key: str) -> str:
+    candidate = value.get(key)
+    if not isinstance(candidate, str) or not candidate:
+        raise OrcaError(f"Orca response omitted {key}")
+    return candidate
 
 
 def _required_recursive_string(value: object, *keys: str) -> str:

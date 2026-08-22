@@ -52,8 +52,9 @@ Treat owner acceptance as exact-run authorization. When the owner accepts, run:
 uv run kasgraph accept <run-id> --json
 ```
 
-Acceptance creates the Orca Run, four dependent Tasks per lane, and the first
-worker wave. Do not reuse an acceptance for a changed proposal; record a new one.
+Acceptance creates the Orca Run, one worker Task per lane, and the bounded first
+wave. Later Tasks are created only from persisted worker/review outcomes. Do not
+reuse an acceptance for a changed proposal; record a new one.
 
 ## Monitor
 
@@ -63,10 +64,12 @@ For an attached supervision session, run:
 uv run kasgraph monitor <run-id> --watch --interval 5 --json
 ```
 
-Kasgraph reconciles Orca Task state, releases settled worker terminals, and starts
-each newly ready initial-reviewer, fixer, and re-reviewer stage using the role
-profiles in `kasgraph.yaml`. If the session must remain interactive, call
-`monitor <run-id> --json` at checkpoints instead.
+Kasgraph validates the structured result stored by Orca after `worker_done`,
+releases settled terminals, freezes the initial findings, and starts only the
+next eligible per-finding fixer, re-reviewer, or escalation stage. Stable finding
+IDs, round bounds, capability fallback, and deferred unrelated findings survive
+monitor restarts. If the session must remain interactive, call `monitor
+<run-id> --json` at checkpoints instead.
 
 On `blocked` or `failed`, inspect the Orca Task/Dispatch evidence before proposing
 recovery. On `complete`, summarize the exact lane results and update Linear or
@@ -75,5 +78,7 @@ writes.
 
 The model you are talking to belongs to this interactive session. The top-level
 `planner` profile in `kasgraph.yaml` configures only the optional Codex or
-Claude planning turn. The four `roles` profiles configure Orca execution launches,
-including provider-native fast mode before supervised task injection.
+Claude planning turn. The four `roles` profiles configure normal Orca launches.
+The nested `review_cycle.escalation` profile owns adjudication after scope escape,
+ambiguous results, or round exhaustion. Provider-native fast mode is applied
+before supervised task injection.

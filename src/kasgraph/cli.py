@@ -25,7 +25,7 @@ from kasgraph.planner import (
     SubprocessClaudeRunner,
     SubprocessCodexRunner,
 )
-from kasgraph.store import StateStore
+from kasgraph.store import StateStore, UnsupportedStateError
 
 app = typer.Typer(
     help="Record, accept, and monitor Orca execution graphs.",
@@ -177,6 +177,7 @@ def show_graph(
             "run": store.run(run_id).model_dump(mode="json"),
             "lanes": [lane.model_dump(mode="json") for lane in store.lanes(run_id)],
             "stages": [stage.model_dump(mode="json") for stage in store.stages(run_id)],
+            "findings": [finding.model_dump(mode="json") for finding in store.findings(run_id)],
         }
     except (ConfigError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
@@ -232,7 +233,15 @@ def _planner() -> SchemaCliPlanner:
 def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
     try:
         result = asyncio.run(awaitable)
-    except (ConfigError, OrcaError, PlannerError, KeyError, TypeError, ValueError) as exc:
+    except (
+        ConfigError,
+        OrcaError,
+        PlannerError,
+        UnsupportedStateError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(result, json_output=json_output)
 

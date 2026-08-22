@@ -45,10 +45,51 @@ class StagePhase(StrEnum):
 
     PENDING = "pending"
     READY = "ready"
+    STARTING = "starting"
     DISPATCHED = "dispatched"
     COMPLETED = "completed"
     FAILED = "failed"
     BLOCKED = "blocked"
+
+
+class StageKind(StrEnum):
+    """Dynamic workflow work item scheduled inside one lane."""
+
+    WORKER = "worker"
+    INITIAL_REVIEWER = "initial_reviewer"
+    FIXER = "fixer"
+    RE_REVIEWER = "re_reviewer"
+    ESCALATION = "escalation"
+
+
+class AttemptKind(StrEnum):
+    """Which configured profile owns a fixer attempt."""
+
+    PRIMARY = "primary"
+    FALLBACK = "fallback"
+
+
+class FindingPhase(StrEnum):
+    """Persisted convergence state for one frozen finding."""
+
+    PENDING_FIX = "pending_fix"
+    FIXING = "fixing"
+    PENDING_RE_REVIEW = "pending_re_review"
+    RE_REVIEWING = "re_reviewing"
+    PENDING_ESCALATION = "pending_escalation"
+    ESCALATING = "escalating"
+    RESOLVED = "resolved"
+    DEFERRED = "deferred"
+    BLOCKED = "blocked"
+
+
+class FindingReason(StrEnum):
+    """Persisted reason for fallback or escalation routing."""
+
+    CAPABILITY_FALLBACK = "capability_fallback"
+    SCOPE_ESCAPE = "scope_escape"
+    AMBIGUOUS_RESULT = "ambiguous_result"
+    ROUNDS_EXHAUSTED = "rounds_exhausted"
 
 
 class LaneProposal(BaseModel):
@@ -228,6 +269,24 @@ class ValidationResult(WorkflowContract):
     output: str = Field(default="", max_length=8_000)
 
 
+class WorkerResult(WorkflowContract):
+    """Exact committed changeset and validation evidence produced by a lane worker."""
+
+    review_revision: ReviewRevision
+    commit_sha: GitObjectId
+    changed_paths: list[str] = Field(default_factory=list, max_length=256)
+    validation_results: list[ValidationResult] = Field(default_factory=list, max_length=64)
+    summary: str = Field(min_length=1, max_length=8_000)
+
+    @model_validator(mode="after")
+    def commit_matches_review_head(self) -> WorkerResult:
+        """Pin the review input to the exact worker commit."""
+
+        if self.commit_sha != self.review_revision.head_sha:
+            raise ValueError("worker commit_sha must equal review_revision.head_sha")
+        return self
+
+
 class ScopeExpansionRequest(WorkflowContract):
     """Explicit scope the fixer could not safely avoid expanding."""
 
@@ -262,6 +321,13 @@ class FixAttempt(WorkflowContract):
         return self
 
 
+class ReReviewFinding(WorkflowContract):
+    """A finding noticed during re-review with an explicit convergence disposition."""
+
+    origin: Literal["introduced_by_fix", "unrelated"]
+    finding: ReviewFinding
+
+
 class ReReviewResult(WorkflowContract):
     """Closed verdict set for one exact fixer commit and finding round."""
 
@@ -277,6 +343,24 @@ class ReReviewResult(WorkflowContract):
     ]
     rationale: str = Field(min_length=1, max_length=4_000)
     evidence: list[FindingEvidence] = Field(default_factory=list, max_length=64)
+    new_findings: list[ReReviewFinding] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="after")
+    def new_findings_match_verdict(self) -> ReReviewResult:
+        """Only regression verdicts may introduce a finding into this review run."""
+
+        ids = [item.finding.id for item in self.new_findings]
+        if len(ids) != len(set(ids)):
+            raise ValueError("new re-review finding IDs must be unique")
+        if self.finding_id in ids:
+            raise ValueError("a re-review finding must not reuse the original finding ID")
+        introduced = [item for item in self.new_findings if item.origin == "introduced_by_fix"]
+        if introduced and self.verdict not in {
+            "regression_introduced_by_fix",
+            "interaction_failure",
+        }:
+            raise ValueError("introduced findings require a regression or interaction verdict")
+        return self
 
 
 class EscalationDecision(WorkflowContract):
@@ -339,10 +423,28 @@ class CiReceipt(WorkflowContract):
     checks: list[CiCheckResult] = Field(default_factory=list, max_length=256)
 
 
+class OrcaWorkerResult(BaseModel):
+    """Validated lifecycle result persisted by Orca after ``worker_done``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    provenance: Literal["worker_report"]
+    outcome: Literal["succeeded", "failed"]
+    message_id: str = Field(alias="messageId", min_length=1)
+    reported_by: str = Field(alias="reportedBy", min_length=1)
+    subject: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    completed_by: str = Field(alias="completedBy", min_length=1)
+    files_modified: list[str] = Field(default_factory=list, alias="filesModified")
+    report_path: str | None = Field(default=None, alias="reportPath")
+    completed_at: datetime = Field(alias="completedAt")
+
+
 def workflow_contract_schemas() -> dict[str, dict[str, object]]:
     """Return stable names and generated JSON Schemas for agent-facing results."""
 
     contracts: tuple[tuple[str, type[WorkflowContract]], ...] = (
+        ("worker_result", WorkerResult),
         ("initial_review_report", InitialReviewReport),
         ("fix_attempt", FixAttempt),
         ("re_review_result", ReReviewResult),
@@ -401,11 +503,17 @@ class StageRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stage_id: str
+    stage_key: str
     lane_id: str
-    role: RoleName
+    role: StageKind
+    finding_id: str | None
+    round: int | None
+    attempt_kind: AttemptKind | None
     phase: StagePhase
     orca_task_id: str | None
     orca_dispatch_id: str | None
+    result_json: str | None
+    processed: bool
     released: bool
     created_at: datetime
     updated_at: datetime
@@ -440,10 +548,28 @@ class StageLaunch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lane: str
-    role: RoleName
+    role: StageKind
     task_id: str
     dispatch_id: str
     worktree_id: str
+
+
+class FindingRecord(BaseModel):
+    """Persisted immutable finding contract plus its current convergence state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_key: str
+    lane_id: str
+    finding_id: str
+    origin: Literal["initial_review", "introduced_by_fix", "unrelated"]
+    contract: ReviewFinding
+    effective_contract: ReviewFinding
+    phase: FindingPhase
+    round: int
+    escalation_reason: FindingReason | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class GraphResult(BaseModel):
@@ -457,3 +583,4 @@ class GraphResult(BaseModel):
     started: list[StageLaunch] = Field(default_factory=list)
     lanes: list[LaneRecord]
     stages: list[StageRecord]
+    findings: list[FindingRecord]
