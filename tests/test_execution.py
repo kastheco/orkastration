@@ -177,6 +177,7 @@ class FakeOrca:
         self.starts: list[dict[str, object]] = []
         self.releases: list[str] = []
         self.runs_by_id: dict[str, JsonObject] = {}
+        self.bound_runs: list[str] = []
         self.fail_after_run_create = False
         self.fail_after_task_create = False
         self.fail_after_worker_start = False
@@ -192,6 +193,10 @@ class FakeOrca:
 
     async def runs(self) -> list[JsonObject]:
         return list(self.runs_by_id.values())
+
+    async def use_run(self, orca_run_id: str) -> JsonObject:
+        self.bound_runs.append(orca_run_id)
+        return {"ok": True}
 
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         task_id = f"task-{len(self.tasks_by_id) + 1}"

@@ -57,8 +57,10 @@ class SubprocessRunner:
             await process.communicate()
             raise OrcaError(f"Orca command timed out after {self.timeout_seconds:g}s") from exc
         if process.returncode != 0:
-            detail = stderr.decode(errors="replace").strip()[:2_000]
-            raise OrcaError(f"Orca command failed with rc={process.returncode}: {detail}")
+            # Orca reports command failures as a JSON envelope on stdout and leaves
+            # stderr empty, so stdout is the only place the typed error code lives.
+            detail = _failure_detail(stdout) or stderr.decode(errors="replace").strip()
+            raise OrcaError(f"Orca command failed with rc={process.returncode}: {detail[:2_000]}")
         try:
             value = json.loads(stdout)
         except json.JSONDecodeError as exc:
@@ -98,6 +100,11 @@ class OrcaClient:
 
         response = await self._ok("orchestration", "run-create", "--objective", objective, "--json")
         return _orchestration_id(response, "run", "runId"), response
+
+    async def use_run(self, orca_run_id: str) -> JsonObject:
+        """Bind this coordinator terminal to the Run that owns the graph's Tasks."""
+
+        return await self._ok("orchestration", "run-use", "--id", orca_run_id, "--json")
 
     async def runs(self) -> list[JsonObject]:
         """List Orca Runs so acceptance can recover a create-before-bind crash."""
@@ -260,6 +267,10 @@ class OrcaClient:
             "20000",
             "--json",
         )
+        # worker-start defaults its worktree selector to the calling terminal's own
+        # checkout. orkastrator drives Orca from a floating coordinator terminal that
+        # has none, so the placement has to be named explicitly even when --terminal
+        # already identifies the agent pane.
         response = await self._ok(
             "orchestration",
             "worker-start",
@@ -267,6 +278,8 @@ class OrcaClient:
             task_id,
             "--terminal",
             terminal_handle,
+            "--worktree",
+            f"id:{resolved_worktree}",
             "--json",
         )
         dispatch_id = _required_recursive_string(response, "dispatchId")
@@ -282,8 +295,36 @@ class OrcaClient:
     async def _ok(self, *arguments: str) -> JsonObject:
         response = await self._runner.run(arguments)
         if response.get("ok") is not True:
-            raise OrcaError("Orca returned a non-success response")
+            detail = _error_detail(response.get("error"))
+            raise OrcaError(f"Orca returned a non-success response{detail}")
         return response
+
+
+def _error_detail(error: object) -> str:
+    """Render an Orca error envelope as a bounded suffix."""
+
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+        parts = [str(part) for part in (code, message) if isinstance(part, str) and part]
+        if parts:
+            unique = parts[:1] if len(parts) == 2 and parts[0] == parts[1] else parts
+            return ": " + ": ".join(unique)[:2_000]
+    if isinstance(error, str) and error:
+        return f": {error[:2_000]}"
+    return ""
+
+
+def _failure_detail(stdout: bytes) -> str:
+    """Read the typed error out of an Orca failure envelope printed on stdout."""
+
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    return _error_detail(value.get("error")).removeprefix(": ")
 
 
 def _object(value: object, field: str) -> JsonObject:

@@ -56,6 +56,8 @@ class OrcaGraphController(Protocol):
 
     async def runs(self) -> list[JsonObject]: ...
 
+    async def use_run(self, orca_run_id: str) -> JsonObject: ...
+
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]: ...
 
     async def tasks(self, orca_run_id: str) -> list[JsonObject]: ...
@@ -140,6 +142,13 @@ class ExecutionController:
             raise ValueError(f"run {run_id} cannot be accepted from status {run.status}")
         else:
             self._require_authorization(run_id)
+            orca_run_id = self._store.run(run_id).orca_run_id
+            if orca_run_id is None:
+                raise ValueError(f"run {run_id} was accepted without an Orca Run")
+        # Task and worker commands resolve against the Run bound to this coordinator
+        # terminal. Recovering an existing Run, or accepting from a later process,
+        # leaves that binding pointing elsewhere, so rebind before touching Tasks.
+        await self._orca.use_run(orca_run_id)
         await self._ensure_tasks(run_id)
         return await self.monitor(run_id)
 
@@ -150,6 +159,7 @@ class ExecutionController:
         if run.orca_run_id is None:
             raise ValueError(f"run {run_id} has not been accepted")
         self._require_authorization(run_id)
+        await self._orca.use_run(run.orca_run_id)
         tasks = await self._orca.tasks(run.orca_run_id)
         by_id = {_task_id(task): task for task in tasks}
         lanes = {lane.lane_id: lane for lane in self._store.lanes(run_id)}
