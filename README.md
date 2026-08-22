@@ -292,6 +292,29 @@ you.
 A worker that cannot proceed at all returns blocked or escalation evidence instead, and that evidence
 drives the convergence loop rather than the conversation.
 
+### Stage budgets
+
+An agent that dies is easy: Orca hands its Task back to READY once the worker terminal is gone, and
+the stage is dispatched again. An agent that wedges keeps its terminal, so nothing comes back and the
+lane waits forever. `stage_budgets` in `orkastrator.yaml` gives each role a wall clock, measured
+against the `stage_start_reserved` timestamp already in the ledger:
+
+```yaml
+stage_budgets:
+  worker: {soft_minutes: 45, hard_minutes: 90}
+  max_timeouts: 2
+```
+
+`soft_minutes` reports and nothing else: one `stage_overdue` event, and the stage in `monitor`'s
+`overdue` list until it settles. `hard_minutes` releases the worker terminal, which puts the stage
+back through the same path a dead agent takes. Neither records a result, because a stage that ran out
+of time produced none — blurring that would turn a slow machine into a false finding. After
+`max_timeouts` releases the lane blocks instead, since a stage that wedges every time is telling you
+something a third dispatch will not.
+
+Both halves are optional and unset by default. A budget is a claim about how long this repository's
+work takes, and no default knows that.
+
 ## Verification
 
 ```bash

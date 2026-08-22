@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from sqlmodel import Session, select
 
-from orkastrator.config import AgentProfile, GraphConfig
+from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
+from orkastrator.db import EventRow
 from orkastrator.execution import ExecutionController, _next_key
 from orkastrator.git import GitCommandResult, LocalGit
 from orkastrator.models import (
@@ -2802,3 +2804,158 @@ async def test_a_fix_stacked_on_another_fix_is_never_rebased_off_it(tmp_path: Pa
     # And not because there was nothing to move to: the lane head really has
     # advanced past the commit this fix is stacked on.
     assert store.lanes(run_id)[0].integration_head_sha not in {None, original_commit}
+
+
+def budgeted(*, soft: int | None, hard: int | None, max_timeouts: int = 2) -> GraphConfig:
+    """A config whose worker role carries a wall-clock budget."""
+
+    base = config()
+    return base.model_copy(
+        update={
+            "stage_budgets": StageBudgets(
+                worker=StageBudget(soft_minutes=soft, hard_minutes=hard),
+                max_timeouts=max_timeouts,
+            )
+        }
+    )
+
+
+def backdate_dispatch(store: StateStore, run_id: str, minutes: int) -> None:
+    """Move this run's start reservations back, so a budget has something to measure.
+
+    The clock is read from `stage_start_reserved` rather than from the stage
+    row, so this is the whole of what "an agent has been running a while" means
+    to the supervisor.
+    """
+
+    moved = datetime.now(UTC) - timedelta(minutes=minutes)
+    with Session(store._engine) as session:
+        for row in session.exec(
+            select(EventRow).where(
+                EventRow.run_id == run_id, EventRow.kind == "stage_start_reserved"
+            )
+        ).all():
+            row.created_at = moved
+            session.add(row)
+        session.commit()
+
+
+async def test_a_stage_inside_its_budget_is_not_overdue(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca, graph_config=budgeted(soft=45, hard=90))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 44)
+
+    result = await value.monitor(run_id)
+
+    assert result.overdue == []
+    assert orca.releases == []
+    assert not [item for item in store.events(run_id) if item["kind"] == "stage_overdue"]
+
+
+async def test_an_unconfigured_budget_waits_forever_as_it_always_did(tmp_path: Path) -> None:
+    """No default can know how long this repository's work takes, so there isn't one."""
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 10_000)
+
+    result = await value.monitor(run_id)
+
+    assert result.overdue == []
+    assert orca.releases == []
+
+
+async def test_a_stage_past_its_soft_budget_says_so_once_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A slow agent and a wedged one look identical, so soft only reports."""
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca, graph_config=budgeted(soft=45, hard=None))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 50)
+
+    result = await value.monitor(run_id)
+
+    assert [item.budget for item in result.overdue] == ["soft"]
+    overdue = result.overdue[0]
+    assert overdue.role is StageKind.WORKER
+    assert overdue.lane == "issue-100"
+    assert overdue.minutes == 50
+    assert orca.releases == []
+    stage = next(item for item in store.stages(run_id) if item.role is StageKind.WORKER)
+    assert stage.phase is StagePhase.DISPATCHED
+    assert stage.orca_dispatch_id is not None
+
+    # Still overdue next tick, but the event is not written again: an owner
+    # reading the log wants to know when it went overdue, not how often the
+    # ticker has since noticed.
+    again = await value.monitor(run_id)
+    assert [item.budget for item in again.overdue] == ["soft"]
+    assert len([item for item in store.events(run_id) if item["kind"] == "stage_overdue"]) == 1
+
+
+async def test_a_stage_past_its_hard_budget_is_released_and_dispatched_again(
+    tmp_path: Path,
+) -> None:
+    """Releasing the terminal is the whole mechanism.
+
+    Orca hands the Task back to READY once its worker terminal is gone, and the
+    existing dead-dispatch path clears the Dispatch id from there. Nothing here
+    records a result, because a stage that ran out of time produced none.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca, graph_config=budgeted(soft=45, hard=90))
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    stage = next(item for item in store.stages(run_id) if item.role is StageKind.WORKER)
+    dispatch_id = stage.orca_dispatch_id
+    assert dispatch_id is not None
+    backdate_dispatch(store, run_id, 95)
+
+    result = await value.monitor(run_id)
+
+    assert [item.budget for item in result.overdue] == ["hard"]
+    assert orca.releases == [dispatch_id]
+    timed_out = [item for item in store.events(run_id) if item["kind"] == "stage_timed_out"]
+    assert len(timed_out) == 1
+    released = next(item for item in store.stages(run_id) if item.role is StageKind.WORKER)
+    assert released.result_json is None
+    assert released.processed is False
+
+    orca.abandon_dispatched()
+    restarted = await value.monitor(run_id)
+
+    assert [launch.role for launch in restarted.started] == [StageKind.WORKER]
+    assert restarted.status == "active"
+
+
+async def test_a_stage_that_wedges_every_time_blocks_instead_of_looping(tmp_path: Path) -> None:
+    """A release is worth doing twice. A stage that wedges on every dispatch is
+    telling you something a third one will not."""
+
+    orca = FakeOrca()
+    value, store = controller(
+        tmp_path, orca, graph_config=budgeted(soft=None, hard=90, max_timeouts=1)
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    backdate_dispatch(store, run_id, 95)
+
+    await value.monitor(run_id)
+    orca.abandon_dispatched()
+    await value.monitor(run_id)
+    backdate_dispatch(store, run_id, 95)
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked"
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    payload = blocked[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert "exceeded its 90-minute budget" in payload["reason"]

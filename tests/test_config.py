@@ -132,3 +132,28 @@ def test_invalid_timeout_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, 
     monkeypatch.setenv("ORKASTRATOR_COMMAND_TIMEOUT_SECONDS", value)
     with pytest.raises(ConfigError, match="TIMEOUT"):
         Settings.from_env()
+
+
+def test_stage_budgets_default_to_unset(tmp_path: Path) -> None:
+    """A budget is a claim about how long this repository's work takes.
+
+    No default can know that, so an unconfigured budget means what it meant
+    before budgets existed: wait.
+    """
+
+    path = tmp_path / "graph.yaml"
+    write_config(path)
+    budgets = load_graph_config(path).stage_budgets
+    assert budgets.for_role("worker").soft_minutes is None
+    assert budgets.for_role("worker").hard_minutes is None
+    assert budgets.max_timeouts == 2
+
+
+def test_a_hard_budget_before_its_soft_budget_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "graph.yaml"
+    write_config(path)
+    path.write_text(
+        path.read_text() + "\nstage_budgets:\n  worker: {soft_minutes: 90, hard_minutes: 45}\n"
+    )
+    with pytest.raises(ConfigError, match="hard_minutes"):
+        load_graph_config(path)

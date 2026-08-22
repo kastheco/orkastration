@@ -8,7 +8,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -50,6 +50,51 @@ class RoleProfiles(BaseModel):
     initial_reviewer: AgentProfile
     fixer: FixerProfile
     re_reviewer: AgentProfile
+
+
+class StageBudget(BaseModel):
+    """How long one dispatched stage may run before that is itself the signal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    soft_minutes: int | None = Field(default=None, ge=1, le=1440)
+    hard_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+    @model_validator(mode="after")
+    def hard_is_not_before_soft(self) -> StageBudget:
+        if (
+            self.soft_minutes is not None
+            and self.hard_minutes is not None
+            and self.hard_minutes < self.soft_minutes
+        ):
+            raise ValueError("hard_minutes cannot be earlier than soft_minutes")
+        return self
+
+
+class StageBudgets(BaseModel):
+    """Per-role wall-clock budgets for a dispatched stage.
+
+    Both halves are optional and unset by default, because a budget is a claim
+    about how long this repository's work takes and no default can know that.
+    An unset budget is the behaviour that shipped before: wait forever.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker: StageBudget = Field(default_factory=StageBudget)
+    initial_reviewer: StageBudget = Field(default_factory=StageBudget)
+    fixer: StageBudget = Field(default_factory=StageBudget)
+    re_reviewer: StageBudget = Field(default_factory=StageBudget)
+    escalation: StageBudget = Field(default_factory=StageBudget)
+    # How many hard timeouts one stage may spend before the lane blocks instead.
+    # Releasing a wedged worker is worth doing twice; a stage that wedges every
+    # time is telling you something a third dispatch will not.
+    max_timeouts: int = Field(default=2, ge=1, le=10)
+
+    def for_role(self, role: str) -> StageBudget:
+        """The budget configured for one stage role."""
+
+        return cast(StageBudget, getattr(self, role, StageBudget()))
 
 
 class NewFindingPolicy(BaseModel):
@@ -201,6 +246,7 @@ class GraphConfig(BaseModel):
     max_parallel_workers: int = Field(default=6, ge=1, le=128)
     review_cycle: ReviewCycleConfig
     roles: RoleProfiles
+    stage_budgets: StageBudgets = Field(default_factory=StageBudgets)
     publication: PublicationConfig
     final_gate: FinalGateConfig
 

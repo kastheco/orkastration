@@ -52,6 +52,7 @@ from orkastrator.models import (
     ReReviewResult,
     ReviewFinding,
     RunRecord,
+    StageClock,
     StageKind,
     StagePhase,
     StageRecord,
@@ -700,6 +701,91 @@ class StateStore:
                 row.lane_id,
                 "stage_dead_dispatch_released",
                 {"stage_id": stage.stage_id},
+            )
+
+    def stage_clocks(self, run_id: str) -> dict[str, StageClock]:
+        """When each stage's current dispatch started, and what has been said about it.
+
+        Read from the event log rather than from `updated_at`, because that
+        column moves for reasons that have nothing to do with the agent: a
+        result syncing, a task binding, a release. The clock has to restart when
+        a stage is re-dispatched, so every counter here is scoped to the latest
+        `stage_start_reserved` and anything older is not this dispatch's
+        history.
+        """
+
+        kinds = ["stage_start_reserved", "stage_overdue", "stage_timed_out"]
+        with self._session() as session:
+            rows = session.exec(
+                select(EventRow)
+                .where(EventRow.run_id == run_id, col(EventRow.kind).in_(kinds))
+                .order_by(col(EventRow.created_at), col(EventRow.event_id))
+            ).all()
+        clocks: dict[str, StageClock] = {}
+        timeouts: dict[str, int] = {}
+        for row in rows:
+            payload = json.loads(row.payload_json)
+            stage_id = payload.get("stage_id")
+            if not isinstance(stage_id, str):
+                continue
+            if row.kind == "stage_start_reserved":
+                clocks[stage_id] = StageClock(
+                    started_at=row.created_at, warned=False, timeouts=timeouts.get(stage_id, 0)
+                )
+                continue
+            clock = clocks.get(stage_id)
+            if clock is None:
+                continue
+            if row.kind == "stage_overdue":
+                clocks[stage_id] = clock.model_copy(update={"warned": True})
+            else:
+                timeouts[stage_id] = clock.timeouts + 1
+                clocks[stage_id] = clock.model_copy(update={"timeouts": timeouts[stage_id]})
+        return clocks
+
+    def note_stage_overdue(self, run_id: str, stage: StageRecord, minutes: int) -> None:
+        """Record that one dispatched stage has passed its soft budget.
+
+        Soft means soft: nothing is released and nothing is failed. A stage that
+        is merely slow and a stage that is wedged look identical from outside,
+        and the honest thing to do about that is say so where somebody will see
+        it rather than guess.
+        """
+
+        with self._session() as session:
+            self._event(
+                session,
+                run_id,
+                stage.lane_id,
+                "stage_overdue",
+                {
+                    "stage_id": stage.stage_id,
+                    "stage_key": stage.stage_key,
+                    "role": stage.role.value,
+                    "minutes": minutes,
+                },
+            )
+
+    def note_stage_timed_out(self, run_id: str, stage: StageRecord, minutes: int) -> None:
+        """Record that one dispatched stage's worker was released for exceeding its budget.
+
+        Deliberately not a result. The stage produced nothing, so it must be
+        dispatched again rather than recorded as having failed on the merits;
+        blurring those two turns a slow machine into a false finding.
+        """
+
+        with self._session() as session:
+            self._event(
+                session,
+                run_id,
+                stage.lane_id,
+                "stage_timed_out",
+                {
+                    "stage_id": stage.stage_id,
+                    "stage_key": stage.stage_key,
+                    "role": stage.role.value,
+                    "minutes": minutes,
+                },
             )
 
     def sync_stage(

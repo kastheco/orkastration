@@ -739,6 +739,33 @@ class PendingQuestion(BaseModel):
     body: str
 
 
+class StageClock(BaseModel):
+    """How long one stage's current dispatch has been running, and what it has been told.
+
+    `warned` and `timeouts` are scoped to this dispatch. A re-dispatched stage
+    starts a fresh clock, because the question a budget asks is about the agent
+    now running, not about the stage's whole history.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    started_at: datetime
+    warned: bool = False
+    timeouts: int = 0
+
+
+class OverdueStage(BaseModel):
+    """One dispatched stage that has outlived its configured budget."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage_key: str
+    lane: str
+    role: StageKind
+    minutes: int
+    budget: Literal["soft", "hard"]
+
+
 class GraphResult(BaseModel):
     """Machine-readable result of accepting or monitoring a graph."""
 
@@ -754,3 +781,4 @@ class GraphResult(BaseModel):
     publications: list[PublicationReceipt] = Field(default_factory=list)
     ci: list[CiReceipt] = Field(default_factory=list)
     questions: list[PendingQuestion] = Field(default_factory=list)
+    overdue: list[OverdueStage] = Field(default_factory=list)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
 
 from pydantic import ValidationError
@@ -32,6 +33,7 @@ from orkastrator.models import (
     LaneProposal,
     LaneRecord,
     OrcaWorkerResult,
+    OverdueStage,
     PendingQuestion,
     ProposalReceipt,
     PublicationReceipt,
@@ -240,6 +242,7 @@ class ExecutionController:
             if phase is StagePhase.READY and stage.orca_dispatch_id is not None:
                 self._store.release_dead_dispatch(run_id, stage)
 
+        overdue = await self._enforce_stage_budgets(run_id)
         await self._process_results(run_id)
         await self._release_settled(run_id)
         await self._reclaim_foreign_reservations(run_id)
@@ -265,6 +268,7 @@ class ExecutionController:
             publications=self._store.publications(run_id),
             ci=self._store.ci_receipts(run_id),
             questions=await self._pending_questions(run_id, run.orca_run_id),
+            overdue=overdue,
         )
 
     async def questions(self, run_id: str) -> list[PendingQuestion]:
@@ -1331,6 +1335,75 @@ class ExecutionController:
             self._store.bind_stage_task(run_id, stage.stage_id, task_id)
             locally_bound.add(task_id)
 
+    async def _enforce_stage_budgets(self, run_id: str) -> list[OverdueStage]:
+        """Answer "has this stage been running longer than its budget" from the clock.
+
+        The only liveness signal before this was Orca handing a Task back to
+        READY when its worker terminal disappeared, which catches a *dead*
+        agent. A wedged one keeps its terminal, so the Task never comes back and
+        the lane waits forever - `application-lifecycle-kas-580` sat dispatched
+        for two hours with a child process at zero CPU, and the thing that
+        noticed was a human reading `ps`. That answer is arithmetic on a
+        timestamp already in the database.
+
+        Soft says so and changes nothing. Hard releases the worker terminal, and
+        that is the whole mechanism: Orca returns the Task to READY, the
+        existing dead-dispatch path clears the Dispatch id, and the stage is
+        dispatched again next tick. Nothing here records a result, because the
+        stage produced none.
+        """
+
+        budgets = self._config.stage_budgets
+        clocks = self._store.stage_clocks(run_id)
+        lanes = {lane.lane_id: lane.name for lane in self._store.lanes(run_id)}
+        now = datetime.now(UTC)
+        overdue: list[OverdueStage] = []
+        for stage in self._store.stages(run_id):
+            if stage.phase is not StagePhase.DISPATCHED or stage.orca_dispatch_id is None:
+                continue
+            clock = clocks.get(stage.stage_id)
+            if clock is None:
+                continue
+            budget = budgets.for_role(stage.role.value)
+            minutes = int((now - _aware(clock.started_at)).total_seconds() // 60)
+            hard = budget.hard_minutes
+            if hard is not None and minutes >= hard:
+                if clock.timeouts >= budgets.max_timeouts:
+                    self._store.block_lane(
+                        run_id,
+                        stage.lane_id,
+                        f"stage {stage.stage_key} exceeded its {hard}-minute budget "
+                        f"{clock.timeouts + 1} times",
+                    )
+                    continue
+                await self._orca.release_worker(stage.orca_dispatch_id)
+                self._store.note_stage_timed_out(run_id, stage, minutes)
+                overdue.append(
+                    OverdueStage(
+                        stage_key=stage.stage_key,
+                        lane=lanes.get(stage.lane_id, stage.lane_id),
+                        role=stage.role,
+                        minutes=minutes,
+                        budget="hard",
+                    )
+                )
+                continue
+            soft = budget.soft_minutes
+            if soft is None or minutes < soft:
+                continue
+            if not clock.warned:
+                self._store.note_stage_overdue(run_id, stage, minutes)
+            overdue.append(
+                OverdueStage(
+                    stage_key=stage.stage_key,
+                    lane=lanes.get(stage.lane_id, stage.lane_id),
+                    role=stage.role,
+                    minutes=minutes,
+                    budget="soft",
+                )
+            )
+        return overdue
+
     async def _release_settled(self, run_id: str) -> None:
         for stage in self._store.stages(run_id):
             if (
@@ -2054,6 +2127,12 @@ def _recovered_worktree(
     if stage.role in {StageKind.FIXER, StageKind.RE_REVIEWER}:
         return recovered
     return recovered or lane_worktree
+
+
+def _aware(value: datetime) -> datetime:
+    """Read a ledger timestamp as UTC, which is the only thing it was ever written in."""
+
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _sha256_json(value: object) -> str:
