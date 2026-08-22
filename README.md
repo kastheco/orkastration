@@ -21,6 +21,8 @@ you <-> interactive orkastrator supervisor
               +-- worker -> initial review
               |                 |
               |                 `-- frozen findings -> fix -> scoped re-review
+              |                                              |
+              |                                              `-- escalation -> adjudicated
               v
          persisted Orca tasks
               |
@@ -28,6 +30,7 @@ you <-> interactive orkastrator supervisor
   orkastrator/<run>/<lane> -> draft PR -> exact-SHA GitHub checks
                                           |
                                           +-- pass -> ready
+                                          |           `-> merge commit  (target, manual today)
                                           `-- fail -> scoped CI fix, max 2
 ```
 
@@ -77,9 +80,24 @@ model is selected by the interactive session, not this file.
 
 The review cycle freezes initial findings, limits each finding to two semantic fix rounds, rejects
 out-of-scope path changes, serializes overlapping fixers, and defers unrelated re-review findings.
-Accepted fixes integrate serially into the lane checkout. Publication uses non-force deterministic
-branches and one draft GitHub PR per lane. Exact-SHA checks are the final gate. orkastrator never
-merges or deploys.
+An integration conflict is a fact about the lane head moving rather than about the fix, so it
+retries the same round instead of spending one. Accepted fixes integrate serially into the lane
+checkout.
+
+Publication uses non-force deterministic branches and one GitHub PR per lane, opened as a draft and
+marked ready once the exact-SHA checks on the published head pass. Those checks are the gate before
+anything lands.
+
+**Landing is the target state, not the shipped one.** Today the controller stops at a ready PR and
+the merge is manual. When landing ships it will use a merge commit, never a squash and never a
+fast-forward, so each lane keeps its own history in the base branch, and a lane that conflicts with
+a head that moved under it will raise an integration conflict rather than fail the run.
+orkastrator does not deploy.
+
+A finding can settle wrongly - most often because the supervisor lacked a word for what an
+adjudicator meant. `orkas reopen` sends it back to an earlier phase, retires the settled stages at
+and after that round, and drops the frozen contracts the reopened phase supersedes. It keeps a
+committed fix on purpose, because `accept_fix` settles a finding on exactly that commit.
 
 SQLModel provides the typed SQLite ledger for proposals, findings, attempts, verdicts, integration,
 publication, CI, and transition evidence. Raw SQL is limited to SQLite locking and additive
@@ -142,6 +160,17 @@ uv run --project /home/kas/dev/orkastrator orkas show <run-id> --json
 uv run --project /home/kas/dev/orkastrator orkas schemas --json
 ```
 
+Send a finding that settled wrongly back to an earlier phase:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas reopen <run-id> \
+  --finding <finding-id> --phase pending_escalation \
+  --reason validation_failed --note "why" --json
+```
+
+`--phase` accepts `pending_fix`, `pending_re_review`, or `pending_escalation`. The round defaults to
+the finding's current one.
+
 ## Communication boundary
 
 The interactive supervisor can answer questions because it owns the conversation and the
@@ -149,11 +178,19 @@ Linear/Notion evidence used to make the proposal. You can challenge a dependency
 independent, narrow scope, or revise the proposal before acceptance.
 
 Execution workers do not have Linear or Notion authority. They receive bounded task prompts and
-return typed results through Orca. There is not yet a live question-and-reply channel between a
-running worker and the supervisor. A worker that cannot proceed returns blocked or escalation
-evidence; the supervisor reads that evidence, explains it, and asks you what to do next. Adding live
-steering would require an explicit Orca messaging/interrupt protocol and is separate from the
-current convergence loop.
+return typed results through Orca.
+
+A running worker can ask a question. `orkas monitor` surfaces unanswered questions in its result and
+stops watching when it finds one, because an agent parked on a decision the graph cannot make for it
+will not move no matter how many ticks it gets. The supervisor reads the question, explains it, and
+answers through Orca's own reply channel:
+
+```bash
+orca orchestration reply --id <message-id> --body <text> --json
+```
+
+A worker that cannot proceed at all returns blocked or escalation evidence instead, and that evidence
+drives the convergence loop rather than the conversation.
 
 ## Verification
 
