@@ -29,7 +29,7 @@ from orkastrator.models import (
     ValidationResult,
 )
 from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
-from orkastrator.publication import PublicationError
+from orkastrator.publication import PublicationError, PullRequestLanded
 from orkastrator.store import StateStore
 from tests.factories import (
     graph_config_data,
@@ -2959,3 +2959,81 @@ async def test_a_stage_that_wedges_every_time_blocks_instead_of_looping(tmp_path
     payload = blocked[-1]["payload"]
     assert isinstance(payload, dict)
     assert "exceeded its 90-minute budget" in payload["reason"]
+
+
+async def test_a_merged_pull_request_lands_the_lane_instead_of_failing_it(
+    tmp_path: Path,
+) -> None:
+    """Merged and closed are opposite outcomes, and only one of them is a failure.
+
+    Publication read every non-OPEN state as "the authorized lane pull request
+    is no longer open", so an owner merging a lane's pull request - the thing
+    the lane exists to produce - was reported as the lane failing. The merge is
+    discovered here while observing checks, which is the window
+    `_a_complete_lane_is_never_touched_by_publication_again` does not cover: the
+    lane is still ACTIVE, so it is still being published.
+    """
+
+    class MergedWhileObserving(FakePublisher):
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            raise PullRequestLanded(receipt.head_sha)
+
+    orca = FakeOrca()
+    publisher = MergedWhileObserving()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    landed = await value.monitor(run_id)
+
+    assert landed.status == "complete", store.events(run_id)
+    receipt = store.publications(run_id)[-1]
+    assert receipt.landed is True
+    assert receipt.draft is False
+    assert [item["kind"] for item in store.events(run_id)].count("pull_request_landed") == 1
+    # A merge is not a check result, and recording one would claim CI passed for
+    # a head whose checks now belong to the base branch's history.
+    assert store.ci_receipts(run_id) == []
+    # And the lane is not published again, so the merge cannot be re-discovered.
+    again = await value.monitor(run_id)
+    assert again.status == "complete"
+    assert len(publisher.publish_calls) == 1
+
+
+async def test_a_lane_published_onto_a_merged_pull_request_never_asks_for_checks(
+    tmp_path: Path,
+) -> None:
+    """A landed receipt is terminal, so nothing downstream of it runs."""
+
+    class AlreadyMerged(FakePublisher):
+        async def publish(
+            self,
+            *,
+            run_id: str,
+            lane: LaneRecord,
+            head_sha: str,
+            previous: PublicationReceipt | None,
+        ) -> PublicationReceipt:
+            receipt = await super().publish(
+                run_id=run_id, lane=lane, head_sha=head_sha, previous=previous
+            )
+            return receipt.model_copy(update={"draft": False, "landed": True})
+
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            raise AssertionError("a merged head has no checks left to observe")
+
+    orca = FakeOrca()
+    publisher = AlreadyMerged()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert publisher.ready_calls == []
+    assert store.publications(run_id)[-1].landed is True

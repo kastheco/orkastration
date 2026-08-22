@@ -13,6 +13,7 @@ from orkastrator.publication import (
     CommandResult,
     GitHubPublisher,
     PublicationError,
+    PullRequestLanded,
     _github_repository,
 )
 
@@ -56,9 +57,9 @@ async def test_create_draft_pr_observe_exact_checks_and_mark_ready(tmp_path: Pat
     runner = QueueRunner(
         result("git@github.com:owner/repo.git\n"),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
-        result(),
-        result(),
         result("[]"),
+        result(),
+        result(),
         result("https://github.com/owner/repo/pull/7\n"),
         result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
         result(
@@ -109,8 +110,6 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
     runner = QueueRunner(
         result("git@github.com:owner/repo.git\n"),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
-        result(f"{old_sha}\trefs/heads/{previous.branch}\n"),
-        result(),
         result(
             json.dumps(
                 [
@@ -118,11 +117,14 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
                         "url": previous.pull_request_url,
                         "isDraft": True,
                         "state": "OPEN",
+                        "headRefOid": old_sha,
                         "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
         ),
+        result(f"{old_sha}\trefs/heads/{previous.branch}\n"),
+        result(),
         result(),
     )
 
@@ -134,7 +136,7 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
     )
 
     assert receipt.head_sha == new_sha
-    assert runner.calls[3][:3] == ("git", "push", "origin")
+    assert runner.calls[4][:3] == ("git", "push", "origin")
     assert runner.calls[-1][1:3] == ("pr", "edit")
 
 
@@ -154,6 +156,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
     diverged = QueueRunner(
         result(previous.remote_url),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result("[]"),
         result(f"{'c' * 40}\trefs/heads/{previous.branch}\n"),
     )
     with pytest.raises(PublicationError, match="diverged"):
@@ -167,6 +170,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
     unowned = QueueRunner(
         result(previous.remote_url),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result("[]"),
         result(f"{'c' * 40}\trefs/heads/{previous.branch}\n"),
     )
     with pytest.raises(PublicationError, match="unrelated revision"):
@@ -189,7 +193,6 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
     runner = QueueRunner(
         result("git@github.com:owner/repo.git"),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
-        result(f"{sha}\trefs/heads/{branch}\n"),
         result(
             json.dumps(
                 [
@@ -197,11 +200,13 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
                         "url": "https://github.com/owner/repo/pull/7",
                         "isDraft": True,
                         "state": "OPEN",
+                        "headRefOid": sha,
                         "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
         ),
+        result(f"{sha}\trefs/heads/{branch}\n"),
         result(),
     )
 
@@ -216,7 +221,6 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
     update_runner = QueueRunner(
         result(receipt.remote_url),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
-        result(f"{sha}\trefs/heads/{branch}\n"),
         result(
             json.dumps(
                 [
@@ -224,11 +228,13 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
                         "url": receipt.pull_request_url,
                         "isDraft": True,
                         "state": "OPEN",
+                        "headRefOid": sha,
                         "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
             )
         ),
+        result(f"{sha}\trefs/heads/{branch}\n"),
         result(),
     )
     recovered_update = await GitHubPublisher(runner=update_runner).publish(
@@ -413,11 +419,9 @@ async def test_ready_transition_recovers_after_remote_success() -> None:
 
 async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path) -> None:
     sha = "b" * 40
-    branch = "orkastrator/run-12345678/issue-123"
     runner = QueueRunner(
         result("git@github.com:owner/repo.git"),
         result(json.dumps({"defaultBranchRef": {"name": "main"}})),
-        result(f"{sha}\trefs/heads/{branch}\n"),
         result(
             json.dumps(
                 [
@@ -425,6 +429,7 @@ async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path)
                         "url": "https://github.com/owner/repo/pull/7",
                         "isDraft": True,
                         "state": "CLOSED",
+                        "headRefOid": sha,
                         "body": "orkastrator run: `run-1234567890`",
                     }
                 ]
@@ -432,7 +437,7 @@ async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path)
         ),
     )
 
-    with pytest.raises(PublicationError, match="no longer open"):
+    with pytest.raises(PublicationError, match="closed without merging"):
         await GitHubPublisher(runner=runner).publish(
             run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
         )
@@ -537,3 +542,119 @@ async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> Non
             head_sha=sha,
             previous=None,
         )
+
+
+async def test_a_merged_pull_request_is_the_lane_landing_not_a_failure(tmp_path: Path) -> None:
+    """MERGED is the outcome the lane was working toward, not a reason to stop it.
+
+    The pull request is also read before anything is pushed. GitHub deletes the
+    head branch on merge, and looking at the remote first meant the adapter
+    recreated the branch GitHub had just removed before anyone could see why it
+    was missing.
+    """
+
+    sha = "b" * 40
+    runner = QueueRunner(
+        result("git@github.com:owner/repo.git"),
+        result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result(
+            json.dumps(
+                [
+                    {
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "isDraft": False,
+                        "state": "MERGED",
+                        "headRefOid": sha,
+                        "body": "orkastrator run: `run-1234567890`",
+                    }
+                ]
+            )
+        ),
+    )
+
+    receipt = await GitHubPublisher(runner=runner).publish(
+        run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+    )
+
+    assert receipt.landed is True
+    assert receipt.draft is False
+    assert receipt.head_sha == sha
+    assert [call[:2] for call in runner.calls] == [
+        ("git", "remote"),
+        ("gh", "repo"),
+        ("gh", "pr"),
+    ]
+
+
+async def test_a_pull_request_merged_at_another_head_is_refused(tmp_path: Path) -> None:
+    """What landed has to be what this lane published, or landing says nothing about it."""
+
+    runner = QueueRunner(
+        result("git@github.com:owner/repo.git"),
+        result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result(
+            json.dumps(
+                [
+                    {
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "isDraft": False,
+                        "state": "MERGED",
+                        "headRefOid": "c" * 40,
+                        "body": "orkastrator run: `run-1234567890`",
+                    }
+                ]
+            )
+        ),
+    )
+
+    with pytest.raises(PublicationError, match="which is not this lane's integrated head"):
+        await GitHubPublisher(runner=runner).publish(
+            run_id="run-1234567890", lane=lane(tmp_path), head_sha="b" * 40, previous=None
+        )
+
+
+async def test_a_merge_observed_after_publishing_raises_landed_not_an_error() -> None:
+    """`checks` sees the merge when it happens between publishing and observing."""
+
+    sha = "b" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "MERGED", "isDraft": False}))
+    )
+
+    with pytest.raises(PullRequestLanded) as landed:
+        await GitHubPublisher(runner=runner).checks(receipt)
+
+    assert landed.value.head_sha == sha
+    assert isinstance(landed.value, PublicationError)
+
+
+async def test_an_unknown_pull_request_state_is_named_rather_than_guessed() -> None:
+    """Three states are enumerated; a fourth is a question, not a default verdict."""
+
+    sha = "b" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "LOCKED", "isDraft": False}))
+    )
+
+    with pytest.raises(PublicationError, match="unknown pull-request state LOCKED"):
+        await GitHubPublisher(runner=runner).checks(receipt)

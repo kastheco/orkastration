@@ -88,6 +88,13 @@ Publication uses non-force deterministic branches and one GitHub PR per lane, op
 marked ready once the exact-SHA checks on the published head pass. Those checks are the gate before
 anything lands.
 
+A pull request has three states and each one gets its own answer. `OPEN` is the working case.
+`MERGED` means the lane's branch reached the base branch, which is the outcome the lane exists to
+produce: the receipt records `landed`, the lane completes, and it is never published again. `CLOSED`
+means somebody rejected the branch and blocks the lane, saying so. Publication reads the pull request
+before it pushes anything, because GitHub deletes the head branch on merge and pushing first would
+recreate it.
+
 **Landing is the target state, not the shipped one.** Today the controller stops at a ready PR and
 the merge is manual. When landing ships it will use a merge commit, never a squash and never a
 fast-forward, so each lane keeps its own history in the base branch, and a lane that conflicts with

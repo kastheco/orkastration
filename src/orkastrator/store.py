@@ -391,15 +391,24 @@ class StateStore:
                 kind = "lane_published"
             else:
                 previous = PublicationReceipt.model_validate_json(row.payload_json)
-                if previous.model_copy(update={"draft": receipt.draft}) != receipt:
+                # Draft and landed are the two facts about a published head that
+                # are allowed to move, and both move in one direction only.
+                # Everything else identifies the publication and must not change.
+                if (
+                    previous.model_copy(update={"draft": receipt.draft, "landed": receipt.landed})
+                    != receipt
+                ):
                     raise ValueError("publication identity changed for an existing head")
+                if previous.landed and not receipt.landed:
+                    raise ValueError("a landed publication cannot be un-landed")
                 row.payload_json = payload
                 row.updated_at = now
-                kind = (
-                    "pull_request_ready"
-                    if previous.draft and not receipt.draft
-                    else "lane_published"
-                )
+                if receipt.landed and not previous.landed:
+                    kind = "pull_request_landed"
+                elif previous.draft and not receipt.draft:
+                    kind = "pull_request_ready"
+                else:
+                    kind = "lane_published"
             self._event(session, run_id, lane_id, kind, receipt.model_dump())
 
     def publications(self, run_id: str, lane_id: str | None = None) -> list[PublicationReceipt]:

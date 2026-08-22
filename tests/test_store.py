@@ -13,6 +13,7 @@ from orkastrator.models import (
     FixAttempt,
     InitialReviewReport,
     LanePhase,
+    PublicationReceipt,
     StageKind,
     StagePhase,
     SupervisorPlan,
@@ -758,3 +759,45 @@ def test_reopening_a_blocked_finding_still_needs_no_force(tmp_path: Path) -> Non
     )
 
     assert reopened.phase is FindingPhase.PENDING_FIX
+
+
+def test_a_published_head_may_land_but_never_un_land(tmp_path: Path) -> None:
+    """Draft and landed are the two facts about a published head that move.
+
+    Both move once and in one direction. Everything else on the receipt
+    identifies the publication, so letting it change would quietly re-point an
+    audit record at a different branch or pull request.
+    """
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    receipt = PublicationReceipt(
+        run_id=run_id,
+        lane=lane.name,
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch=f"orkastrator/{run_id[:12]}/{lane.name}",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=True,
+    )
+
+    store.record_publication(run_id, lane.lane_id, receipt)
+    landed = receipt.model_copy(update={"draft": False, "landed": True})
+    store.record_publication(run_id, lane.lane_id, landed)
+
+    assert store.publications(run_id) == [landed]
+    kinds = [item["kind"] for item in store.events(run_id)]
+    assert kinds.count("lane_published") == 1
+    assert kinds.count("pull_request_landed") == 1
+
+    with pytest.raises(ValueError, match="cannot be un-landed"):
+        store.record_publication(run_id, lane.lane_id, receipt)
+    with pytest.raises(ValueError, match="publication identity changed"):
+        store.record_publication(
+            run_id,
+            lane.lane_id,
+            landed.model_copy(update={"pull_request_url": "https://github.com/owner/repo/pull/9"}),
+        )

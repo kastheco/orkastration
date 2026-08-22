@@ -517,6 +517,12 @@ class PublicationReceipt(WorkflowContract):
     pull_request_url: str = Field(min_length=1, max_length=2_048)
     head_sha: GitObjectId
     draft: bool
+    # The branch reached the base branch, which is the outcome the lane was
+    # working toward. A landed receipt is terminal: there is nothing left to
+    # push, edit, or observe, because the head's checks belong to the base
+    # branch's history now. Defaults false so receipts written before this
+    # field existed still read.
+    landed: bool = False
 
 
 class CiReceipt(WorkflowContract):

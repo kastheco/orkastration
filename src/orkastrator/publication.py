@@ -18,6 +18,19 @@ class PublicationError(RuntimeError):
     """Raised when remote state cannot be mutated or observed safely."""
 
 
+class PullRequestLanded(PublicationError):
+    """The authorized pull request was merged while the lane was still publishing.
+
+    Merged and closed are opposite outcomes, and collapsing both into "no longer
+    open" reports the lane succeeding as the lane failing. This carries the
+    merged head so the caller can check that what landed is what it published.
+    """
+
+    def __init__(self, head_sha: str):
+        super().__init__(f"the authorized lane pull request was merged at {head_sha}")
+        self.head_sha = head_sha
+
+
 class LanePublisher(Protocol):
     """Provider boundary used after a lane converges locally."""
 
@@ -104,16 +117,10 @@ class GitHubPublisher:
             or previous.base_branch != default_branch
         ):
             raise PublicationError("persisted publication target changed")
-        remote_head = await self._remote_head(path, branch)
-        if previous is None and remote_head is not None and remote_head != head_sha:
-            raise PublicationError(f"existing branch {branch} points to an unrelated revision")
-        if previous is not None and remote_head not in {previous.head_sha, head_sha}:
-            raise PublicationError(
-                f"remote branch {branch} diverged from published head {previous.head_sha}"
-            )
-        if remote_head != head_sha:
-            await self._required(path, "git", "push", "origin", f"{head_sha}:refs/heads/{branch}")
-
+        # The pull request is read before anything is pushed. A merged pull
+        # request usually means its branch is gone, and pushing first would
+        # recreate the branch GitHub deleted on merge before anyone had looked
+        # at why it was missing.
         pull_requests = await self._gh_json(
             path,
             "pr",
@@ -125,7 +132,7 @@ class GitHubPublisher:
             "--state",
             "all",
             "--json",
-            "url,isDraft,state,body",
+            "url,isDraft,state,body,headRefOid",
             "--limit",
             "10",
         )
@@ -134,16 +141,45 @@ class GitHubPublisher:
             raise PublicationError("GitHub returned an invalid pull-request list")
         if len(pull_requests) > 1:
             raise PublicationError(f"multiple pull requests exist for lane branch {branch}")
-        if pull_requests:
-            pull_request = pull_requests[0]
+        pull_request = pull_requests[0] if pull_requests else None
+        if pull_request is not None:
             pull_request_url = str(pull_request["url"])
             marker = f"orkastrator run: `{run_id}`"
             if previous is None and marker not in str(pull_request.get("body") or ""):
                 raise PublicationError("existing pull request is not owned by this accepted run")
             if previous is not None and pull_request_url != previous.pull_request_url:
                 raise PublicationError("pull request identity changed after publication")
-            if str(pull_request.get("state")) != "OPEN":
-                raise PublicationError("the authorized lane pull request is no longer open")
+            state = _pull_request_state(pull_request)
+            if state == "MERGED":
+                merged_head = str(pull_request.get("headRefOid") or "an unreported head")
+                if merged_head != head_sha:
+                    raise PublicationError(
+                        f"the authorized lane pull request was merged at {merged_head}, "
+                        f"which is not this lane's integrated head {head_sha}"
+                    )
+                return PublicationReceipt(
+                    run_id=run_id,
+                    lane=lane.name,
+                    remote_url=remote_url.strip(),
+                    base_branch=default_branch,
+                    branch=branch,
+                    pull_request_url=pull_request_url,
+                    head_sha=head_sha,
+                    draft=False,
+                    landed=True,
+                )
+
+        remote_head = await self._remote_head(path, branch)
+        if previous is None and remote_head is not None and remote_head != head_sha:
+            raise PublicationError(f"existing branch {branch} points to an unrelated revision")
+        if previous is not None and remote_head not in {previous.head_sha, head_sha}:
+            raise PublicationError(
+                f"remote branch {branch} diverged from published head {previous.head_sha}"
+            )
+        if remote_head != head_sha:
+            await self._required(path, "git", "push", "origin", f"{head_sha}:refs/heads/{branch}")
+
+        if pull_request is not None:
             await self._required(path, *self._gh, "pr", "edit", pull_request_url, "--body", body)
             draft = bool(pull_request.get("isDraft", True))
         else:
@@ -331,13 +367,33 @@ def _pull_request_body(run_id: str, lane: LaneRecord, head_sha: str) -> str:
     )
 
 
+def _pull_request_state(payload: dict[object, object]) -> str:
+    """Name the state GitHub reported, refusing the ones a lane cannot proceed from.
+
+    GitHub returns exactly three states here. `OPEN` is the working case and
+    `MERGED` is the lane's goal, so both are answers rather than errors; only
+    `CLOSED` means somebody rejected the branch. Branching on `!= "OPEN"`
+    collapsed all three into one verdict and reported the goal as a failure.
+    """
+
+    state = str(payload.get("state"))
+    if state in {"OPEN", "MERGED"}:
+        return state
+    if state == "CLOSED":
+        raise PublicationError("the authorized lane pull request was closed without merging")
+    raise PublicationError(f"GitHub reported unknown pull-request state {state}")
+
+
 def _verify_pull_request(payload: object, receipt: PublicationReceipt) -> None:
     if not isinstance(payload, dict):
         raise PublicationError("GitHub returned invalid pull-request state")
     if payload.get("headRefOid") != receipt.head_sha:
         raise PublicationError("pull request head does not match the published revision")
-    if payload.get("state") != "OPEN":
-        raise PublicationError("the authorized lane pull request is no longer open")
+    if _pull_request_state(payload) == "MERGED":
+        # Merged between publishing this head and observing it. The head is
+        # identical, so what landed is exactly what this lane published; the
+        # caller records that rather than counting a failed pass.
+        raise PullRequestLanded(receipt.head_sha)
 
 
 def _required_check(raw: object) -> CiCheckResult:

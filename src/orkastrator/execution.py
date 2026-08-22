@@ -50,7 +50,12 @@ from orkastrator.models import (
     WorkerResult,
 )
 from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
-from orkastrator.publication import GitHubPublisher, LanePublisher, PublicationError
+from orkastrator.publication import (
+    GitHubPublisher,
+    LanePublisher,
+    PublicationError,
+    PullRequestLanded,
+)
 from orkastrator.scope import path_allowed
 from orkastrator.store import IntegrationBusyError, StateStore
 
@@ -1576,18 +1581,23 @@ class ExecutionController:
                 )
                 publications = self._store.publications(run_id, lane.lane_id)
                 ci = self._store.ci_receipts(run_id, lane.lane_id)
-                published_head = publications[-1].head_sha if publications else None
                 passed_head = next(
                     (item.head_sha for item in reversed(ci) if item.status == "passed"), None
                 )
-                phase = (
-                    LanePhase.COMPLETE
-                    if reviewed
-                    and settled
-                    and published_head == lane.integration_head_sha == passed_head
-                    and not publications[-1].draft
-                    else LanePhase.ACTIVE
+                published = publications[-1] if publications else None
+                # A landed head has already passed whatever the base branch
+                # required of it, and its pull request cannot be taken out of
+                # draft after a merge. Holding a merged lane open waiting for
+                # those two facts waits for something that can never arrive.
+                gated = (
+                    published is not None
+                    and published.head_sha == lane.integration_head_sha
+                    and (
+                        published.landed
+                        or (published.head_sha == passed_head and not published.draft)
+                    )
                 )
+                phase = LanePhase.COMPLETE if reviewed and settled and gated else LanePhase.ACTIVE
             self._store.set_lane_phase(run_id, lane.lane_id, phase)
             lane_phases.append(phase)
         if any(phase is LanePhase.ACTIVE for phase in lane_phases):
@@ -1631,24 +1641,35 @@ class ExecutionController:
                 continue
             publications = self._store.publications(run_id, lane.lane_id)
             previous = publications[-1] if publications else None
+            # Bound before the attempt so the landed handler can name what was
+            # merged even when the merge is discovered while observing checks.
+            receipt: PublicationReceipt | None = previous
             try:
                 if previous is None or previous.head_sha != lane.integration_head_sha:
-                    receipt = await self._publisher.publish(
+                    published = await self._publisher.publish(
                         run_id=run_id,
                         lane=lane,
                         head_sha=lane.integration_head_sha,
                         previous=previous,
                     )
-                    if receipt.run_id != run_id or receipt.lane != lane.name:
+                    if published.run_id != run_id or published.lane != lane.name:
                         raise PublicationError("publisher receipt does not match the accepted lane")
-                    if receipt.head_sha != lane.integration_head_sha:
+                    if published.head_sha != lane.integration_head_sha:
                         raise PublicationError(
                             "publisher receipt does not match the integrated head"
                         )
-                    self._store.record_publication(run_id, lane.lane_id, receipt)
-                    publications.append(receipt)
+                    self._store.record_publication(run_id, lane.lane_id, published)
+                    publications.append(published)
+                    receipt = published
                 else:
                     receipt = previous
+                if receipt.landed:
+                    # The branch is in the base branch. Nothing is left to push,
+                    # edit, or observe: checks for this head belong to the base
+                    # branch's history now, and asking for them again is how a
+                    # merged lane used to report itself as failed.
+                    self._store.note_publication_progress(run_id, lane.lane_id)
+                    continue
                 ci = await self._publisher.checks(receipt)
                 if ci.head_sha != receipt.head_sha:
                     raise PublicationError("CI observation is not pinned to the published head")
@@ -1660,6 +1681,17 @@ class ExecutionController:
                     self._store.record_publication(run_id, lane.lane_id, ready)
                 elif ci.status == "failed":
                     await self._record_ci_failure(run_id, lane, publications, ci)
+                self._store.note_publication_progress(run_id, lane.lane_id)
+            except PullRequestLanded:
+                # Merged between publishing this head and observing it. The head
+                # is the one this lane published, so the merge is this lane
+                # succeeding; record it and stop publishing the lane.
+                if receipt is not None:
+                    self._store.record_publication(
+                        run_id,
+                        lane.lane_id,
+                        receipt.model_copy(update={"draft": False, "landed": True}),
+                    )
                 self._store.note_publication_progress(run_id, lane.lane_id)
             except PublicationError as exc:
                 # One failed observation is not knowledge. `assistant-kas-576`
