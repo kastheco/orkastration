@@ -89,6 +89,14 @@ class SubprocessRunner:
 
 
 @dataclass(frozen=True, slots=True)
+class UnreadMessage:
+    """One message sitting in a dispatch's mailbox that nobody has read."""
+
+    sequence: int
+    subject: str
+
+
+@dataclass(frozen=True, slots=True)
 class OpenTerminals:
     """The panes Orca currently lists, and whether that listing was the whole set."""
 
@@ -485,6 +493,45 @@ class OrcaClient:
             else frozenset()
         )
         return OpenTerminals(handles=handles, complete=result.get("truncated") is not True)
+
+    async def unread_messages(self, dispatch_id: str, limit: int = 20) -> list[UnreadMessage]:
+        """Messages addressed to one dispatch that its agent has not read.
+
+        Reads the mailbox rather than consuming it, so this is safe to run
+        against a live run: `check` marks messages read, and doing that from the
+        supervisor would hide the very thing being looked for.
+
+        The subject is carried and the body is not. The question this answers is
+        whether direction arrived, not what it said - and a worker that has
+        stopped reading has usually stopped reading everything, so the useful
+        output is a short list of subjects rather than one message in full.
+        """
+
+        response = await self._ok(
+            "orchestration",
+            "inbox",
+            "--terminal",
+            f"dispatch:{dispatch_id}",
+            "--limit",
+            str(limit),
+            "--json",
+        )
+        result = _object(response.get("result"), "result")
+        messages = result.get("messages")
+        if not isinstance(messages, list):
+            return []
+        unread: list[UnreadMessage] = []
+        for message in messages:
+            if not isinstance(message, dict) or message.get("read"):
+                continue
+            sequence = message.get("sequence")
+            unread.append(
+                UnreadMessage(
+                    sequence=sequence if isinstance(sequence, int) else 0,
+                    subject=str(message.get("subject") or "")[:200],
+                )
+            )
+        return sorted(unread, key=lambda item: item.sequence)
 
     async def close_terminal(self, terminal_handle: str) -> None:
         """Close one pane, treating a handle Orca has forgotten as already closed."""

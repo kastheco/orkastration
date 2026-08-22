@@ -7,7 +7,7 @@ import json
 from collections.abc import Coroutine
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Never
+from typing import Annotated, Any, Never, cast
 
 import typer
 import yaml
@@ -344,6 +344,65 @@ def reap(
         _emit(plan.to_dict(), json_output=True)
         return
     typer.echo(render_reap_plan(plan))
+
+
+@app.command()
+def mail(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Show supervisor direction the agents in flight have not read.
+
+    A message sent to a dispatch reports success as soon as Orca accepts it,
+    and nothing afterwards says whether the agent ever looked. An agent that
+    enters a wait loop around a subprocess stops checking its mailbox and does
+    not resume, so direction sent after that point is dropped in silence while
+    both sides believe they are in contact.
+
+    Reads the mailbox rather than consuming it, so this is safe against a live
+    run: `check` marks messages read, and doing that here would destroy the
+    evidence. A non-empty listing means the supervisor is talking to itself.
+    """
+
+    async def read() -> dict[str, object]:
+        _, store, orca = _components()
+        lanes = {lane.lane_id: lane.name for lane in store.lanes(run_id)}
+        pending: list[dict[str, object]] = []
+        for stage in store.stages(run_id):
+            # Only stages still in flight: a settled stage's mailbox cannot be
+            # read by anyone any more, so unread there is expected, not a fault.
+            if stage.released or stage.orca_dispatch_id is None:
+                continue
+            unread = await orca.unread_messages(stage.orca_dispatch_id)
+            pending.extend(
+                {
+                    "lane": lanes.get(stage.lane_id, stage.lane_id),
+                    "role": str(stage.role.value),
+                    "dispatch_id": stage.orca_dispatch_id,
+                    "sequence": message.sequence,
+                    "subject": message.subject,
+                }
+                for message in unread
+            )
+        return {"run_id": run_id, "unread": pending}
+
+    try:
+        result = asyncio.run(read())
+    except (ConfigError, OrcaError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    if json_output:
+        _emit(result, json_output=True)
+        return
+    unread = cast(list[dict[str, object]], result["unread"])
+    if not unread:
+        typer.echo(f"run {run_id}\n\n  no unread direction on any stage in flight")
+        return
+    typer.echo(f"run {run_id}\n\n  {len(unread)} unread\n")
+    for message in unread:
+        typer.echo(
+            f"  seq {message['sequence']}  {message['lane']}:{message['role']}"
+            f"  {message['subject']}"
+        )
 
 
 @app.command(name="show")

@@ -267,6 +267,32 @@ safe to run against a live run. `doctor` reports what is currently being driven:
 uv run --project /home/kas/dev/orkastrator orkas doctor --json | jq .driving
 ```
 
+## Unread direction
+
+`orkas mail <run-id>` lists messages sent to a stage still in flight that its agent has not read.
+
+```
+run 1f13dd37-342a-4cd1-8137-c9a06fbcaaf3
+
+  3 unread
+
+  seq 262  application-lifecycle-kas-580:worker  Supervisor direction: boundary corrections required
+  seq 269  application-lifecycle-kas-580:worker  Correction to supervisor direction: point (1)
+  seq 281  application-lifecycle-kas-580:worker  Supervisor decision: upload target is decided
+```
+
+Sending direction to a dispatch reports success the moment Orca accepts it, and nothing afterwards
+says whether the agent ever looked. An agent that enters a wait loop around a subprocess stops
+checking its mailbox and does not resume on its own, so every message sent after that point is
+dropped in silence while both sides believe they are in contact. The run above lost three pieces of
+direction that way across several hours, and the loop they were meant to settle kept running.
+
+It reads the mailbox rather than consuming it. `orca orchestration check` marks messages read, so
+running that from the supervisor would destroy the evidence this command exists to find. Stages that
+have settled are skipped: nobody can read their mailbox any more, so unread there is expected.
+
+A non-empty listing means the supervisor is talking to itself.
+
 ## Reclaiming terminals
 
 Releasing a settled stage closes the pane orkastrator opened for it. That only covers stages

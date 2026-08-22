@@ -657,3 +657,47 @@ async def test_closing_a_terminal_orca_has_forgotten_is_already_the_outcome() ->
     await OrcaClient(runner).close_terminal("term-gone")
 
     assert runner.calls == [("terminal", "close", "--terminal", "term-gone", "--json")]
+
+
+async def test_unread_direction_is_listed_without_marking_it_read() -> None:
+    """`check` consumes; this must not, or reading the mailbox destroys the evidence."""
+
+    runner = FakeRunner(
+        [
+            {
+                "ok": True,
+                "result": {
+                    "messages": [
+                        {"sequence": 281, "read": 0, "subject": "decision: upload target"},
+                        {"sequence": 259, "read": 1, "subject": "Re: Question"},
+                        {"sequence": 262, "read": 0, "subject": "boundary corrections"},
+                    ]
+                },
+            }
+        ]
+    )
+
+    unread = await OrcaClient(runner).unread_messages("ctx-1")
+
+    # Read messages are dropped, and what is left is in the order it was sent.
+    assert [(message.sequence, message.subject) for message in unread] == [
+        (262, "boundary corrections"),
+        (281, "decision: upload target"),
+    ]
+    assert runner.calls == [
+        (
+            "orchestration",
+            "inbox",
+            "--terminal",
+            "dispatch:ctx-1",
+            "--limit",
+            "20",
+            "--json",
+        ),
+    ]
+
+
+async def test_a_mailbox_orca_describes_without_messages_is_empty_not_an_error() -> None:
+    unread = await OrcaClient(FakeRunner([{"ok": True, "result": {}}])).unread_messages("ctx-1")
+
+    assert unread == []
