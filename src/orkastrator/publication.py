@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -75,9 +76,11 @@ class GitHubPublisher:
         *,
         gh_command: tuple[str, ...] = ("gh",),
         runner: CommandRunner | None = None,
+        advisory_checks: Iterable[str] = (),
     ):
         self._gh = gh_command
         self._runner = runner or SubprocessCommandRunner()
+        self._advisory = frozenset(advisory_checks)
 
     async def publish(
         self,
@@ -203,13 +206,18 @@ class GitHubPublisher:
             checks = _required_checks(
                 _parse_checks(check_data, status_data, receipt.head_sha), None
             )
-        if any(item.status in {"failed", "cancelled"} for item in checks):
+        # Every check is recorded, so the receipt shows what the advisory suite
+        # actually did; only the enforced ones decide the lane.
+        gating = [item for item in checks if item.name not in self._advisory]
+        if any(item.status in {"failed", "cancelled"} for item in gating):
             status = "failed"
-        elif not checks or any(item.status == "pending" for item in checks):
+        elif not gating or any(item.status == "pending" for item in gating):
             # No checks at all is not a pass. GitHub needs a moment to register a
             # push's workflow runs, so a lane that asks right after publishing sees
             # an empty list, and reading that as "passed" would merge a lane whose
-            # CI never ran. Report pending and let the next tick ask again.
+            # CI never ran. Report pending and let the next tick ask again. A head
+            # whose only reported check is advisory is the same situation: nothing
+            # enforced has spoken yet.
             status = "pending"
         else:
             status = "passed"

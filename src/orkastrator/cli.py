@@ -263,7 +263,10 @@ def _controller() -> ExecutionController:
         config=settings.graph,
         orca=orca,
         store=store,
-        publisher=GitHubPublisher(gh_command=settings.github_command),
+        publisher=GitHubPublisher(
+            gh_command=settings.github_command,
+            advisory_checks=settings.graph.final_gate.advisory_checks,
+        ),
     )
 
 

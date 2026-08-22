@@ -305,6 +305,84 @@ async def test_a_branch_github_has_not_registered_yet_stays_pending() -> None:
     assert [item.name for item in observed.checks] == ["check-discovery"]
 
 
+async def test_a_check_the_repository_does_not_enforce_cannot_block_the_lane() -> None:
+    """The supervisor must not be stricter than the repository it publishes into.
+
+    kashh's `all-checks` job deletes its Chrome conformance suite from the set it
+    requires, by name, while that suite's launch boundary is intermittent. The
+    supervisor read every reported check instead and blocked a lane whose four
+    enforced suites had all passed. The advisory result still belongs in the
+    receipt - it is what the lane was told - it just does not decide anything.
+    """
+
+    sha = "d" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    reported = [
+        {"name": "conformance (advisory)", "bucket": "fail", "link": "", "description": "flaked"},
+        {"name": "pytest", "bucket": "pass", "link": "", "description": "ok"},
+    ]
+
+    def runner() -> QueueRunner:
+        return QueueRunner(
+            result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+            result(json.dumps(reported), returncode=8),
+        )
+
+    strict = await GitHubPublisher(runner=runner()).checks(receipt)
+    assert strict.status == "failed"
+
+    observed = await GitHubPublisher(
+        runner=runner(), advisory_checks=("conformance (advisory)",)
+    ).checks(receipt)
+
+    assert observed.status == "passed"
+    # Recorded, not hidden: the receipt is the audit of what CI actually said.
+    assert [(item.name, item.status) for item in observed.checks] == [
+        ("conformance (advisory)", "failed"),
+        ("pytest", "passed"),
+    ]
+
+
+async def test_a_head_whose_only_reported_check_is_advisory_stays_pending() -> None:
+    """Nothing enforced has spoken yet, which is the same as no checks at all."""
+
+    sha = "e" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        result(
+            json.dumps(
+                [{"name": "conformance (advisory)", "bucket": "pass", "link": "", "description": "ok"}]
+            ),
+            returncode=8,
+        ),
+    )
+
+    observed = await GitHubPublisher(
+        runner=runner, advisory_checks=("conformance (advisory)",)
+    ).checks(receipt)
+
+    assert observed.status == "pending"
+
+
 async def test_ready_transition_recovers_after_remote_success() -> None:
     receipt = PublicationReceipt(
         run_id="run-1234567890",

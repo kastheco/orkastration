@@ -178,6 +178,16 @@ class FinalGateConfig(BaseModel):
     require_remote: Literal[True]
     require_all_checks: Literal[True]
     restart_initial_review: Literal[False]
+    # Checks named here are observed and recorded but never gate the lane.
+    # `require_all_checks` still means every check the repository actually
+    # enforces; this is how a repository says which of its own checks it does
+    # not. Without it the supervisor is stricter than the repository: kashh's
+    # `all-checks` job excludes its Chrome conformance suite by name while that
+    # suite's launch boundary is intermittent, and a lane whose every enforced
+    # suite passed was blocked on the one check the repository had already
+    # decided not to enforce. Exact names only - a substring rule would silently
+    # widen the moment somebody names a real suite "advisory rollout".
+    advisory_checks: list[str] = Field(default_factory=list, max_length=32)
     on_failure: FinalGateFailureConfig
 
 
