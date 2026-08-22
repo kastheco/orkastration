@@ -1511,8 +1511,11 @@ class ExecutionController:
             return (
                 "Review the exact worker changeset once, read-only. Freeze every actionable "
                 "finding. Omit review_revision everywhere: the supervisor binds it and verifies "
-                "your checkout itself. Send worker_done with body set to only the JSON contract "
-                f"matching this schema: {schema}\n\n{context}"
+                "your checkout itself. Every validation command you write is executed directly "
+                "without a shell, so name one executable and pass its working directory as an "
+                "argument: no `cd`, `&&`, pipes or redirection, and a command that needs them "
+                "fails the finding it belongs to. Send worker_done with body set to only the JSON "
+                f"contract matching this schema: {schema}\n\n{context}"
             )
         finding = self._finding_for_stage(run_id, stage)
         contract = finding.effective_contract.model_dump_json()

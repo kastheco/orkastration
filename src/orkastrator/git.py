@@ -164,20 +164,49 @@ class LocalGit:
     async def validate(
         self, worktree_id: str, requirements: list[ValidationRequirement]
     ) -> list[ValidationResult]:
-        """Run configured validation commands without a shell."""
+        """Run configured validation commands without a shell.
+
+        A command that cannot be executed is a failed validation, never a raised
+        error. Reviewers write these commands, and a reviewer that writes
+        `cd app/ui && npx tsc -b` has written something exec cannot run - which is
+        worth failing that finding over, and is not worth killing the monitor tick
+        that every other lane in the run is waiting on. Say what the rule is in the
+        output so the adjudicator can revise the contract instead of guessing.
+        """
 
         cwd = worktree_path(worktree_id)
         results: list[ValidationResult] = []
         for requirement in requirements:
             arguments = shlex.split(requirement.command)
             if not arguments:
-                raise GitError("validation command cannot be empty")
-            process = await asyncio.create_subprocess_exec(
-                *arguments,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+                results.append(
+                    ValidationResult(
+                        command=requirement.command,
+                        status="failed",
+                        output="validation command is empty",
+                    )
+                )
+                break
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *arguments,
+                    cwd=cwd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                results.append(
+                    ValidationResult(
+                        command=requirement.command,
+                        status="failed",
+                        output=(
+                            f"could not execute {arguments[0]!r}: {exc}. Validation commands run "
+                            "without a shell, so operators, redirection and `cd` are unavailable; "
+                            "name one executable and pass its working directory as an argument."
+                        ),
+                    )
+                )
+                break
             stdout, stderr = await process.communicate()
             output = (stdout + stderr).decode(errors="replace")[-8_000:]
             results.append(
