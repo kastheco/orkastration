@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 from orkastrator import __version__, cli
 from orkastrator.config import GraphConfig
+from orkastrator.locks import run_lock
 from orkastrator.models import OrcaSnapshot, ProposalReceipt, SupervisorPlan
 from orkastrator.orca import OrcaError
 from orkastrator.store import StateStore
@@ -154,6 +155,31 @@ lanes:
     assert json.loads(proposed.stdout)["status"] == "proposed"
     assert json.loads(accepted.stdout)["status"] == "active"
     assert json.loads(monitored.stdout)["status"] == "complete"
+
+
+def test_a_second_driver_on_one_run_is_refused_by_name(fake_wiring: None, tmp_path: Path) -> None:
+    """Orca punishes two supervisors on one run with `consumer_fenced`, which
+    fails the *first* one intermittently rather than the second one cleanly. So
+    refuse in front of it, and say which process already has the run."""
+
+    with run_lock(tmp_path / "state.sqlite3", "run-1"):
+        refused = runner.invoke(cli.app, ["monitor", "run-1", "--json"])
+
+    assert refused.exit_code != 0
+    assert "already being driven by" in json.loads(refused.stderr)["error"]
+
+    # And the moment it is released, the same command works.
+    assert json.loads(runner.invoke(cli.app, ["monitor", "run-1", "--json"]).stdout)["status"]
+
+
+def test_doctor_names_the_run_a_live_supervisor_is_driving(
+    fake_wiring: None, tmp_path: Path
+) -> None:
+    with run_lock(tmp_path / "state.sqlite3", "run-1"):
+        result = runner.invoke(cli.app, ["doctor", "--json"])
+
+    assert [entry["run_id"] for entry in json.loads(result.stdout)["driving"]] == ["run-1"]
+    assert json.loads(runner.invoke(cli.app, ["doctor", "--json"]).stdout)["driving"] == []
 
 
 def test_propose_rejects_non_mapping_yaml(tmp_path: Path) -> None:

@@ -194,6 +194,31 @@ uv run --project /home/kas/dev/orkastrator orkas settle <run-id> \
   --finding <finding-id> --phase deferred --note "why" --json
 ```
 
+## One driver per run
+
+Orca binds a Task Run to the coordinator terminal that started its workers and refuses a
+`worker-start` from anyone else with `consumer_fenced`. That check is correct and it is also too late:
+a second ticker does not fail cleanly, it makes the *first* one fail intermittently until somebody
+notices. So `accept` and `monitor` take an exclusive lock on the run before they touch Orca, and a
+second one refuses by name:
+
+```
+error: run 1f13dd37-… is already being driven by pid 1833761 on kas since 2026-08-22T15:20:04+00:00;
+two supervisors on one run is what produces Orca's consumer_fenced. Stop the other one, or watch it
+instead of starting a second.
+```
+
+The lock is an `flock` on a file under `locks/` beside the database, which means the kernel releases
+it when the holding process dies, however it dies. There is no stale lock to break and no command to
+break one: a lock left behind by a dead supervisor is already free.
+
+Everything that only reads — `show`, `report`, `questions`, `snapshot`, `doctor` — is unlocked and
+safe to run against a live run. `doctor` reports what is currently being driven:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas doctor --json | jq .driving
+```
+
 ## Measuring convergence
 
 A run's cost is not its wall clock. It is how many agent dispatches each finding consumed, and how

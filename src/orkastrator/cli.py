@@ -16,6 +16,7 @@ from orkastrator import __version__
 from orkastrator.config import ConfigError, Settings
 from orkastrator.execution import ExecutionController
 from orkastrator.git import GitError
+from orkastrator.locks import RunLockedError, held_runs, run_lock
 from orkastrator.models import (
     FindingPhase,
     FindingReason,
@@ -70,6 +71,9 @@ def doctor(
             "orca_command": list(settings.orca_command),
             "github_command": list(settings.github_command),
             "orca_reachable": status.get("ok") is True,
+            # A live driver, read from the kernel rather than from a record that
+            # could be stale: "is something already ticking this run" in one command.
+            "driving": held_runs(settings.database_path),
         }
 
     _run(check(), json_output=json_output)
@@ -119,7 +123,7 @@ def accept(
 ) -> None:
     """Accept a proposal, create its Orca Task DAGs, and start the first wave."""
 
-    _run(_controller().accept(run_id), json_output=json_output)
+    _drive(run_id, _controller().accept(run_id), json_output=json_output)
 
 
 @app.command()
@@ -147,7 +151,7 @@ def monitor(
                 return result
             await asyncio.sleep(interval)
 
-    _run(advance(), json_output=json_output)
+    _drive(run_id, advance(), json_output=json_output)
 
 
 @app.command()
@@ -378,6 +382,24 @@ def _controller() -> ExecutionController:
             advisory_checks=settings.graph.final_gate.advisory_checks,
         ),
     )
+
+
+def _drive[T](run_id: str, awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
+    """Run one command that dispatches to Orca, as the run's only driver.
+
+    Orca refuses a `worker-start` from a terminal other than the one bound to
+    the Task Run, so a second supervisor on the same run does not fail cleanly:
+    it makes the first one fail, intermittently, until somebody notices. Refuse
+    in front of that instead, and name the process already holding the run.
+    """
+
+    try:
+        settings, _, _ = _components()
+        with run_lock(settings.database_path, run_id):
+            _run(awaitable, json_output=json_output)
+    except (ConfigError, RunLockedError) as exc:
+        awaitable.close()
+        _fail(str(exc), json_output=json_output)
 
 
 def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
