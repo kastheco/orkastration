@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 
 from orkastrator.models import (
+    AttemptKind,
+    EscalationDecision,
+    FindingPhase,
+    FindingReason,
+    FixAttempt,
     InitialReviewReport,
     LanePhase,
     StageKind,
@@ -264,3 +269,149 @@ def test_setup_rejects_proposed_v1_fixed_stage_state(tmp_path: Path) -> None:
 
     with pytest.raises(UnsupportedStateError, match="v1 fixed-stage"):
         store.setup()
+
+
+def test_reopening_a_finding_retires_its_settled_stage_and_stale_verdict(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "reopen.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    stage = store.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key="escalate:1",
+        role=StageKind.ESCALATION,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=1,
+    )
+    store.sync_stage(run_id, stage.stage_id, StagePhase.COMPLETED, None)
+    store.record_escalation(
+        run_id,
+        finding,
+        stage,
+        EscalationDecision(
+            finding_id=finding.finding_id,
+            round=1,
+            reason="validation_failed",
+            action="block",
+            rationale="The word this adjudicator wanted did not exist yet.",
+        ),
+    )
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+
+    reopened = store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_ESCALATION,
+        escalation_reason=FindingReason.VALIDATION_FAILED,
+        note="the vocabulary gained accept_fix",
+    )
+
+    assert reopened.phase is FindingPhase.PENDING_ESCALATION
+    assert reopened.escalation_reason is FindingReason.VALIDATION_FAILED
+    assert store.run(run_id).status == "active"
+    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
+    # The settled stage must stop answering to its key or the graph, which finds
+    # stages by key, never dispatches the replacement adjudication.
+    assert [
+        item.stage_key for item in store.stages(run_id) if item.role is StageKind.ESCALATION
+    ] != ["escalate:1"]
+    # And the stale verdict must be gone, or the fresh one is rejected on the
+    # frozen-contract guard rather than recorded.
+    assert (
+        store.ensure_stage(
+            run_id,
+            lane.lane_id,
+            stage_key="escalate:1",
+            role=StageKind.ESCALATION,
+            finding_key=finding.finding_key,
+            finding_id=finding.finding_id,
+            round=1,
+        ).phase
+        is StagePhase.PENDING
+    )
+
+
+def test_reopening_to_an_escalation_keeps_the_committed_fix_as_evidence(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "evidence.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    stage = store.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key="fix:1",
+        role=StageKind.FIXER,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=1,
+        attempt_kind=AttemptKind.PRIMARY,
+    )
+    store.record_fix_attempt(
+        run_id,
+        finding,
+        stage,
+        FixAttempt(
+            finding_id=finding.finding_id,
+            round=1,
+            status="fixed",
+            base_sha="b" * 40,
+            commit_sha="c" * 40,
+            changed_paths=["src/app.py"],
+            validation_results=[],
+            scope_expansion_required=None,
+        ),
+    )
+
+    store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_ESCALATION,
+        escalation_reason=FindingReason.VALIDATION_FAILED,
+        note="only the evidence was disputed",
+    )
+
+    kept = store.latest_fix_attempt(finding.finding_key)
+    assert kept is not None and kept.commit_sha == "c" * 40
+
+    # Reopening to the fix itself does discard it: that round is being redone.
+    store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_FIX,
+        note="the fix itself was wrong",
+    )
+    assert store.latest_fix_attempt(finding.finding_key) is None
+
+
+def test_a_finding_cannot_be_reopened_into_a_phase_no_stage_advances(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "phase.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+
+    with pytest.raises(ValueError, match="cannot reopen"):
+        store.reopen_finding(
+            run_id, finding.finding_id, phase=FindingPhase.RESOLVED, note="wishful"
+        )
+    with pytest.raises(KeyError):
+        store.reopen_finding(run_id, "finding-absent", phase=FindingPhase.PENDING_FIX, note="typo")

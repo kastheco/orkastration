@@ -16,7 +16,12 @@ from orkastrator import __version__
 from orkastrator.config import ConfigError, Settings
 from orkastrator.execution import ExecutionController
 from orkastrator.git import GitError
-from orkastrator.models import SupervisorPlan, workflow_contract_schemas
+from orkastrator.models import (
+    FindingPhase,
+    FindingReason,
+    SupervisorPlan,
+    workflow_contract_schemas,
+)
 from orkastrator.orca import OrcaClient, OrcaError, SubprocessRunner
 from orkastrator.publication import GitHubPublisher, PublicationError
 from orkastrator.store import StateStore, UnsupportedStateError
@@ -142,6 +147,43 @@ def monitor(
             await asyncio.sleep(interval)
 
     _run(advance(), json_output=json_output)
+
+
+@app.command()
+def reopen(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    finding: Annotated[str, typer.Option("--finding", help="Finding ID to send back.")],
+    phase: Annotated[
+        FindingPhase, typer.Option("--phase", help="Phase to reopen the finding into.")
+    ] = FindingPhase.PENDING_ESCALATION,
+    round: Annotated[
+        int | None,
+        typer.Option("--round", min=1, help="Round to reopen at. Defaults to the current one."),
+    ] = None,
+    reason: Annotated[
+        FindingReason | None,
+        typer.Option("--reason", help="Escalation trigger to adjudicate again."),
+    ] = None,
+    note: Annotated[
+        str, typer.Option("--note", help="Why this finding is being reopened.")
+    ] = "reopened by the supervisor",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Send a settled finding back to an earlier phase and clear what superseded it."""
+
+    try:
+        _, store, _ = _components()
+        record = store.reopen_finding(
+            run_id,
+            finding,
+            phase=phase,
+            round=round,
+            escalation_reason=reason,
+            note=note,
+        )
+    except (ConfigError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(record.model_dump(mode="json"), json_output=json_output)
 
 
 @app.command(name="show")

@@ -74,6 +74,22 @@ FindingOrigin = Literal[
 ]
 ContractRow = TypeVar("ContractRow", FixAttemptRow, ReReviewRow, EscalationRow)
 
+_SETTLED_STAGE_PHASES = frozenset(
+    {StagePhase.COMPLETED.value, StagePhase.FAILED.value, StagePhase.BLOCKED.value}
+)
+"""Stage phases `ensure_stage` will never dispatch again under the same key."""
+
+_REOPENABLE_PHASES = (
+    FindingPhase.PENDING_FIX,
+    FindingPhase.PENDING_RE_REVIEW,
+    FindingPhase.PENDING_ESCALATION,
+)
+"""The phases a settled finding may be sent back to.
+
+Every other phase either names work already in flight or is itself terminal, and
+reopening into one would hand the graph a state no stage can advance.
+"""
+
 
 class StateStore:
     """Persist workflow evidence without replacing Orca as runtime authority."""
@@ -729,6 +745,123 @@ class StateStore:
                 )
             ).one()
             return _finding(row)
+
+    def reopen_finding(
+        self,
+        run_id: str,
+        finding_id: str,
+        *,
+        phase: FindingPhase,
+        round: int | None = None,
+        escalation_reason: FindingReason | None = None,
+        note: str,
+    ) -> FindingRecord:
+        """Send one settled finding back to an earlier phase and clear what follows it.
+
+        A finding settles wrongly when the supervisor lacked a word for what an
+        agent meant, and until now the only way back was five hand-written UPDATE
+        statements against the state file. Two of those statements encode
+        implementation detail nobody should have to remember: `ensure_stage` keys
+        off `stage_key`, so a settled stage has to be renamed or the graph never
+        dispatches a replacement, and every contract row is frozen against its own
+        replay, so a stale verdict at the reopened round rejects the fresh one as
+        "contract changed after persistence".
+
+        So retire the stages at and after the reopened round, drop exactly the
+        contract classes that come after `phase`, and leave everything before it
+        alone - a fix that is already committed is evidence a re-adjudication may
+        still need.
+        """
+
+        if phase not in _REOPENABLE_PHASES:
+            raise ValueError(f"cannot reopen a finding into {phase.value}")
+        retired = 0
+        with self._session() as session:
+            row = session.exec(
+                select(FindingRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+                .where(LaneRow.run_id == run_id, FindingRow.finding_id == finding_id)
+            ).first()
+            if row is None:
+                raise KeyError(f"run {run_id} has no finding {finding_id}")
+            target = row.round if round is None else round
+            stages = session.exec(
+                select(WorkflowStageRow).where(
+                    WorkflowStageRow.finding_key == row.finding_key,
+                    col(WorkflowStageRow.round) >= target,
+                )
+            ).all()
+            for stage in stages:
+                if stage.phase not in _SETTLED_STAGE_PHASES:
+                    continue
+                stage.stage_key = f"{stage.stage_key}:reopened{_now():%Y%m%d%H%M%S}"
+                stage.updated_at = _now()
+                retired += 1
+            for contract in self._superseded_contracts(session, row.finding_key, target, phase):
+                session.delete(contract)
+            row.phase = phase.value
+            row.round = target
+            row.escalation_reason = None if escalation_reason is None else escalation_reason.value
+            row.updated_at = _now()
+            lane = session.get(LaneRow, row.lane_id)
+            if lane is not None and lane.phase != LanePhase.ACTIVE.value:
+                lane.phase = LanePhase.ACTIVE.value
+                lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status != "active":
+                run.status = "active"
+                run.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "finding_reopened",
+                {
+                    "finding_id": finding_id,
+                    "phase": phase.value,
+                    "round": target,
+                    "reason": None if escalation_reason is None else escalation_reason.value,
+                    "retired_stages": retired,
+                    "note": note[:4_000],
+                },
+            )
+            return _finding(row)
+
+    @staticmethod
+    def _superseded_contracts(
+        session: Session, finding_key: str, round: int, phase: FindingPhase
+    ) -> list[FixAttemptRow | ReReviewRow | EscalationRow]:
+        """Collect the frozen contracts a reopen at `phase` invalidates.
+
+        Reopening to an escalation keeps the fix attempt on purpose: `accept_fix`
+        settles a finding on a commit that already exists, so dropping the record of
+        that commit would take away the evidence the re-adjudication has to weigh.
+        """
+
+        rows: list[FixAttemptRow | ReReviewRow | EscalationRow] = list(
+            session.exec(
+                select(EscalationRow).where(
+                    EscalationRow.finding_key == finding_key, col(EscalationRow.round) >= round
+                )
+            ).all()
+        )
+        if phase in {FindingPhase.PENDING_FIX, FindingPhase.PENDING_RE_REVIEW}:
+            rows.extend(
+                session.exec(
+                    select(ReReviewRow).where(
+                        ReReviewRow.finding_key == finding_key, col(ReReviewRow.round) >= round
+                    )
+                ).all()
+            )
+        if phase is FindingPhase.PENDING_FIX:
+            rows.extend(
+                session.exec(
+                    select(FixAttemptRow).where(
+                        FixAttemptRow.finding_key == finding_key, col(FixAttemptRow.round) >= round
+                    )
+                ).all()
+            )
+        return rows
 
     def set_finding_state(
         self,
