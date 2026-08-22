@@ -221,7 +221,15 @@ class ReviewFinding(WorkflowContract):
     """Frozen, issue-scoped contract emitted by the initial reviewer."""
 
     id: FindingId
-    review_revision: ReviewRevision
+    review_revision: ReviewRevision | None = None
+    """Absent means the revision the supervisor binds this finding to.
+
+    An agent that retypes a 64-character digest sometimes elides its middle, and
+    that cost a whole finding a terminal block. The supervisor already knows the
+    frozen revision, so let a contract omit it and be stamped rather than demand
+    a transcription no agent is the authority on.
+    """
+
     evidence: list[FindingEvidence] = Field(min_length=1, max_length=64)
     failure_mode: str = Field(min_length=1, max_length=4_000)
     required_outcome: str = Field(min_length=1, max_length=4_000)
@@ -234,7 +242,9 @@ class ReviewFinding(WorkflowContract):
 class InitialReviewReport(WorkflowContract):
     """One full lane review that freezes the complete initial finding set."""
 
-    review_revision: ReviewRevision
+    review_revision: ReviewRevision | None = None
+    """Absent means the frozen worker revision the supervisor binds this to."""
+
     summary: str = Field(min_length=1, max_length=8_000)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=128)
 
@@ -246,7 +256,12 @@ class InitialReviewReport(WorkflowContract):
         if len(by_id) != len(self.findings):
             raise ValueError("finding IDs must be unique")
         for finding in self.findings:
-            if finding.review_revision != self.review_revision:
+            named = finding.review_revision
+            if (
+                named is not None
+                and self.review_revision is not None
+                and named != self.review_revision
+            ):
                 raise ValueError(f"finding {finding.id} uses a different review revision")
             unknown = set(finding.dependencies).difference(by_id)
             if unknown:
@@ -415,7 +430,15 @@ class EscalationDecision(WorkflowContract):
         "validation_failed",
         "worker_decision",
     ]
-    action: Literal["approve_scope_revision", "defer", "block"]
+    action: Literal["approve_unchanged", "approve_scope_revision", "defer", "block"]
+    """approve_unchanged means the finding stands exactly as frozen.
+
+    An adjudicator that agrees with a finding and agrees its scope is already
+    sufficient used to have no action to name, so it picked block and killed a
+    live finding it had just called correct. Approving without a revision is a
+    real outcome and now has a word.
+    """
+
     rationale: str = Field(min_length=1, max_length=4_000)
     revised_finding: ReviewFinding | None = None
 

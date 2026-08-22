@@ -180,6 +180,7 @@ def escalation(
     *,
     round: int = 1,
     finding_id: str = "finding-1",
+    revised_finding: dict[str, object] | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -188,7 +189,7 @@ def escalation(
             "reason": reason,
             "action": action,
             "rationale": "Bounded adjudication.",
-            "revised_finding": None,
+            "revised_finding": revised_finding,
         }
     )
 
@@ -330,6 +331,7 @@ class FakeGit(LocalGit):
         self.integrated: dict[str, str] = {}
         self.changed_override: list[str] | None = None
         self.head_override: str | None = None
+        self.ancestor_override: bool | None = None
         self.lane_head_override: str | None = None
         self.conflict = False
         self.crash_after_cherry_pick = False
@@ -377,6 +379,8 @@ class FakeGit(LocalGit):
         return "c" * 64
 
     async def is_ancestor(self, worktree_id: str, base_sha: str, head_sha: str) -> bool:
+        if self.ancestor_override is not None and "finding-" in worktree_id:
+            return self.ancestor_override
         return True
 
     async def commit_count(self, worktree_id: str, base_sha: str, head_sha: str) -> int:
@@ -858,7 +862,25 @@ async def test_partial_re_review_discovery_replays_idempotently(tmp_path: Path) 
         ],
     )
     orca.complete_dispatched(body)
-    persisted = ReReviewResult.model_validate_json(body)
+    # A crash-replay finds what the supervisor persisted, which is the report
+    # already restated on the revision it derived for the fixer commit.
+    bound = {
+        "base_sha": "b" * 40,
+        "head_sha": fixer_sha("finding-1", 1),
+        "diff_sha256": "c" * 64,
+    }
+    raw = ReReviewResult.model_validate_json(body)
+    persisted = raw.model_copy(
+        update={
+            "reviewed_commit_sha": fixer_sha("finding-1", 1),
+            "new_findings": [
+                item.model_copy(
+                    update={"finding": item.finding.model_copy(update={"review_revision": bound})}
+                )
+                for item in raw.new_findings
+            ],
+        }
+    )
     original = store.findings(run_id)[0]
     stage = next(item for item in store.stages(run_id) if item.role is StageKind.RE_REVIEWER)
     store.record_re_review(run_id, original, stage, persisted)
@@ -967,10 +989,84 @@ async def test_out_of_scope_diff_is_rejected_and_escalated(tmp_path: Path) -> No
     assert payload["actual_paths"] == ["src/outside.py"]
 
 
-async def test_exact_fixer_head_is_required_before_re_review(tmp_path: Path) -> None:
+async def test_fixer_identity_is_taken_from_the_record_not_from_the_report(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    mistyped = json.loads(fix_attempt())
+    mistyped["base_sha"] = "0" * 40
+    mistyped["commit_sha"] = "1" * 40
+    orca.complete_dispatched(json.dumps(mistyped))
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.RE_REVIEWER
+    attempt = store.latest_fix_attempt(store.findings(run_id)[0].finding_key)
+    assert attempt is not None
+    assert attempt.base_sha == "b" * 40
+    assert attempt.commit_sha == fixer_sha("finding-1", 1)
+
+
+async def test_adjudicator_may_omit_the_revision_of_a_revised_contract(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    await value.monitor(run_id)
+    revised = review_finding_data()
+    del revised["review_revision"]
+    revised["allowed_write_scope"] = {"paths": ["src/file1.py", "src/widened.py"], "symbols": []}
+    orca.complete_dispatched(
+        escalation("validation_failed", "approve_scope_revision", revised_finding=revised)
+    )
+
+    result = await value.monitor(run_id)
+
+    finding = result.findings[0]
+    assert finding.phase is FindingPhase.FIXING
+    assert finding.round == 2
+    contract = store.findings(run_id)[0].effective_contract
+    assert contract.review_revision is not None
+    assert contract.review_revision.head_sha == "b" * 40
+    assert contract.allowed_write_scope.paths == ["src/file1.py", "src/widened.py"]
+
+
+async def test_approving_a_finding_unchanged_starts_the_next_fix_round(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    await value.monitor(run_id)
+    frozen = store.findings(run_id)[0].effective_contract
+    orca.complete_dispatched(escalation("validation_failed", "approve_unchanged"))
+
+    result = await value.monitor(run_id)
+
+    finding = result.findings[0]
+    assert finding.phase is FindingPhase.FIXING
+    assert finding.round == 2
+    assert store.findings(run_id)[0].effective_contract == frozen
+
+
+async def test_fixer_head_off_its_assigned_base_is_rejected_before_re_review(
+    tmp_path: Path,
+) -> None:
     orca = FakeOrca()
     git = FakeGit()
     git.head_override = "9" * 40
+    git.ancestor_override = False
     value, _ = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
