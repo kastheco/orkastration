@@ -214,6 +214,35 @@ def settle(
 
 
 @app.command()
+def resume(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    lane: Annotated[
+        str | None,
+        typer.Option("--lane", help="Lane to resume. Defaults to every blocked lane."),
+    ] = None,
+    note: Annotated[
+        str, typer.Option("--note", help="Why this lane is being resumed.")
+    ] = "resumed by the supervisor",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Clear a lane block and let the run advance again.
+
+    `reopen` and `settle` act on findings. A lane that blocked with every
+    finding already settled - on a CI query made a second too early, on a pull
+    request somebody merged - is reachable by neither, and this is that case.
+    """
+
+    try:
+        resumed = _controller().resume(run_id, lane, note)
+    except (ConfigError, KeyError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _emit(
+        {"run_id": run_id, "resumed": [item.model_dump(mode="json") for item in resumed]},
+        json_output=json_output,
+    )
+
+
+@app.command()
 def reauthorize(
     run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
     note: Annotated[str, typer.Option("--note", help="Why this policy change is authorized.")],

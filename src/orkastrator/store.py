@@ -1583,6 +1583,34 @@ class StateStore:
         self.set_lane_phase(run_id, lane_id, LanePhase.BLOCKED)
         self._append_event(run_id, lane_id, "lane_blocked", {"reason": reason[:4_000]})
 
+    def resume_lane(self, run_id: str, lane_id: str, note: str) -> None:
+        """Lift a lane block, and clear the run status that block wrote.
+
+        Both halves, because either one alone leaves the owner somewhere they
+        cannot get out of. A lane left BLOCKED is skipped by publication; a run
+        row left `blocked` reads as stopped even once every lane is healthy.
+        """
+
+        with self._session() as session:
+            lane = session.get(LaneRow, lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {lane_id}")
+            if lane.phase != LanePhase.BLOCKED.value:
+                raise ValueError(f"lane {lane.name} is {lane.phase}, not blocked")
+            lane.phase = LanePhase.ACTIVE.value
+            lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status in {"blocked", "failed"}:
+                run.status = "active"
+                run.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                lane_id,
+                "supervisor_resumed_lane",
+                {"lane": lane.name, "note": note[:4_000]},
+            )
+
     def set_terminal_status(self, run_id: str, status: str) -> None:
         if status not in {"complete", "failed", "blocked"}:
             raise ValueError(f"invalid terminal status {status}")

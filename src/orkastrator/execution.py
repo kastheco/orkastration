@@ -1444,6 +1444,16 @@ class ExecutionController:
                 )
             self._store.set_lane_phase(run_id, lane.lane_id, phase)
             lane_phases.append(phase)
+        if any(phase is LanePhase.ACTIVE for phase in lane_phases):
+            # One lane blocking has no bearing on a lane that is still working,
+            # and calling the whole run terminal because of it stops the ones
+            # that were fine. `assistant-kas-576` blocked on a CI query it made
+            # one second too early and took `ui-kas-564` and
+            # `application-lifecycle-kas-580` down with it, neither of which had
+            # anything to do with that pull request. The run is terminal when
+            # nothing is left that could still move; until then the per-lane
+            # phases carry the block, which is where it belongs.
+            return "active"
         if any(phase is LanePhase.FAILED for phase in lane_phases):
             return "failed"
         if any(phase is LanePhase.BLOCKED for phase in lane_phases):
@@ -1536,6 +1546,36 @@ class ExecutionController:
         )
         self._store.reauthorize_acceptance(run_id, authorization, note)
         return authorization
+
+    def resume(self, run_id: str, lane_name: str | None, note: str) -> list[LaneRecord]:
+        """Clear a lane block the owner has looked at, and let the run advance again.
+
+        `reopen` and `settle` both act on findings. A lane that blocked after
+        every one of its findings had settled - on a CI query, on a pull request
+        somebody merged - is reachable by neither, which is why recovering one
+        has meant hand-written UPDATE statements against `lanes` and
+        `supervisor_runs`. Those two commands exist to make that unnecessary;
+        this is the third case they missed.
+
+        The run's recorded status is cleared with the block. Leaving it terminal
+        would be half a recovery: the next tick derives the real status anyway,
+        and a stale `blocked` on the row is exactly what makes an owner think
+        the run is still stopped.
+        """
+
+        lanes = [
+            lane
+            for lane in self._store.lanes(run_id)
+            if lane.phase is LanePhase.BLOCKED and lane_name in {None, lane.name}
+        ]
+        if not lanes:
+            named = f"lane {lane_name} of " if lane_name else ""
+            raise ValueError(f"{named}run {run_id} has no blocked lane to resume")
+        for lane in lanes:
+            self._store.resume_lane(run_id, lane.lane_id, note)
+        return [
+            lane for lane in self._store.lanes(run_id) if lane.lane_id in {x.lane_id for x in lanes}
+        ]
 
     def _require_authorization(self, run_id: str) -> AcceptanceAuthorization:
         """Reject resumed work when its frozen proposal or graph policy changed."""

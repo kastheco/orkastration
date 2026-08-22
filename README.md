@@ -186,6 +186,20 @@ The same lanes, findings and worktrees continue under the new policy, and the ch
 `supervisor_reauthorized_policy` event carrying both digests and the note. If the *proposal* changed
 rather than the config, this refuses, because that is a different plan and wants a new proposal.
 
+A lane can block with every one of its findings already settled — on a required-check query made a
+second after pushing its branch, or on a pull request somebody merged out from under it. `reopen` and
+`settle` both act on findings, so neither reaches that lane. `resume` does:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas resume <run-id> \
+  --lane <lane-name> --note "why" --json
+```
+
+Without `--lane` it resumes every blocked lane in the run. It clears the lane block and the run status
+the block wrote, because a run row left `blocked` reads as stopped even once every lane is healthy. A
+blocked lane no longer stops the others in the first place: the run reports terminal only when nothing
+is left that could still move, and the per-lane phases carry the block until then.
+
 Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
 so it is a separate command from `reopen` and it records the note as evidence:
 

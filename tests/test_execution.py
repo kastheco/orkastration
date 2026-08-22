@@ -1914,6 +1914,87 @@ async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
     assert [start["task_id"] for start in orca.starts] == ["task-1", "task-2"]
 
 
+async def test_a_blocked_lane_does_not_stop_a_lane_that_is_still_working(
+    tmp_path: Path,
+) -> None:
+    """One lane's block is one lane's problem.
+
+    `assistant-kas-576` blocked on a required-check query it made one second
+    after pushing its branch, and that took the whole run terminal - stopping
+    `ui-kas-564` and `application-lifecycle-kas-580`, neither of which had
+    anything to do with that pull request.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal(lane_count=2)).run_id
+    await value.accept(run_id)
+
+    blocked, working = store.lanes(run_id)
+    store.block_lane(run_id, blocked.lane_id, "GitHub required-check query failed")
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "active"
+    phases = {lane.name: lane.phase for lane in result.lanes}
+    assert phases[blocked.name] is LanePhase.BLOCKED
+    assert phases[working.name] is LanePhase.ACTIVE
+    # And the run row itself was never written terminal.
+    assert store.run(run_id).status == "active"
+
+
+async def test_resuming_a_blocked_lane_clears_the_block_and_the_run_status(
+    tmp_path: Path,
+) -> None:
+    """`reopen` and `settle` act on findings, and this lane has none left."""
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    lane = store.lanes(run_id)[0]
+    store.block_lane(run_id, lane.lane_id, "the authorized lane pull request is no longer open")
+    store.set_terminal_status(run_id, "blocked")
+
+    resumed = value.resume(run_id, None, "owner merged it on purpose")
+
+    assert [item.name for item in resumed] == [lane.name]
+    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
+    # Half a recovery is not one: a run row left `blocked` reads as stopped.
+    assert store.run(run_id).status == "active"
+    notes = [
+        event["payload"]
+        for event in store.events(run_id)
+        if event["kind"] == "supervisor_resumed_lane"
+    ]
+    assert notes == [{"lane": lane.name, "note": "owner merged it on purpose"}]
+
+
+async def test_resuming_names_the_lane_when_that_lane_is_not_blocked(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal(lane_count=2)).run_id
+    await value.accept(run_id)
+    blocked, working = store.lanes(run_id)
+    store.block_lane(run_id, blocked.lane_id, "blocked")
+
+    with pytest.raises(ValueError, match=f"lane {working.name} of run .* no blocked lane"):
+        value.resume(run_id, working.name, "note")
+
+    # The one that is blocked still resumes by name, and only that one.
+    assert [item.name for item in value.resume(run_id, blocked.name, "note")] == [blocked.name]
+
+
+async def test_resuming_a_run_with_nothing_blocked_is_refused(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    with pytest.raises(ValueError, match="no blocked lane to resume"):
+        value.resume(run_id, None, "note")
+
+
 async def test_restart_recovers_dispatch_started_before_local_binding(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, store = controller(tmp_path, orca)
