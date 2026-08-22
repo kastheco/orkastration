@@ -452,6 +452,9 @@ class ExecutionController:
             raise ValueError("fix attempt does not match its persisted finding and round")
         self._store.record_fix_attempt(run_id, finding, stage, attempt)
         if attempt.status == "fixed":
+            if not _validation_satisfied(finding, attempt):
+                self._escalate(run_id, finding, FindingReason.VALIDATION_FAILED)
+                return
             if not await self._validate_fixer_commit(run_id, finding, stage, attempt):
                 self._escalate(run_id, finding, FindingReason.SCOPE_ESCAPE)
                 return
@@ -1401,9 +1404,10 @@ class ExecutionController:
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
                 "Start from the assigned frozen review head and produce exactly one commit that "
-                "fully resolves the finding. Do not widen scope. Send worker_done with body set "
-                "to only the JSON contract "
-                f"matching this schema: {schema}\n\n{context}"
+                "fully resolves the finding. Do not widen scope. Run exactly the validation "
+                "commands this finding names and report each one; they are the whole obligation, "
+                "so do not re-run the lane's wider suite. Send worker_done with body set to only "
+                f"the JSON contract matching this schema: {schema}\n\n{context}"
             )
         if stage.role is StageKind.RE_REVIEWER:
             attempt = self._store.latest_fix_attempt(finding.finding_key)
@@ -1421,6 +1425,24 @@ class ExecutionController:
             f"Trigger: {finding.escalation_reason}. Send worker_done with body set to only the "
             f"JSON contract matching this schema: {schema}\n\n{context}"
         )
+
+
+def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
+    """Require the finding's own validation list, and treat it as the whole obligation.
+
+    The finding names the checks that prove it resolved, so a fix that skips one
+    has not been shown to work. Nothing here demands more: re-running a whole lane
+    suite to close one bounded finding is the cost this workflow exists to avoid.
+    """
+
+    observed = {
+        result.command: result.status
+        for result in attempt.validation_results
+        if result.status == "passed"
+    }
+    return all(
+        requirement.command in observed for requirement in finding.effective_contract.validation
+    )
 
 
 def _task_id(task: JsonObject) -> str:

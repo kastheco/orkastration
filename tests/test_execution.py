@@ -125,6 +125,7 @@ def fix_attempt(
     status: str = "fixed",
     base_sha: str | None = None,
     changed_path: str | None = None,
+    validation: list[dict[str, str]] | None = None,
 ) -> str:
     commit = fixer_sha(finding_id, round)
     base = base_sha or "b" * 40
@@ -139,7 +140,11 @@ def fix_attempt(
             "changed_paths": [changed_path or f"src/file{path_number}.py"]
             if status == "fixed"
             else [],
-            "validation_results": [],
+            "validation_results": (
+                validation
+                if validation is not None
+                else [{"command": "pytest", "status": "passed", "output": "passed"}]
+            ),
             "scope_expansion_required": (
                 {"paths": ["src/shared.py"], "reason": "Required."}
                 if status == "blocked_scope"
@@ -1024,7 +1029,14 @@ async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: P
     fixer_starts = [item for item in orca.starts if "fixer" in str(item["lane_name"])]
     for start in fixer_starts:
         finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
-        orca.complete_task(str(start["task_id"]), fix_attempt(finding_id))
+        command = "pytest" if finding_id == "finding-1" else "pytest tests/test_two.py"
+        orca.complete_task(
+            str(start["task_id"]),
+            fix_attempt(
+                finding_id,
+                validation=[{"command": command, "status": "passed", "output": "passed"}],
+            ),
+        )
     result = await value.monitor(run_id)
     assert [item.role for item in result.started] == [StageKind.RE_REVIEWER], store.events(run_id)
 
@@ -1083,7 +1095,15 @@ async def test_introduced_regression_integrates_the_approved_composite_chain(
     assert result.started[0].role is StageKind.FIXER
     corrected_commit = fixer_sha("finding-2", 1)
     git.commit_chain_override = [original_commit, corrected_commit]
-    orca.complete_dispatched(fix_attempt("finding-2", base_sha=original_commit))
+    orca.complete_dispatched(
+        fix_attempt(
+            "finding-2",
+            base_sha=original_commit,
+            validation=[
+                {"command": "pytest tests/regression.py", "status": "passed", "output": "passed"}
+            ],
+        )
+    )
     await value.monitor(run_id)
     orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
 
@@ -1700,3 +1720,53 @@ async def test_adjudicated_worker_decision_resumes_as_a_bounded_fixer(tmp_path: 
     assert [launch.role for launch in result.started] == [StageKind.FIXER]
     assert result.findings[0].phase is FindingPhase.FIXING
     assert result.findings[0].round == 2
+
+
+async def test_fixer_missing_a_required_validation_escalates(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+    assert [launch.role for launch in result.started] == [StageKind.ESCALATION]
+
+
+async def test_fixer_reporting_a_failed_required_validation_escalates(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(
+        fix_attempt(validation=[{"command": "pytest", "status": "failed", "output": "1 failed"}])
+    )
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+
+async def test_fixer_may_add_its_own_proof_beyond_the_contract(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(
+        fix_attempt(
+            validation=[
+                {"command": "pytest", "status": "passed", "output": "passed"},
+                {"command": "pytest tests/test_one.py", "status": "passed", "output": "passed"},
+            ]
+        )
+    )
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is None
+    assert [launch.role for launch in result.started] == [StageKind.RE_REVIEWER]
