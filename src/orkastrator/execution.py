@@ -662,7 +662,7 @@ class ExecutionController:
                 retry_round = finding.round if conflicts < limit else finding.round + 1
             else:
                 retry_round = finding.round + 1
-            if retry_round > limit and self._first_adjudicated_retry(run_id, finding, limit):
+            if retry_round > limit and self._first_adjudicated_retry(finding, limit):
                 # An adjudicator that inspected the head itself and asked for one
                 # more attempt is supervising, not watching a fixer thrash on one
                 # defect, so it gets a retry at the ceiling round rather than
@@ -688,26 +688,20 @@ class ExecutionController:
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
             self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
 
-    def _first_adjudicated_retry(self, run_id: str, finding: FindingRecord, limit: int) -> bool:
+    def _first_adjudicated_retry(self, finding: FindingRecord, limit: int) -> bool:
         """Say whether this finding still holds its one supervised retry at the ceiling.
 
-        Spend the grant against the fixer stages that actually ran, not against
-        the decisions that asked for them: an adjudicator repeating itself
-        verbatim records no second row, so counting verdicts would hand out the
-        same retry forever.
+        Spend the grant against the attempts the ledger accepted, not against the
+        decisions that asked for them and not against the stages that ran. An
+        adjudicator repeating itself verbatim records no second verdict, so
+        counting verdicts would hand out the same retry forever; and a stage that
+        only re-landed an existing commit after a conflict did no new fix work,
+        so counting stages would spend the grant on a rebase.
         """
 
         if finding.round != limit:
             return False
-        attempts = sum(
-            1
-            for stage in self._store.stages(run_id)
-            if stage.role is StageKind.FIXER
-            and stage.lane_id == finding.lane_id
-            and stage.finding_id == finding.finding_id
-            and stage.round == limit
-        )
-        return attempts == 1
+        return self._store.fix_attempt_count(finding.finding_key, limit) == 1
 
     def _reject_stage(self, run_id: str, stage: StageRecord, reason: str) -> None:
         if stage.finding_id is None:

@@ -1045,6 +1045,19 @@ class StateStore:
             )
             return FixAttempt.model_validate_json(rows[0].payload_json)
 
+    def fix_attempt_count(self, finding_key: str, round: int) -> int:
+        """Count the fix attempts this finding actually recorded at one round."""
+
+        with self._session() as session:
+            return len(
+                session.exec(
+                    select(FixAttemptRow).where(
+                        FixAttemptRow.finding_key == finding_key,
+                        FixAttemptRow.round == round,
+                    )
+                ).all()
+            )
+
     def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
         with self._session() as session:
             rows = list(
