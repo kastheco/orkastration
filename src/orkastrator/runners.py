@@ -36,8 +36,18 @@ MAX_OUTPUT = 8_000
 # Room for the failures themselves once the summary and header are accounted for.
 _KEEP_FAILURES = 12
 
+# Runners colour their output whenever they think a terminal is watching, and
+# pytest under `-n` decides that from the parent, not from this pipe. Every
+# pattern below is written against plain text, so the colour comes off first.
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# The summary line appears two ways and both have to match. Verbose pytest frames
+# it in `=` rules; `-q` prints it bare. What is stable across both is that the
+# line carries an outcome word and the run's duration, so key on that rather than
+# on the furniture around it.
 _PYTEST_SUMMARY = re.compile(
-    r"^=+\s*(?P<body>[^=]*\b(?:passed|failed|error|errors|no tests ran)\b[^=]*?)\s*=+$",
+    r"^=*\s*(?P<body>(?:[^=\n]*\b(?:passed|failed|error|errors)\b[^=\n]*?\bin\s[\d.]+s[^=\n]*|"
+    r"no tests ran[^=\n]*))\s*=*$",
     re.MULTILINE,
 )
 _PYTEST_FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+\S.*$", re.MULTILINE)
@@ -80,6 +90,8 @@ def condense(output: str, *, returncode: int, satisfied: bool) -> str:
 def _condense(output: str, *, returncode: int, satisfied: bool) -> str:
     if not output.strip():
         return "" if satisfied else f"no output; exit status {returncode}"
+
+    output = _ANSI.sub("", output)
 
     for parser in (_pytest, _tsc, _node_tap, _vitest):
         condensed = parser(output, satisfied=satisfied)
