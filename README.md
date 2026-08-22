@@ -352,6 +352,14 @@ start rejection rate     0.196   (20 of 102 starts; 7 reservations reset)
 findings past round 1    7 of 12
 stages past soft budget  1   (0 released for exceeding a hard budget)
 
+still open
+    455m  application-lifecycle-kas-580:worker
+
+wall clock by role
+   1675m  escalation
+    736m  fixer
+    559m  worker
+
 overdue stages were doing
     3  exec poll loop
     1  unknown
@@ -372,6 +380,17 @@ poll loop` is a stage that spent its budget making the same call over and over -
 waiting on a subprocess by burning an inference every thirty seconds - and it is the one entry
 there that names waste rather than slowness. `unknown` is a stage that could not be read, which is
 deliberately not folded into a tool bucket.
+
+Every ratio above `still open` counts work that finished, so a run with one stage stuck for hours
+scores exactly like a healthy one until that stage closes. `still open` is the line that tells them
+apart. Its clock starts when the stage row was created rather than when the surviving worker was
+dispatched, so a stage that was dispatched, lost and re-dispatched reads as one long open stage: the
+supervisor has been holding it for that whole span, and a runtime-only figure would hide every
+abandoned attempt inside it.
+
+`wall clock by role` answers a different question from `dispatches per finding`, and usually gives a
+different answer. A run can spend most of its dispatches on fixers and most of its hours on
+escalations.
 
 A rejected start is the most expensive thing that can happen: a whole dispatch billed for input,
 output and wall clock, and nothing kept. So the buckets are named for who could have prevented it.

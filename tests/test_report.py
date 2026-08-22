@@ -78,6 +78,9 @@ def _stage(
     finding_id: str | None = None,
     round: int | None = None,
     key: str = "",
+    released: bool = True,
+    created: datetime = NOW,
+    updated: datetime = NOW,
 ) -> StageRecord:
     return StageRecord(
         stage_id=key or f"{lane_id}:{role}:{finding_id}:{round}",
@@ -93,9 +96,9 @@ def _stage(
         worktree_id=None,
         result_json=None,
         processed=True,
-        released=True,
-        created_at=NOW,
-        updated_at=NOW,
+        released=released,
+        created_at=created,
+        updated_at=updated,
     )
 
 
@@ -255,6 +258,72 @@ def test_rejections_separate_the_supervisor_own_faults_from_the_agent_ones():
         "unresolved_sha": 1,
         "malformed_result": 1,
     }
+
+
+def test_an_open_stage_is_measured_to_now_and_a_released_one_to_its_last_touch():
+    """Every ratio above counts finished work, so only this line sees a stuck run."""
+
+    start = datetime(2026, 8, 22, 6, 0, tzinfo=UTC)
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    stages = [
+        _stage("lane", StageKind.WORKER, key="open", released=False, created=start, updated=start),
+        _stage(
+            "lane",
+            StageKind.FIXER,
+            key="done",
+            created=start,
+            updated=datetime(2026, 8, 22, 6, 30, tzinfo=UTC),
+        ),
+    ]
+
+    report = build_report(
+        run_id="run",
+        lanes=[_lane("lane", "demo")],
+        stages=stages,
+        findings=[],
+        integrations=[],
+        publications=[],
+        events=[],
+        now=now,
+    )
+
+    assert [(item.lane, item.role, item.minutes) for item in report.live_stages] == [
+        ("demo", "worker", 360)
+    ]
+    assert report.minutes_by_role == {"worker": 360, "fixer": 30}
+    rendered = render(report)
+    assert "  360m  demo:worker" in rendered
+    assert "wall clock by role" in rendered
+
+
+def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished():
+    """Two reports of one settled run must be comparable, so `now` cannot leak in."""
+
+    start = datetime(2026, 8, 22, 6, 0, tzinfo=UTC)
+    stages = [
+        _stage(
+            "lane",
+            StageKind.WORKER,
+            key="done",
+            created=start,
+            updated=datetime(2026, 8, 22, 7, 0, tzinfo=UTC),
+        )
+    ]
+    kwargs = {
+        "run_id": "run",
+        "lanes": [_lane("lane", "demo")],
+        "stages": stages,
+        "findings": [],
+        "integrations": [],
+        "publications": [],
+        "events": [],
+    }
+
+    early = build_report(**kwargs, now=datetime(2026, 8, 22, 8, 0, tzinfo=UTC))
+    late = build_report(**kwargs, now=datetime(2026, 9, 22, 8, 0, tzinfo=UTC))
+
+    assert early.minutes_by_role == late.minutes_by_role == {"worker": 60}
+    assert early.live_stages == late.live_stages == ()
 
 
 def test_late_stages_are_grouped_by_behaviour_not_by_the_ratio_that_proves_it():

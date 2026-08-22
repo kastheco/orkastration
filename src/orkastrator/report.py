@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 
 from orkastrator.models import (
     FindingRecord,
@@ -31,7 +32,7 @@ from orkastrator.models import (
     StageRecord,
 )
 
-__all__ = ["FindingReport", "LaneReport", "RunReport", "build_report", "render"]
+__all__ = ["FindingReport", "LaneReport", "LiveStage", "RunReport", "build_report", "render"]
 
 # The roles that cost a dispatch per finding rather than per lane. A worker and
 # an initial reviewer run once for the whole lane no matter how many findings
@@ -51,6 +52,15 @@ class FindingReport:
     dispatches: int
     repeats: int
     escalations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LiveStage:
+    """A stage the supervisor has not finished with, and how long that has been."""
+
+    lane: str
+    role: str
+    minutes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +114,15 @@ class RunReport:
     # all poll loops has a different problem from one whose late stages are all
     # working, and only this line tells them apart.
     overdue_by_activity: dict[str, int] = field(default_factory=dict)
+    # Stages still held, longest first. A run can look healthy on every ratio
+    # above while one stage has been open for hours: the ratios only count work
+    # that finished, so an unfinished stage is invisible to all of them. This is
+    # the line that says a run is stuck rather than slow.
+    live_stages: tuple[LiveStage, ...] = ()
+    # Total wall clock each role has consumed. Ratios say how many dispatches a
+    # finding cost; this says which role the hours went to, which is a different
+    # question and often a different answer.
+    minutes_by_role: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -118,8 +137,16 @@ def build_report(
     integrations: list[IntegrationRecord],
     publications: list[PublicationReceipt],
     events: list[dict[str, object]],
+    now: datetime | None = None,
 ) -> RunReport:
-    """Reduce one run's persisted rows to its convergence metrics."""
+    """Reduce one run's persisted rows to its convergence metrics.
+
+    `now` is the clock a still-open stage is measured against. It is a parameter
+    rather than a call to the wall clock so that two reports of the same finished
+    run are byte-identical, which is the whole point of comparing them.
+    """
+
+    now = now or datetime.now(UTC)
 
     lane_names = {lane.lane_id: lane.name for lane in lanes}
     published = {receipt.lane for receipt in publications}
@@ -200,6 +227,26 @@ def build_report(
         for lane in lanes
     )
 
+    live: list[LiveStage] = []
+    minutes: Counter[str] = Counter()
+    for stage in stages:
+        # A released stage is measured to its last touch; an open one to now.
+        # The clock starts at `created_at`, so a stage that was dispatched, lost
+        # and re-dispatched reads as one long open stage rather than as however
+        # long the surviving worker has been alive. That is the honest number:
+        # the supervisor has been holding that stage for the whole span, and a
+        # runtime-only figure would hide every abandoned attempt inside it.
+        elapsed = _minutes(stage.created_at, stage.updated_at if stage.released else now)
+        minutes[str(stage.role.value)] += elapsed
+        if not stage.released:
+            live.append(
+                LiveStage(
+                    lane=lane_names.get(stage.lane_id, stage.lane_id),
+                    role=str(stage.role.value),
+                    minutes=elapsed,
+                )
+            )
+
     rejected_total = sum(rejected.values())
     return RunReport(
         run_id=run_id,
@@ -220,6 +267,8 @@ def build_report(
         overdue_stages=overdue,
         timed_out_stages=timed_out,
         overdue_by_activity=dict(activities.most_common()),
+        live_stages=tuple(sorted(live, key=lambda item: (-item.minutes, item.lane, item.role))),
+        minutes_by_role=dict(minutes.most_common()),
     )
 
 
@@ -295,6 +344,19 @@ def _rejection_class(reason: str) -> str:
     return "other"
 
 
+def _minutes(start: datetime, end: datetime) -> int:
+    """Whole minutes between two stage timestamps, however they carry a zone.
+
+    Rows read back from SQLite are naive UTC and the ones tests build are aware,
+    so comparing them directly raises. Dropping the zone from both is correct
+    here precisely because every timestamp the store writes is already UTC.
+    """
+
+    naive_start = start.replace(tzinfo=None)
+    naive_end = end.replace(tzinfo=None)
+    return max(0, int((naive_end - naive_start).total_seconds() // 60))
+
+
 def _ratio(numerator: int, denominator: int) -> float:
     return 0.0 if denominator <= 0 else round(numerator / denominator, 3)
 
@@ -316,6 +378,14 @@ def render(report: RunReport) -> str:
         f"  stages past soft budget  {report.overdue_stages}"
         f"   ({report.timed_out_stages} released for exceeding a hard budget)",
     ]
+    if report.live_stages:
+        lines += ["", "still open"]
+        lines += [
+            f"  {stage.minutes:>5}m  {stage.lane}:{stage.role}" for stage in report.live_stages
+        ]
+    if report.minutes_by_role:
+        lines += ["", "wall clock by role"]
+        lines += [f"  {count:>5}m  {role}" for role, count in report.minutes_by_role.items()]
     lines += _histogram("overdue stages were doing", report.overdue_by_activity)
     lines += _histogram("escalations", report.escalations_by_reason)
     lines += _histogram("start rejections", report.rejection_reasons)
