@@ -1028,6 +1028,24 @@ class StateStore:
                     },
                 )
 
+    def integration_conflicts(self, finding_key: str) -> int:
+        """Count how many times this finding's fix has actually failed to land.
+
+        The integrations ledger is unique on (finding_key, round), so a fix that
+        conflicts repeatedly inside one round leaves a single row and cannot be
+        counted from there. Escalation records are keyed by the stage that
+        produced them, so they are the only place the recurrence survives.
+        """
+
+        with self._session() as session:
+            rows = session.exec(
+                select(EscalationRow).where(
+                    EscalationRow.finding_key == finding_key,
+                    EscalationRow.reason == FindingReason.INTEGRATION_CONFLICT.value,
+                )
+            ).all()
+            return len(rows)
+
     def latest_fix_attempt(self, finding_key: str) -> FixAttempt | None:
         with self._session() as session:
             rows = list(
@@ -1057,6 +1075,25 @@ class StateStore:
                     )
                 ).all()
             )
+
+    def escalation_action_count(
+        self, finding_key: str, round: int, reason: str, action: str
+    ) -> int:
+        """Count how often one trigger has already drawn the same adjudicated verdict."""
+
+        with self._session() as session:
+            rows = session.exec(
+                select(EscalationRow).where(
+                    EscalationRow.finding_key == finding_key,
+                    EscalationRow.round == round,
+                    EscalationRow.reason == reason,
+                )
+            ).all()
+        return sum(
+            1
+            for row in rows
+            if EscalationDecision.model_validate_json(row.payload_json).action == action
+        )
 
     def fix_attempt(self, finding_key: str, round: int) -> FixAttempt | None:
         with self._session() as session:

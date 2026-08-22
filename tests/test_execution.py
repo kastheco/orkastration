@@ -347,6 +347,7 @@ class FakeGit(LocalGit):
         self.active_sequence_commits: list[str] | None = None
         self.abort_calls = 0
         self.diff_sha256_override: str | None = None
+        self.lane_validation_fails = False
 
     async def head(self, worktree_id: str) -> str:
         if worktree_id == "repo::/tmp/issue" and self.lane_head_override is not None:
@@ -437,8 +438,13 @@ class FakeGit(LocalGit):
         self, worktree_id: str, requirements: list[ValidationRequirement]
     ) -> list[ValidationResult]:
         self.validation_calls.append([item.command for item in requirements])
+        status = (
+            "failed"
+            if self.lane_validation_fails and worktree_id == "repo::/tmp/issue"
+            else "passed"
+        )
         return [
-            ValidationResult(command="pytest", status="passed", output="passed")
+            ValidationResult(command="pytest", status=status, output=status)
             for _ in requirements
         ]
 
@@ -1378,6 +1384,72 @@ async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(
     assert result.findings[0].round == 1
     assert result.started[0].role is StageKind.FIXER
     assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
+
+
+async def test_an_adjudicator_that_never_settles_a_finding_is_bounded(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+    # An adjudicator can approve the finding unchanged at the ceiling round and
+    # leave it exactly where it started: same phase, same round, same trigger.
+    # The retry suffix makes the next dispatch a fresh key, so without a bound
+    # here the same adjudication runs again on every monitor pass forever.
+    adjudications = 0
+    for _ in range(12):
+        if result.findings[0].phase is FindingPhase.BLOCKED:
+            break
+        orca.complete_dispatched(escalation("validation_failed", "approve_unchanged"))
+        adjudications += 1
+        result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+    assert adjudications <= 4
+    escalation_stages = [
+        stage
+        for stage in store.stages(run_id)
+        if stage.role is StageKind.ESCALATION and ":escalate:" in stage.stage_key
+    ]
+    assert len(escalation_stages) <= 4
+
+
+async def test_a_second_acceptance_of_the_same_failed_validation_blocks(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+    # The head, the fix and the failing command are all the same on the second
+    # look, so a second acceptance cannot be reading anything the first one
+    # missed. Blocking costs an owner a glance; readjudicating costs a dispatch
+    # every tick for as long as the run is monitored.
+    adjudications = 0
+    for _ in range(10):
+        if result.findings[0].phase is FindingPhase.BLOCKED:
+            break
+        orca.complete_dispatched(escalation("validation_failed", "accept_fix"))
+        adjudications += 1
+        result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+    assert adjudications == 2
 
 
 async def test_restart_recovers_cherry_pick_before_receipt_settlement(tmp_path: Path) -> None:

@@ -639,6 +639,29 @@ class ExecutionController:
             # sending it back for another round would re-fix working code, and at
             # the final round would block it outright.
             attempt = self._store.latest_fix_attempt(finding.finding_key)
+            # A conflict is the one trigger a second acceptance can honestly
+            # clear, because the lane head moves under it when another finding
+            # lands; the conflict count below is its bound. Every other trigger
+            # is a fact about this fix against this head, and the acceptance
+            # just re-integrated and raised it again. Nothing an adjudicator
+            # could read has changed, so a further round of it would spend
+            # another dispatch to reach the same verdict. The ledger has
+            # refuted the claim; stop and let an owner look.
+            if (
+                finding.escalation_reason is not FindingReason.INTEGRATION_CONFLICT
+                and self._store.escalation_action_count(
+                    finding.finding_key,
+                    finding.round,
+                    finding.escalation_reason.value,
+                    "accept_fix",
+                )
+                > 1
+            ):
+                self._store.set_finding_state(
+                    run_id, finding.finding_key, phase=FindingPhase.BLOCKED
+                )
+                self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
+                return
             if attempt is None or attempt.status != "fixed" or attempt.commit_sha is None:
                 self._store.set_finding_state(
                     run_id, finding.finding_key, phase=FindingPhase.BLOCKED
@@ -654,11 +677,11 @@ class ExecutionController:
             # thrashing on one defect, and that is not what happened. Its own
             # bound is how many times the same finding has conflicted.
             if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
-                conflicts = sum(
-                    1
-                    for receipt in self._store.integrations(run_id)
-                    if receipt.finding_key == finding.finding_key and receipt.status == "conflict"
-                )
+                # Count the conflicts from the escalation ledger, not the
+                # integration ledger: the latter is unique on (finding, round), so
+                # repeated conflicts inside one round collapse into one row and
+                # this bound would never be reached.
+                conflicts = self._store.integration_conflicts(finding.finding_key)
                 retry_round = finding.round if conflicts < limit else finding.round + 1
             else:
                 retry_round = finding.round + 1
@@ -1109,10 +1132,28 @@ class ExecutionController:
                         f"{lane.lane_id}:{finding.finding_id}:escalate:"
                         f"{finding.round}:{reason.value}"
                     )
+                    stage_key = _next_key(settled, base)
+                    # A repeat under this base is the same finding, at the same
+                    # round, on the same trigger: the adjudication that just ran
+                    # left the graph exactly where it found it. The retry suffix
+                    # makes every such repeat a fresh dispatchable key, and
+                    # nothing else bounds it, so an adjudicator that cannot
+                    # settle this finding re-runs for as long as anyone monitors
+                    # the run. Spend the same ceiling the fix rounds use, then
+                    # hand the finding to the owner.
+                    if (
+                        _retry_ordinal(stage_key)
+                        > self._config.review_cycle.max_fix_rounds_per_finding
+                    ):
+                        self._store.set_finding_state(
+                            run_id, finding.finding_key, phase=FindingPhase.BLOCKED
+                        )
+                        self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
+                        continue
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
-                        stage_key=_next_key(settled, base),
+                        stage_key=stage_key,
                         role=StageKind.ESCALATION,
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
@@ -1599,6 +1640,20 @@ def _next_key(settled: set[str], base: str) -> str:
 
     retried = sum(1 for key in settled if key == base or key.startswith(f"{base}{_RETRY_MARKER}"))
     return f"{base}{_RETRY_MARKER}{retried}" if retried else base
+
+
+def _retry_ordinal(stage_key: str) -> int:
+    """Read how many times this stage key has already been retried.
+
+    A key carries the ordinal `_next_key` gave it, so the count survives a
+    restart without a separate ledger. A reopen renames a stage out of the
+    family on purpose, and the trailing marker it adds is not an ordinal.
+    """
+
+    _, marker, tail = stage_key.rpartition(_RETRY_MARKER)
+    if not marker or not tail.isdigit():
+        return 0
+    return int(tail)
 
 
 def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
