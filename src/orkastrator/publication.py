@@ -205,7 +205,11 @@ class GitHubPublisher:
             )
         if any(item.status in {"failed", "cancelled"} for item in checks):
             status = "failed"
-        elif any(item.status == "pending" for item in checks):
+        elif not checks or any(item.status == "pending" for item in checks):
+            # No checks at all is not a pass. GitHub needs a moment to register a
+            # push's workflow runs, so a lane that asks right after publishing sees
+            # an empty list, and reading that as "passed" would merge a lane whose
+            # CI never ran. Report pending and let the next tick ask again.
             status = "pending"
         else:
             status = "passed"
@@ -267,6 +271,12 @@ class GitHubPublisher:
             "--json",
             "name,bucket,link,description",
         )
+        if not result.stdout.strip():
+            # `gh pr checks` writes "no checks reported on the ... branch" to stderr
+            # and nothing to stdout when the push's workflow runs have not appeared
+            # yet. That is a branch GitHub has not caught up with, not a failed
+            # query, and the caller already falls back to the check-runs API.
+            return []
         try:
             payload = cast(object, json.loads(result.stdout))
         except json.JSONDecodeError as exc:

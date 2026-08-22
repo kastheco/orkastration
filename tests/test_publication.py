@@ -277,6 +277,34 @@ async def test_missing_required_check_stays_pending() -> None:
     assert observed.checks[0].output == "queued"
 
 
+async def test_a_branch_github_has_not_registered_yet_stays_pending() -> None:
+    sha = "c" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        # `gh pr checks` says this on stderr, with nothing on stdout, for the
+        # seconds between pushing a branch and GitHub registering its workflows.
+        result("", "no checks reported on the 'orkastrator/run-12345678/issue-123' branch", 1),
+        result(json.dumps([{"check_runs": []}])),
+        result(json.dumps({"state": "pending", "statuses": []})),
+    )
+
+    observed = await GitHubPublisher(runner=runner).checks(receipt)
+
+    # Reading "no checks yet" as a pass would merge a lane whose CI never ran.
+    assert observed.status == "pending"
+    assert [item.name for item in observed.checks] == ["check-discovery"]
+
+
 async def test_ready_transition_recovers_after_remote_success() -> None:
     receipt = PublicationReceipt(
         run_id="run-1234567890",
