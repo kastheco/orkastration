@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from orkastrator.config import AgentProfile, GraphConfig
 from orkastrator.git import GitError, LocalGit
 from orkastrator.models import (
+    SHELL_OPERATORS,
     AcceptanceAuthorization,
     AllowedWriteScope,
     AttemptKind,
@@ -383,6 +384,7 @@ class ExecutionController:
             frozen.head_sha,
         ):
             raise ValueError("initial review revision does not match the worker changeset")
+        _reject_unrunnable_validation(report)
         if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
             raise ValueError("initial review checkout contains uncommitted changes")
         if await self._git.head(stage.worktree_id) != frozen.head_sha:
@@ -1573,9 +1575,10 @@ class ExecutionController:
                 "Review the exact worker changeset once, read-only. Freeze every actionable "
                 "finding. Omit review_revision everywhere: the supervisor binds it and verifies "
                 "your checkout itself. Every validation command you write is executed directly "
-                "without a shell, so name one executable and pass its working directory as an "
-                "argument: no `cd`, `&&`, pipes or redirection, and a command that needs them "
-                "fails the finding it belongs to. Send worker_done with body set to only the JSON "
+                "without a shell, so name one executable per requirement: no `cd`, `&&`, pipes or "
+                "redirection. Split a chain into one requirement each and set that requirement's "
+                "workdir instead of `cd`. This review is rejected outright if any command uses "
+                "that syntax. Send worker_done with body set to only the JSON "
                 f"contract matching this schema: {schema}\n\n{context}"
             )
         finding = self._finding_for_stage(run_id, stage)
@@ -1654,6 +1657,27 @@ def _retry_ordinal(stage_key: str) -> int:
     if not marker or not tail.isdigit():
         return 0
     return int(tail)
+
+
+def _reject_unrunnable_validation(report: InitialReviewReport) -> None:
+    """Refuse a review whose validation a shell-free runner can never execute.
+
+    A command carrying an operator is not a check that fails, it is a check
+    that cannot run, and the fix loop cannot tell those apart: run 1f13dd37
+    spent five adjudications on a fix that was already correct because its
+    finding required `cd app/ui && npx tsc -b`. Catch it while the reviewer is
+    still dispatched and can restate the requirement.
+    """
+
+    for finding in report.findings:
+        for requirement in finding.validation:
+            found = sorted({token for token in SHELL_OPERATORS if token in requirement.command})
+            if found:
+                raise ValueError(
+                    f"finding {finding.id} requires a validation command using shell syntax "
+                    f"({', '.join(found)}), but validation runs without a shell: give one "
+                    "executable per requirement and set workdir instead of `cd`"
+                )
 
 
 def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:

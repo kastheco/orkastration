@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -210,11 +211,27 @@ class AllowedWriteScope(WorkflowContract):
         return self
 
 
+SHELL_OPERATORS = ("&&", "||", "|", ";", ">", "<", "$(", "`")
+"""Syntax only a shell resolves, which the validation runner never provides."""
+
+
 class ValidationRequirement(WorkflowContract):
     """One deterministic check required by a finding contract."""
 
     command: str = Field(min_length=1, max_length=2_000)
     expected: str = Field(min_length=1, max_length=2_000)
+    workdir: str | None = Field(default=None, max_length=500)
+    """Directory under the worktree to run the command in, in place of `cd`."""
+
+    @model_validator(mode="after")
+    def _contained_workdir(self) -> ValidationRequirement:
+        """Keep a requirement's working directory inside its own worktree."""
+
+        if self.workdir is not None:
+            workdir = PurePosixPath(self.workdir)
+            if workdir.is_absolute() or ".." in workdir.parts:
+                raise ValueError("workdir must be a relative path inside the worktree")
+        return self
 
 
 class ReviewFinding(WorkflowContract):

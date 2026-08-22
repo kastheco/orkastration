@@ -124,3 +124,37 @@ async def test_unrunnable_validation_command_fails_the_finding_not_the_tick(
 
     assert [item.status for item in results] == ["failed"]
     assert "without a shell" in results[0].output
+
+
+async def test_a_requirement_runs_in_its_own_workdir(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "workdir"
+    lane_id = add_worktree(repo, lane, "workdir", base)
+    (lane / "app" / "ui").mkdir(parents=True)
+    (lane / "app" / "ui" / "marker.txt").write_text("here\n")
+
+    results = await LocalGit().validate(
+        lane_id,
+        [
+            ValidationRequirement(
+                command="cat marker.txt", expected="prints here", workdir="app/ui"
+            )
+        ],
+    )
+
+    assert [item.status for item in results] == ["passed"]
+    assert "here" in results[0].output
+
+
+async def test_a_missing_workdir_fails_the_finding_not_the_tick(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "missing"
+    lane_id = add_worktree(repo, lane, "missing", base)
+
+    results = await LocalGit().validate(
+        lane_id,
+        [ValidationRequirement(command="true", expected="exit 0", workdir="app/ui")],
+    )
+
+    assert [item.status for item in results] == ["failed"]
+    assert "workdir does not exist" in results[0].output

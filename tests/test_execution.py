@@ -2032,3 +2032,27 @@ async def test_an_adjudicated_retry_at_the_ceiling_is_granted_once(tmp_path: Pat
 
     # A second grant would make the ceiling mean nothing, so the finding blocks.
     assert result.findings[0].phase is FindingPhase.BLOCKED
+
+
+async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    finding = review_finding_data()
+    finding["validation"] = [{"command": "cd app/ui && npx tsc -b", "expected": "exit 0"}]
+    orca.complete_dispatched(initial_review_report_json(finding))
+
+    result = await value.monitor(run_id)
+
+    # The runner has no shell, so this contract could only ever fail, and the
+    # fix loop cannot tell a broken command from a broken fix. Say so while the
+    # reviewer is still the one who can restate it.
+    assert not result.findings
+    rejected = [
+        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
+    ]
+    assert any("without a shell" in str(event["payload"]) for event in rejected)

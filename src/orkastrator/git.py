@@ -174,9 +174,19 @@ class LocalGit:
         output so the adjudicator can revise the contract instead of guessing.
         """
 
-        cwd = worktree_path(worktree_id)
+        root = worktree_path(worktree_id)
         results: list[ValidationResult] = []
         for requirement in requirements:
+            cwd = root if requirement.workdir is None else root / requirement.workdir
+            if not cwd.is_dir():
+                results.append(
+                    ValidationResult(
+                        command=requirement.command,
+                        status="failed",
+                        output=f"validation workdir does not exist: {requirement.workdir}",
+                    )
+                )
+                break
             arguments = shlex.split(requirement.command)
             if not arguments:
                 results.append(
