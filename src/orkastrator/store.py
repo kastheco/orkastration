@@ -1169,6 +1169,19 @@ class StateStore:
             )
             return _finding(row)
 
+    def _finding_lane_id(self, run_id: str, finding_id: str) -> str:
+        """The lane one finding belongs to, or a KeyError naming what was missing."""
+
+        with self._session() as session:
+            row = session.exec(
+                select(FindingRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+                .where(LaneRow.run_id == run_id, FindingRow.finding_id == finding_id)
+            ).first()
+            if row is None:
+                raise KeyError(f"run {run_id} has no finding {finding_id}")
+            return row.lane_id
+
     def settle_finding(
         self, run_id: str, finding_id: str, *, phase: FindingPhase, note: str
     ) -> FindingRecord:
@@ -1188,6 +1201,14 @@ class StateStore:
 
         if phase not in _SETTLEABLE_PHASES:
             raise ValueError(f"cannot settle a finding into {phase.value}")
+        if phase is FindingPhase.RESOLVED:
+            lane_id = self._finding_lane_id(run_id, finding_id)
+            if finding_id not in self.integrated_finding_ids(run_id, lane_id):
+                raise ValueError(
+                    f"finding {finding_id} has no integrated fix, so it cannot be settled "
+                    "resolved; integrate the fixer commit into the lane checkout first, or "
+                    "settle it deferred"
+                )
         retired = 0
         with self._session() as session:
             row = session.exec(
@@ -1648,6 +1669,34 @@ class StateStore:
                 )
             ).first()
             return None if row is None else _integration(row)
+
+    def integrated_finding_ids(self, run_id: str, lane_id: str) -> set[str]:
+        """Every finding in one lane whose fix actually reached the lane checkout.
+
+        A finding is resolved by an integration receipt, and one receipt can carry
+        several findings: the fixer commit it integrates may answer predecessors
+        the adjudicator folded into it. So membership is the union of the receipt's
+        own finding and everything it names as a source, and only an `integrated`
+        receipt counts - `conflict` and `validation_failed` mean the lane checkout
+        never moved.
+        """
+
+        integrated: set[str] = set()
+        with self._session() as session:
+            rows = session.exec(
+                select(IntegrationRow, FindingRow)
+                .join(FindingRow, col(FindingRow.finding_key) == col(IntegrationRow.finding_key))
+                .join(LaneRow, col(LaneRow.lane_id) == col(IntegrationRow.lane_id))
+                .where(
+                    LaneRow.run_id == run_id,
+                    IntegrationRow.lane_id == lane_id,
+                    IntegrationRow.status == "integrated",
+                )
+            ).all()
+        for integration, finding in rows:
+            integrated.add(finding.finding_id)
+            integrated.update(_integration(integration).source_finding_ids)
+        return integrated
 
     def integrations(self, run_id: str) -> list[IntegrationRecord]:
         with self._session() as session:

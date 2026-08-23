@@ -2335,6 +2335,74 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
 
 
+async def test_a_resolved_finding_with_no_integrated_fix_blocks_instead_of_publishing(
+    tmp_path: Path,
+) -> None:
+    """The lane must not push its pre-fix head under a receipt that claims a fix.
+
+    Every automatic route to RESOLVED runs through an integrated receipt, so a
+    resolved finding with no receipt means the phase was written from outside the
+    graph. Publishing then lands the lane exactly as the reviewer found it while
+    reporting the finding fixed.
+    """
+
+    orca = FakeOrca()
+    publisher = FakePublisher(["pending"])
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    finding = store.findings(run_id)[0]
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.RESOLVED)
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    assert blocked[-1]["payload"]["reason"] == (
+        f"lane is settled but {finding.finding_id} has no integrated fix"
+    )
+
+
+async def test_an_escalation_reads_the_fixer_checkout_not_the_lane_checkout(
+    tmp_path: Path,
+) -> None:
+    """An adjudicator asked about a fixer commit has to be able to see it.
+
+    Fixers commit in isolated child checkouts and only reach the lane checkout
+    when integration runs, which is exactly what has not happened by the time a
+    finding escalates. Placing the escalation in the lane checkout showed it the
+    code as it stood before the fix, so its verdict was about the wrong tree.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("still_open"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt(round=2))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("still_open", round=2))
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.ESCALATION
+    fixers = [
+        stage
+        for stage in store.stages(run_id)
+        if stage.role is StageKind.FIXER and stage.worktree_id is not None
+    ]
+    lane = store.lanes(run_id)[0]
+    assert orca.starts[-1]["worktree_id"] == fixers[-1].worktree_id
+    assert orca.starts[-1]["worktree_id"] != lane.worktree_id
+
+
 async def test_ci_failure_creates_scoped_finding_then_republishes_fix(
     tmp_path: Path,
 ) -> None:

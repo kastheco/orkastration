@@ -1657,6 +1657,26 @@ class ExecutionController:
             if not candidates:
                 raise ValueError("re-review has no settled isolated fixer worktree")
             return WorkerPlacement(worktree_id=candidates[-1].worktree_id)
+        if stage.role is StageKind.ESCALATION:
+            # An escalation is asked whether a fixer commit answers its finding.
+            # Fixers commit in isolated child checkouts and only reach the lane
+            # checkout once integration runs, so reading the lane worktree shows
+            # the adjudicator the code as it stood *before* the fix. Every verdict
+            # it gave was about the wrong tree; approve_unchanged in particular
+            # was unanimous because the fix was genuinely absent from what it read.
+            fixed = [
+                item
+                for item in self._store.stages(run_id)
+                if item.lane_id == stage.lane_id
+                and item.finding_id == stage.finding_id
+                and item.role is StageKind.FIXER
+                and item.processed
+                and item.worktree_id is not None
+            ]
+            if fixed:
+                return WorkerPlacement(worktree_id=fixed[-1].worktree_id)
+            # Nothing was ever committed for this finding - a scope escape caught
+            # before the first commit, say - so the lane checkout is the subject.
         return WorkerPlacement(worktree_id=lane.worktree_id)
 
     def _derive_status(self, run_id: str) -> str:
@@ -1743,6 +1763,22 @@ class ExecutionController:
                 continue
             if not self._local_lane_settled(run_id, lane):
                 continue
+            unintegrated = self._unintegrated_resolved(run_id, lane)
+            if unintegrated:
+                # Every automatic path to RESOLVED goes through an integrated
+                # receipt, so reaching here means something outside the graph put
+                # the phase there - `settle --phase resolved` is the one that can.
+                # Publishing now pushes the lane head as it stood before the fix
+                # and calls it fixed, which is the one outcome the whole review
+                # loop exists to prevent.
+                self._store.block_lane(
+                    run_id,
+                    lane.lane_id,
+                    "lane is settled but "
+                    + ", ".join(sorted(unintegrated))
+                    + " has no integrated fix",
+                )
+                continue
             if lane.integration_head_sha is None:
                 self._store.block_lane(run_id, lane.lane_id, "lane has no integrated head")
                 continue
@@ -1813,6 +1849,16 @@ class ExecutionController:
                         lane.lane_id,
                         f"{exc} (unchanged over {attempts} publication passes)",
                     )
+
+    def _unintegrated_resolved(self, run_id: str, lane: LaneRecord) -> list[str]:
+        """Resolved findings in one lane whose fix never reached the lane checkout."""
+
+        integrated = self._store.integrated_finding_ids(run_id, lane.lane_id)
+        return [
+            item.finding_id
+            for item in self._store.findings(run_id, lane.lane_id)
+            if item.phase is FindingPhase.RESOLVED and item.finding_id not in integrated
+        ]
 
     def _local_lane_settled(self, run_id: str, lane: LaneRecord) -> bool:
         stages = [item for item in self._store.stages(run_id) if item.lane_id == lane.lane_id]
