@@ -2459,18 +2459,31 @@ async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
 
 async def test_a_failed_lane_is_not_landed(tmp_path: Path) -> None:
     orca = FakeOrca()
-    publisher = FakePublisher()
+    publisher = FakePublisher(["pending", "passed"])
     value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    failed_phase = LanePhase.FAILED
+    orca.complete_dispatched(initial_review_report_json())
+    first = await value.monitor(run_id)
+    assert first.status == "active", store.events(run_id)
+
     lane = store.lanes(run_id)[0]
-    store.set_lane_phase(run_id, lane.lane_id, LanePhase.FAILED)
+    receipt = store.publications(run_id, lane.lane_id)[-1]
+    store.record_ci_receipt(run_id, lane.lane_id, await publisher.checks(receipt))
+    store.record_publication(run_id, lane.lane_id, await publisher.mark_ready(receipt))
+    assert store.ci_receipts(run_id, lane.lane_id)[-1].status == "passed"
+    assert store.publications(run_id, lane.lane_id)[-1].draft is False
+
+    store.set_lane_phase(run_id, lane.lane_id, failed_phase)
 
     result = await value.monitor(run_id)
 
     assert result.status == "failed"
-    assert publisher.publish_calls == []
+    assert publisher.publish_calls == [("b" * 40, None)]
     assert publisher.land_calls == []
+    assert store.publications(run_id)[-1].landed is False
 
 
 async def test_ci_failure_creates_scoped_finding_then_republishes_fix(
