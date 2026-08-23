@@ -301,6 +301,8 @@ class GitHubPublisher:
             "pr",
             "merge",
             receipt.pull_request_url,
+            "--match-head-commit",
+            receipt.head_sha,
             "--merge",
             "--subject",
             _merge_subject(receipt),

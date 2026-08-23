@@ -129,6 +129,8 @@ async def test_land_uses_a_merge_commit_and_records_its_sha() -> None:
     assert landed.merge_sha == merge_sha
     merge_call = runner.calls[1]
     assert merge_call[:4] == ("gh", "pr", "merge", receipt.pull_request_url)
+    match_head_index = merge_call.index("--match-head-commit")
+    assert merge_call[match_head_index + 1] == receipt.head_sha
     assert "--merge" in merge_call
     assert "--squash" not in merge_call
     assert "--rebase" not in merge_call
