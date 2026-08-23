@@ -84,6 +84,7 @@ class OrcaGraphController(Protocol):
         repo_selector: str,
         worktree_id: str | None,
         profile: AgentProfile,
+        orca_run_id: str,
         base_ref: str | None = None,
         parent_worktree_id: str | None = None,
     ) -> tuple[str, str, str | None, JsonObject]: ...
@@ -1572,6 +1573,14 @@ class ExecutionController:
         if stage.orca_task_id is None:  # already checked before the slot was reserved
             raise ValueError(f"stage {stage.stage_id} has no Orca task")
         placement = self._placement(run_id, lane, stage)
+        # `use_run` binds the coordinator terminal, and that binding is one piece
+        # of shared Orca state: a second supervisor process binding its own run
+        # moves it out from under this one, after which `worker-start` resolves
+        # the task against the wrong run and fails. Name the run on the call so
+        # the start does not depend on who bound the terminal last.
+        orca_run_id = self._store.run(run_id).orca_run_id
+        if orca_run_id is None:
+            raise ValueError(f"run {run_id} has no Orca run to start stages against")
         dispatch_id, worktree_id, terminal_handle, payload = await self._orca.start_worker(
             task_id=stage.orca_task_id,
             lane_name=_worker_name(lane.name, stage),
@@ -1580,6 +1589,7 @@ class ExecutionController:
             base_ref=placement.base_ref,
             parent_worktree_id=placement.parent_worktree_id,
             profile=self._profile(stage),
+            orca_run_id=orca_run_id,
         )
         # Read before the agent has had a chance to commit. A stage that later
         # dies without reporting is asked whether it moved this, which is the

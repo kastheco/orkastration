@@ -251,6 +251,7 @@ class OrcaClient:
         repo_selector: str,
         worktree_id: str | None,
         profile: AgentProfile,
+        orca_run_id: str,
         base_ref: str | None = None,
         parent_worktree_id: str | None = None,
     ) -> tuple[str, str, str | None, JsonObject]:
@@ -272,9 +273,12 @@ class OrcaClient:
                 base_ref=base_ref,
                 parent_worktree_id=parent_worktree_id,
                 profile=profile,
+                orca_run_id=orca_run_id,
             )
 
-        arguments = ["orchestration", "worker-start", "--task", task_id]
+        # Naming the run keeps the start independent of whichever run the
+        # coordinator terminal happens to be bound to when it fires.
+        arguments = ["orchestration", "worker-start", "--task", task_id, "--run", orca_run_id]
         if worktree_id is None:
             placement = "new-child" if parent_worktree_id is not None else "new-top-level"
             arguments.extend(
@@ -323,6 +327,7 @@ class OrcaClient:
         base_ref: str | None,
         parent_worktree_id: str | None,
         profile: AgentProfile,
+        orca_run_id: str,
     ) -> tuple[str, str, str | None, JsonObject]:
         """Launch fast provider argv, then attach it to a supervised Dispatch."""
 
@@ -388,6 +393,8 @@ class OrcaClient:
                 "worker-start",
                 "--task",
                 task_id,
+                "--run",
+                orca_run_id,
                 "--terminal",
                 terminal_handle,
                 "--worktree",

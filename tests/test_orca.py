@@ -215,6 +215,7 @@ async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
         lane_name="issue-123",
         repo_selector="id:repo",
         worktree_id=None,
+        orca_run_id="run-1",
         profile=profile(),
     )
 
@@ -224,6 +225,8 @@ async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
         "worker-start",
         "--task",
         "task-1",
+        "--run",
+        "run-1",
         "--worktree",
         "new-top-level",
         "--repo",
@@ -250,6 +253,7 @@ async def test_start_worker_reuses_lane_worktree() -> None:
         lane_name="issue-123",
         repo_selector="id:repo",
         worktree_id="repo::/tmp/issue-123",
+        orca_run_id="run-1",
         profile=profile(),
     )
     assert worktree_id == "repo::/tmp/issue-123"
@@ -274,17 +278,20 @@ async def test_start_fixer_uses_child_worktree_at_exact_review_head() -> None:
         lane_name="finding-1-fixer-r1",
         repo_selector="id:repo",
         worktree_id=None,
+        orca_run_id="run-1",
         profile=profile(),
         base_ref="b" * 40,
         parent_worktree_id="repo::/tmp/issue-123",
     )
 
     assert worktree_id == "repo::/tmp/finding-1"
-    assert runner.calls[0][0:12] == (
+    assert runner.calls[0][0:14] == (
         "orchestration",
         "worker-start",
         "--task",
         "task-3",
+        "--run",
+        "run-1",
         "--worktree",
         "new-child",
         "--repo",
@@ -294,7 +301,7 @@ async def test_start_fixer_uses_child_worktree_at_exact_review_head() -> None:
         "--setup",
         "run",
     )
-    assert runner.calls[0][12:14] == ("--base-branch", "b" * 40)
+    assert runner.calls[0][14:16] == ("--base-branch", "b" * 40)
 
 
 async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -> None:
@@ -313,6 +320,7 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
         lane_name="issue-123",
         repo_selector="id:repo",
         worktree_id=None,
+        orca_run_id="run-1",
         profile=profile(fast=True),
     )
 
@@ -356,6 +364,8 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
         "worker-start",
         "--task",
         "task-1",
+        "--run",
+        "run-1",
         "--terminal",
         "terminal-1",
         "--worktree",
@@ -379,6 +389,7 @@ async def test_fast_claude_worker_reuses_worktree_with_fast_settings() -> None:
         lane_name="issue-123",
         repo_selector="id:repo",
         worktree_id="repo::/tmp/issue-123",
+        orca_run_id="run-1",
         profile=profile(agent="claude", fast=True),
     )
 
@@ -403,6 +414,7 @@ async def test_fast_worker_rejects_unsupported_agent() -> None:
             lane_name="issue-123",
             repo_selector="id:repo",
             worktree_id="repo::/tmp/issue-123",
+            orca_run_id="run-1",
             profile=profile(agent="omp", fast=True),
         )
 
@@ -737,6 +749,7 @@ async def test_a_terminal_that_never_went_idle_refuses_the_start_by_its_reason()
             lane_name="issue-123",
             repo_selector="id:repo",
             worktree_id=None,
+            orca_run_id="run-1",
             profile=profile(fast=True),
         )
 
@@ -773,6 +786,7 @@ async def test_a_failed_start_leaves_a_caller_supplied_worktree_alone() -> None:
             lane_name="issue-123",
             repo_selector="id:repo",
             worktree_id="repo::/tmp/existing",
+            orca_run_id="run-1",
             profile=profile(fast=True),
         )
 
@@ -800,8 +814,54 @@ async def test_cleanup_failure_does_not_replace_the_start_failure() -> None:
             lane_name="issue-123",
             repo_selector="id:repo",
             worktree_id=None,
+            orca_run_id="run-1",
             profile=profile(fast=True),
         )
 
     assert "codex-trust-prompt" in str(failure.value)
     assert "worktree_busy" not in str(failure.value)
+
+
+async def test_worker_start_names_its_run_so_a_drifted_binding_cannot_misroute_it() -> None:
+    """`use_run` binds shared state, so the start has to say which run it means.
+
+    Two supervisors driving concurrently take turns binding the coordinator
+    terminal. Whichever bound it last decides where an unqualified `worker-start`
+    looks for the task, and the loser gets `task_not_found` against a run it never
+    asked about. Both the fast and the supervised path name the run explicitly.
+    """
+
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}},
+            {"ok": True, "result": {"terminal": {"handle": "terminal-1"}}},
+            {"ok": True, "result": {"wait": {"satisfied": True}}},
+            {"ok": True, "result": {"dispatchId": "dispatch-1"}},
+        ]
+    )
+
+    await OrcaClient(runner).start_worker(
+        task_id="task-1",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id=None,
+        orca_run_id="run_8a5347dc0ec9",
+        profile=profile(fast=True),
+    )
+
+    start = next(call for call in runner.calls if call[:2] == ("orchestration", "worker-start"))
+    assert "--run" in start
+    assert start[start.index("--run") + 1] == "run_8a5347dc0ec9"
+
+    supervised = FakeRunner([{"ok": True, "result": {"dispatchId": "dispatch-2"}}])
+    await OrcaClient(supervised).start_worker(
+        task_id="task-2",
+        lane_name="issue-124",
+        repo_selector="id:repo",
+        worktree_id="repo::/tmp/issue-124",
+        orca_run_id="run_8a5347dc0ec9",
+        profile=profile(),
+    )
+
+    assert supervised.calls[0][:2] == ("orchestration", "worker-start")
+    assert supervised.calls[0][supervised.calls[0].index("--run") + 1] == "run_8a5347dc0ec9"
