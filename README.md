@@ -220,7 +220,7 @@ A run accepted before the policy payload was stored has nothing to diff against.
 than printing an empty change list, and records its policy the first time it is read while unchanged,
 so the next change is readable.
 
-A lane can block with every one of its findings already settled — on a required-check query made a
+A lane can block with every one of its findings already settled, on a required-check query made a
 second after pushing its branch, or on a pull request somebody merged out from under it. `reopen` and
 `settle` both act on findings, so neither reaches that lane. `resume` does:
 
@@ -260,7 +260,7 @@ The lock is an `flock` on a file under `locks/` beside the database, which means
 it when the holding process dies, however it dies. There is no stale lock to break and no command to
 break one: a lock left behind by a dead supervisor is already free.
 
-Everything that only reads — `show`, `report`, `questions`, `snapshot`, `doctor` — is unlocked and
+Everything that only reads (`show`, `report`, `questions`, `snapshot`, `doctor`) is unlocked and
 safe to run against a live run. `doctor` reports what is currently being driven:
 
 ```bash
@@ -509,7 +509,7 @@ last tool and nothing else, because a turn count moves every tick without the st
 status line that reprints on noise stops being read. A worker that cannot be read reports nothing,
 which is not the same as reporting idle. `hard_minutes` releases the worker terminal, which puts the stage
 back through the same path a dead agent takes. Neither records a result, because a stage that ran out
-of time produced none — blurring that would turn a slow machine into a false finding. After
+of time produced none. Blurring that would turn a slow machine into a false finding. After
 `max_timeouts` releases the lane blocks instead, since a stage that wedges every time is telling you
 something a third dispatch will not.
 
@@ -521,7 +521,7 @@ work takes, and no default knows that.
 Whoever opened a terminal closes it. When a profile is not `fast`, Orca launches the agent and
 `worker-release` is enough. A `fast` profile is different: orkastrator creates the terminal itself so
 it can pass provider argv Orca does not model, and Orca then reports that terminal as
-`external_terminal` and answers `processAction: none` — the Dispatch is marked released and the whole
+`external_terminal` and answers `processAction: none`. The Dispatch is marked released and the whole
 agent process tree stays resident. Left alone that is one `codex` or `claude` tree, its MCP servers,
 and a `systemd-inhibit` per stage, for the life of the run.
 
