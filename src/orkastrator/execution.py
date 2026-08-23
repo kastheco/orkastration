@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from dataclasses import dataclass
@@ -2154,11 +2155,12 @@ class ExecutionController:
 
 
 def _format_frozen_diff(
-    *, revision: ReviewRevision, rendered: str, paths: list[str], budget_bytes: int
+    *, revision: ReviewRevision, rendered: bytes | str, paths: list[str], budget_bytes: int
 ) -> str:
     """Package a complete diff, splitting only between file records when needed."""
 
-    size = len(rendered.encode())
+    raw = rendered if isinstance(rendered, bytes) else rendered.encode()
+    size = len(raw)
     index = "\n".join(f"- {path}" for path in paths) or "(no changed files in scope)"
     identity = (
         "Frozen diff input (supervisor-rendered; do not re-derive it):\n"
@@ -2169,10 +2171,29 @@ def _format_frozen_diff(
         f"chunk_budget_bytes: {budget_bytes}\n"
         f"Complete file index ({len(paths)} files):\n{index}"
     )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        details = _non_utf8_file_details(raw, paths)
+        detail_lines = "\n".join(
+            f"- {path}: invalid UTF-8 bytes {bytes_hex}" for path, bytes_hex in details
+        )
+        chunks = _chunk_diff_by_file(raw, budget_bytes)
+        packaged = [
+            f"Frozen diff chunk {number}/{len(chunks)} ({len(chunk)} raw bytes; base64):\n"
+            f"<frozen_diff_chunk encoding=\"base64\">{base64.b64encode(chunk).decode('ascii')}</frozen_diff_chunk>"
+            for number, chunk in enumerate(chunks, start=1)
+        ]
+        return (
+            f"{identity}\nFrozen diff contains bytes that are not valid UTF-8. No bytes were "
+            "substituted; the complete raw diff follows as base64, and each affected file is "
+            f"listed below:\n{detail_lines}\n"
+            + "\n".join(packaged)
+        )
     if size <= budget_bytes:
-        return f"{identity}\nFrozen diff (complete):\n<frozen_diff>\n{rendered}</frozen_diff>"
+        return f"{identity}\nFrozen diff (complete):\n<frozen_diff>\n{text}</frozen_diff>"
 
-    chunks = _chunk_diff_by_file(rendered, budget_bytes)
+    chunks = _chunk_diff_by_file(text, budget_bytes)
     packaged = [
         f"Frozen diff chunk {number}/{len(chunks)} ({len(chunk.encode())} bytes):\n"
         f"<frozen_diff_chunk>\n{chunk}</frozen_diff_chunk>"
@@ -2185,32 +2206,63 @@ def _format_frozen_diff(
     )
 
 
-def _chunk_diff_by_file(rendered: str, budget_bytes: int) -> list[str]:
+def _chunk_diff_by_file(rendered: bytes | str, budget_bytes: int) -> list[bytes] | list[str]:
     """Greedily group complete ``diff --git`` records without losing any bytes."""
 
-    records: list[str] = []
-    current: list[str] = []
+    marker = b"diff --git " if isinstance(rendered, bytes) else "diff --git "
+    records: list[bytes] | list[str] = []
+    current: list[bytes] | list[str] = []
     for line in rendered.splitlines(keepends=True):
-        if line.startswith("diff --git ") and current:
-            records.append("".join(current))
+        if line.startswith(marker) and current:
+            records.append(b"".join(current) if isinstance(rendered, bytes) else "".join(current))
             current = []
         current.append(line)
     if current:
-        records.append("".join(current))
+        records.append(b"".join(current) if isinstance(rendered, bytes) else "".join(current))
     if not records:
-        return [""]
+        return [b""] if isinstance(rendered, bytes) else [""]
 
-    chunks: list[str] = []
-    chunk = ""
+    chunks: list[bytes] | list[str] = []
+    chunk: bytes | str = b"" if isinstance(rendered, bytes) else ""
     for record in records:
-        candidate = f"{chunk}{record}"
-        if chunk and len(candidate.encode()) > budget_bytes:
+        candidate = chunk + record
+        candidate_size = len(candidate) if isinstance(rendered, bytes) else len(candidate.encode())
+        if chunk and candidate_size > budget_bytes:
             chunks.append(chunk)
             chunk = record
         else:
             chunk = candidate
     chunks.append(chunk)
     return chunks
+
+
+def _non_utf8_file_details(raw: bytes, paths: list[str]) -> list[tuple[str, str]]:
+    """Report invalid UTF-8 byte sequences against their diff file records."""
+
+    records = _chunk_diff_by_file(raw, len(raw) or 1)
+    details: list[tuple[str, str]] = []
+    for index, record in enumerate(records):
+        assert isinstance(record, bytes)
+        invalid: list[str] = []
+        offset = 0
+        while offset < len(record):
+            try:
+                record[offset:].decode("utf-8")
+                break
+            except UnicodeDecodeError as error:
+                start = offset + error.start
+                end = offset + error.end
+                invalid.append(record[start:end].hex())
+                offset = end
+        if invalid:
+            prefix = f"a/{paths[index]}".encode() if index < len(paths) else b""
+            path = (
+                paths[index]
+                if index < len(paths) and prefix in record
+                else f"file record {index + 1}"
+            )
+            details.append((path, ", ".join(f"0x{value}" for value in invalid)))
+    return details
 
 
 _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})

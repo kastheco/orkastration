@@ -65,20 +65,26 @@ class LocalGit:
         base_sha: str,
         head_sha: str,
         paths: Sequence[str] = (),
-    ) -> str:
-        """Render the binary-capable frozen diff, optionally scoped by Git paths."""
+    ) -> bytes:
+        """Render the binary-capable frozen diff without decoding its stdout."""
 
-        return (
-            await self._git(
-                worktree_id,
-                "diff",
-                "--binary",
-                "--full-index",
-                f"{base_sha}..{head_sha}",
-                "--",
-                *paths,
-            )
-        ).stdout
+        cwd = worktree_path(worktree_id)
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "diff",
+            "--binary",
+            "--full-index",
+            f"{base_sha}..{head_sha}",
+            "--",
+            *paths,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise GitError(f"git diff failed: {stderr.decode(errors='replace')[:2_000]}")
+        return stdout
 
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
         """Hash the exact binary-capable diff frozen for review."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
 from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
-from orkastrator.execution import ExecutionController, _next_key
+from orkastrator.execution import ExecutionController, _format_frozen_diff, _next_key
 from orkastrator.git import GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
@@ -23,6 +24,7 @@ from orkastrator.models import (
     LaneRecord,
     PublicationReceipt,
     ReReviewResult,
+    ReviewRevision,
     StageKind,
     StagePhase,
     SupervisorPlan,
@@ -746,6 +748,26 @@ async def test_over_budget_frozen_diff_is_chunked_by_file_without_truncation(
     assert spec.count("+first complete record") == 1
     assert spec.count("+second complete record") == 1
     assert "no content is truncated" in spec
+
+
+def test_non_utf8_frozen_diff_is_explicit_and_lossless() -> None:
+    rendered = b"diff --git a/src/latin1.py b/src/latin1.py\n+value = 'caf\xe9'\n"
+    revision = ReviewRevision(base_sha="a" * 40, head_sha="b" * 40, diff_sha256="c" * 64)
+
+    spec = _format_frozen_diff(
+        revision=revision,
+        rendered=rendered,
+        paths=["src/latin1.py"],
+        budget_bytes=65_536,
+    )
+
+    assert f"rendered_bytes: {len(rendered)}" in spec
+    assert "src/latin1.py: invalid UTF-8 bytes 0xe9" in spec
+    assert "encoding=\"base64\"" in spec
+    encoded = spec.split("<frozen_diff_chunk encoding=\"base64\">", 1)[1].split(
+        "</frozen_diff_chunk>", 1
+    )[0]
+    assert base64.b64decode(encoded) == rendered
 
 
 async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Path) -> None:

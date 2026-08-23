@@ -78,13 +78,37 @@ async def test_render_diff_returns_the_complete_path_scoped_frozen_text(tmp_path
     rendered = await git.render_diff(lane_id, base, head, ["src/two.py"])
     complete = await git.render_diff(lane_id, base, head)
 
-    assert "diff --git a/src/two.py b/src/two.py" in rendered
-    assert "+two" in rendered
-    assert "src/one.py" not in rendered
+    assert b"diff --git a/src/two.py b/src/two.py" in rendered
+    assert b"+two" in rendered
+    assert b"src/one.py" not in rendered
     assert await git.changed_paths(lane_id, base, head, ["src/two.py"]) == ["src/two.py"]
-    assert hashlib.sha256(complete.encode()).hexdigest() == await git.diff_sha256(
+    assert hashlib.sha256(complete).hexdigest() == await git.diff_sha256(
         lane_id, base, head
     )
+
+
+async def test_render_diff_preserves_non_utf8_frozen_bytes(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "render"
+    lane_id = add_worktree(repo, lane, "render", base)
+    target = lane / "src" / "latin1.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"value = 'caf\xe9'\n")
+    run(lane, "git", "add", "src/latin1.py")
+    run(lane, "git", "commit", "-m", "add latin1 source")
+    head = run(lane, "git", "rev-parse", "HEAD")
+    git = LocalGit()
+
+    rendered = await git.render_diff(lane_id, base, head)
+
+    expected = subprocess.run(
+        ["git", "diff", "--binary", "--full-index", f"{base}..{head}", "--"],
+        cwd=lane,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert rendered == expected
+    assert hashlib.sha256(rendered).hexdigest() == await git.diff_sha256(lane_id, base, head)
 
 
 async def test_conflicting_commit_aborts_without_resetting_prior_head(tmp_path: Path) -> None:
