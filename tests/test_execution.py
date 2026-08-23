@@ -10,14 +10,15 @@ import pytest
 from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
-from orkastrator.db import AcceptanceAuthorizationRow, EventRow
+from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
 from orkastrator.execution import ExecutionController, _next_key
-from orkastrator.git import GitCommandResult, LocalGit
+from orkastrator.git import GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
     CiReceipt,
     FindingPhase,
     FindingReason,
+    GraphResult,
     LanePhase,
     LaneRecord,
     PublicationReceipt,
@@ -2416,9 +2417,7 @@ async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
     tmp_path: Path,
 ) -> None:
     class NoScopeGit(FakeGit):
-        async def changed_paths(
-            self, worktree_id: str, base_sha: str, head_sha: str
-        ) -> list[str]:
+        async def changed_paths(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
             return []
 
     class ConflictingPublisher(FakePublisher):
@@ -2452,9 +2451,108 @@ async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
     blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
     assert blocked
     assert (
-        blocked[-1]["payload"]["reason"]
-        == "publication conflict has no deterministic lane scope"
+        blocked[-1]["payload"]["reason"] == "publication conflict has no deterministic lane scope"
     )
+
+
+class ArmedGit(FakeGit):
+    """A Git fake that only misbehaves once a landing conflict has happened."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+
+
+class ConflictOnLand(FakePublisher):
+    """A publisher whose landing always reports a base-branch conflict."""
+
+    def __init__(self, git: ArmedGit | None = None) -> None:
+        super().__init__()
+        self.git = git
+
+    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        self.land_calls.append(receipt.head_sha)
+        # Arm here, not earlier: the conflict recorder is the only caller whose
+        # Git failures this test is about, and the review phase ahead of it
+        # needs the same fake to work normally.
+        if self.git is not None:
+            self.git.armed = True
+        raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+
+async def _blocked_reason_after_conflict(
+    tmp_path: Path, *, git: ArmedGit | None = None, drop_worktree: bool = False
+) -> tuple[str, GraphResult]:
+    """Drive one lane to a landing conflict and report why the lane blocked."""
+
+    orca = FakeOrca()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git or FakeGit(),
+        publisher=ConflictOnLand(git),
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    if drop_worktree:
+        lane = store.lanes(run_id)[0]
+        with Session(store._engine) as session:
+            row = session.get(LaneRow, lane.lane_id)
+            assert row is not None
+            row.worktree_id = None
+            session.commit()
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    assert blocked, store.events(run_id)
+    reason = blocked[-1]["payload"]["reason"]
+    assert isinstance(reason, str)
+    return reason, result
+
+
+async def test_publication_conflict_without_a_lane_checkout_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    reason, result = await _blocked_reason_after_conflict(tmp_path, drop_worktree=True)
+
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert reason == "publication conflict has no integrated lane checkout"
+
+
+async def test_publication_conflict_with_unreadable_scope_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    class UnreadableScopeGit(ArmedGit):
+        async def changed_paths(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
+            if self.armed:
+                raise GitError("worktree path does not exist: /tmp/gone")
+            return await super().changed_paths(worktree_id, base_sha, head_sha)
+
+    reason, result = await _blocked_reason_after_conflict(tmp_path, git=UnreadableScopeGit())
+
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert reason == (
+        "publication conflict scope unavailable: worktree path does not exist: /tmp/gone"
+    )
+
+
+async def test_publication_conflict_with_unhashable_scope_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    class UnhashableGit(ArmedGit):
+        async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
+            if self.armed:
+                raise GitError("bad object HEAD")
+            return await super().diff_sha256(worktree_id, base_sha, head_sha)
+
+    reason, result = await _blocked_reason_after_conflict(tmp_path, git=UnhashableGit())
+
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert reason == "publication conflict scope unavailable: bad object HEAD"
 
 
 async def test_a_failed_lane_is_not_landed(tmp_path: Path) -> None:
