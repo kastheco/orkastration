@@ -701,3 +701,107 @@ async def test_a_mailbox_orca_describes_without_messages_is_empty_not_an_error()
     unread = await OrcaClient(FakeRunner([{"ok": True, "result": {}}])).unread_messages("ctx-1")
 
     assert unread == []
+
+
+async def test_a_terminal_that_never_went_idle_refuses_the_start_by_its_reason() -> None:
+    """An agent parked on its own prompt must fail attributably, not later and blind.
+
+    Codex asks whether it trusts an unfamiliar repository root. Until somebody
+    answers, its TUI is not reading, so `worker-start` fails against it with an
+    error that describes the dispatch rather than the prompt holding it up.
+    """
+
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}},
+            {"ok": True, "result": {"terminal": {"handle": "terminal-1"}}},
+            {
+                "ok": True,
+                "result": {
+                    "wait": {
+                        "handle": "terminal-1",
+                        "condition": "tui-idle",
+                        "satisfied": False,
+                        "status": "running",
+                        "blockedReason": "codex-interactive-prompt",
+                    }
+                },
+            },
+            {"ok": True, "result": {}},
+        ]
+    )
+
+    with pytest.raises(OrcaError) as failure:
+        await OrcaClient(runner).start_worker(
+            task_id="task-1",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id=None,
+            profile=profile(fast=True),
+        )
+
+    assert "codex-interactive-prompt" in str(failure.value)
+    # The start never happened, so the checkout it created has no stage to be
+    # reclaimed through. Failing without removing it costs one worktree per
+    # reconcile for as long as the stage stays unstartable.
+    assert runner.calls[-1] == (
+        "worktree",
+        "rm",
+        "--worktree",
+        "id:repo::/tmp/issue-123",
+        "--force",
+        "--json",
+    )
+
+
+async def test_a_failed_start_leaves_a_caller_supplied_worktree_alone() -> None:
+    """Only a checkout this start created is this start's to remove."""
+
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"terminal": {"handle": "terminal-1"}}},
+            {
+                "ok": True,
+                "result": {"wait": {"satisfied": False, "blockedReason": "login-required"}},
+            },
+        ]
+    )
+
+    with pytest.raises(OrcaError):
+        await OrcaClient(runner).start_worker(
+            task_id="task-1",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id="repo::/tmp/existing",
+            profile=profile(fast=True),
+        )
+
+    assert all(call[:2] != ("worktree", "rm") for call in runner.calls)
+
+
+async def test_cleanup_failure_does_not_replace_the_start_failure() -> None:
+    """The reason the start failed outranks anything cleanup has to say."""
+
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}},
+            {"ok": True, "result": {"terminal": {"handle": "terminal-1"}}},
+            {
+                "ok": True,
+                "result": {"wait": {"satisfied": False, "blockedReason": "codex-trust-prompt"}},
+            },
+            {"ok": False, "error": {"code": "worktree_busy", "message": "in use"}},
+        ]
+    )
+
+    with pytest.raises(OrcaError) as failure:
+        await OrcaClient(runner).start_worker(
+            task_id="task-1",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id=None,
+            profile=profile(fast=True),
+        )
+
+    assert "codex-trust-prompt" in str(failure.value)
+    assert "worktree_busy" not in str(failure.value)
