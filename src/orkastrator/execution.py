@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from dataclasses import dataclass
@@ -50,7 +51,7 @@ from orkastrator.models import (
     WorkerBlocked,
     WorkerResult,
 )
-from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
+from orkastrator.orca import MAX_TASK_SPEC_BYTES, JsonObject, OrcaError, OrcaTimeout
 from orkastrator.publication import (
     GitHubPublisher,
     LanePublisher,
@@ -1334,7 +1335,14 @@ class ExecutionController:
                 continue
             lane = lanes[stage.lane_id]
             dependencies = _completed_dependency(stage, self._store.stages(run_id))
-            spec = self._stage_spec(proposals[lane.name], stage, run_id)
+            try:
+                spec = await self._stage_spec(proposals[lane.name], lane, stage, run_id)
+            except (OrcaError, GitError, ValueError, KeyError) as exc:
+                # A stage whose frozen input cannot be rendered is refused on
+                # its own. Leave it unbound so the next tick can retry after
+                # the worktree or persisted result becomes readable again.
+                self._store.record_stage_start_failure(run_id, stage, str(exc), released=True)
+                continue
             recoverable = [
                 task
                 for task in remote_tasks
@@ -2071,7 +2079,13 @@ class ExecutionController:
             return fallback
         return cast(AgentProfile, getattr(self._config.roles, stage.role.value))
 
-    def _stage_spec(self, lane: LaneProposal, stage: StageRecord, run_id: str) -> str:
+    async def _stage_spec(
+        self,
+        lane: LaneProposal,
+        lane_record: LaneRecord,
+        stage: StageRecord,
+        run_id: str,
+    ) -> str:
         context = (
             f"Lane: {lane.name}\nIssue: {lane.issue_id}\nObjective:\n{lane.prompt}\n\n"
             f"Stop condition:\n{lane.stop_condition}"
@@ -2091,7 +2105,7 @@ class ExecutionController:
             )
         if stage.role is StageKind.INITIAL_REVIEWER:
             schema = json.dumps(InitialReviewReport.model_json_schema(), sort_keys=True)
-            return (
+            prefix = (
                 "Review the exact worker changeset once, read-only. Freeze every actionable "
                 "finding. Omit review_revision everywhere: the supervisor binds it and verifies "
                 "your checkout itself. Every validation command you write is executed directly "
@@ -2101,14 +2115,17 @@ class ExecutionController:
                 "that syntax. A check is satisfied by its exit status alone, so set expect_exit "
                 "when the passing outcome is a non-zero one, as an absence check with rg is. "
                 "Send worker_done with body set to only the JSON "
-                f"contract matching this schema: {schema}\n\n{context}"
+                f"contract matching this schema: {schema}"
+            )
+            return await self._stage_spec_with_frozen_diff(
+                prefix, context, lane_record, stage, run_id
             )
         finding = self._finding_for_stage(run_id, stage)
         contract = finding.effective_contract.model_dump_json()
         if stage.role is StageKind.FIXER:
             schema = json.dumps(FixAttempt.model_json_schema(), sort_keys=True)
             prior = self._store.fix_attempt(finding.finding_key, finding.round - 1)
-            return (
+            prefix = (
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
                 "Start from the assigned frozen review head and produce exactly one commit that "
@@ -2117,20 +2134,25 @@ class ExecutionController:
                 "so do not re-run the lane's wider suite. finding_id, round, base_sha and "
                 "commit_sha are read from the record and from Git, so send any placeholder there "
                 "and spend your effort on status, changed_paths and validation_results. Send "
-                f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
-                f"{context}"
+                f"worker_done with body set to only the JSON matching this schema: {schema}"
+            )
+            return await self._stage_spec_with_frozen_diff(
+                prefix, context, lane_record, stage, run_id
             )
         if stage.role is StageKind.RE_REVIEWER:
             attempt = self._store.latest_fix_attempt(finding.finding_key)
             schema = json.dumps(ReReviewResult.model_json_schema(), sort_keys=True)
-            return (
+            prefix = (
                 f"Re-review only this finding at round {finding.round}: {contract}\n"
                 f"Fixer evidence: {attempt.model_dump_json() if attempt else 'missing'}\n"
                 "Unrelated findings must be returned with origin unrelated so they are deferred. "
                 "finding_id, round, reviewed_commit_sha and every review_revision are read from "
                 "the record and from Git, so send any placeholder there and spend your effort on "
                 "the verdict. Send worker_done with body set to only the JSON matching this "
-                f"schema: {schema}\n\n{context}"
+                f"schema: {schema}"
+            )
+            return await self._stage_spec_with_frozen_diff(
+                prefix, context, lane_record, stage, run_id
             )
         schema = json.dumps(EscalationDecision.model_json_schema(), sort_keys=True)
         return (
@@ -2147,6 +2169,232 @@ class ExecutionController:
             f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
             f"{context}"
         )
+
+    async def _stage_spec_with_frozen_diff(
+        self,
+        prefix: str,
+        context: str,
+        lane: LaneRecord,
+        stage: StageRecord,
+        run_id: str,
+    ) -> str:
+        """Build a frozen-diff stage spec within the subprocess argv limit."""
+
+        empty_diff_spec = f"{prefix}\n\n\n\n{context}"
+        diff_bytes = MAX_TASK_SPEC_BYTES - len(empty_diff_spec.encode())
+        if diff_bytes < 1:
+            raise ValueError(f"stage {stage.stage_id} has no room for frozen diff input")
+        frozen_diff = await self._frozen_diff_input(lane, stage, run_id, max_spec_bytes=diff_bytes)
+        spec = f"{prefix}\n\n{frozen_diff}\n\n{context}"
+        if len(spec.encode()) > MAX_TASK_SPEC_BYTES:
+            raise ValueError(f"stage {stage.stage_id} frozen diff spec exceeds delivery limit")
+        return spec
+
+    async def _frozen_diff_input(
+        self,
+        lane: LaneRecord,
+        stage: StageRecord,
+        run_id: str,
+        *,
+        max_spec_bytes: int,
+    ) -> str:
+        """Render the exact scoped diff once, then package all of it under the byte budget."""
+
+        if lane.worktree_id is None:
+            raise ValueError(f"stage {stage.stage_id} has no lane worktree for its frozen diff")
+        if stage.role is StageKind.INITIAL_REVIEWER:
+            worker = self._store.worker_result(lane.lane_id)
+            revision = worker.review_revision
+            paths = worker.changed_paths
+        else:
+            finding = self._finding_for_stage(run_id, stage)
+            paths = finding.effective_contract.allowed_write_scope.paths
+            if stage.role is StageKind.FIXER:
+                frozen = finding.effective_contract.review_revision
+                if frozen is None:
+                    raise ValueError(f"finding {finding.finding_id} has no frozen revision")
+                revision = frozen
+            elif stage.role is StageKind.RE_REVIEWER:
+                attempt = self._store.latest_fix_attempt(finding.finding_key)
+                if attempt is None or attempt.commit_sha is None:
+                    raise ValueError("re-review has no committed fixer diff to render")
+                revision = ReviewRevision(
+                    base_sha=self._fix_base_sha(finding),
+                    head_sha=attempt.commit_sha,
+                    diff_sha256=await self._git.diff_sha256(
+                        lane.worktree_id, self._fix_base_sha(finding), attempt.commit_sha
+                    ),
+                )
+            else:
+                raise ValueError(f"stage {stage.stage_id} does not consume a frozen diff")
+
+        rendered = await self._git.render_diff(
+            lane.worktree_id, revision.base_sha, revision.head_sha, paths
+        )
+        file_index = await self._git.changed_paths(
+            lane.worktree_id, revision.base_sha, revision.head_sha, paths
+        )
+        return _format_frozen_diff(
+            revision=revision,
+            rendered=rendered,
+            paths=file_index,
+            budget_bytes=self._config.frozen_diff_budget_bytes,
+            max_spec_bytes=max_spec_bytes,
+        )
+
+
+def _format_frozen_diff(
+    *,
+    revision: ReviewRevision,
+    rendered: bytes,
+    paths: list[str],
+    budget_bytes: int,
+    max_spec_bytes: int,
+) -> str:
+    """Package diff content without exceeding the task's argv delivery limit."""
+
+    size = len(rendered)
+    index = "\n".join(f"- {path}" for path in paths) or "(no changed files in scope)"
+    identity = (
+        "Frozen diff input (supervisor-rendered; do not re-derive it):\n"
+        f"base_sha: {revision.base_sha}\n"
+        f"head_sha: {revision.head_sha}\n"
+        f"diff_sha256: {revision.diff_sha256}\n"
+        f"rendered_bytes: {size}\n"
+        f"chunk_budget_bytes: {budget_bytes}\n"
+        f"Complete file index ({len(paths)} files):\n{index}"
+    )
+
+    # A rendering that is not valid UTF-8 is delivered as base64 rather than
+    # decoded, so the bytes an agent reads still hash to the advertised
+    # diff_sha256 instead of carrying substituted replacement characters.
+    try:
+        text: str | None = rendered.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+
+    if text is not None:
+        complete = f"{identity}\nFrozen diff (complete):\n<frozen_diff>\n{text}</frozen_diff>"
+        if size <= budget_bytes and len(complete.encode()) <= max_spec_bytes:
+            return complete
+        prefix = (
+            f"{identity}\nFrozen diff is over budget or exceeds the task delivery limit. "
+            "Included content consists only of complete, deterministic file-boundary chunks; "
+            "no content is truncated.\n"
+        )
+    else:
+        detail_lines = "\n".join(
+            f"- {path}: invalid UTF-8 bytes {bytes_hex}"
+            for path, bytes_hex in _non_utf8_file_details(rendered, paths)
+        )
+        prefix = (
+            f"{identity}\nFrozen diff contains bytes that are not valid UTF-8. No bytes were "
+            "substituted; the content follows as base64 over complete file-boundary chunks, "
+            f"and each affected file is listed below:\n{detail_lines}\n"
+        )
+
+    chunks = _chunk_diff_by_file(rendered, min(budget_bytes, max_spec_bytes))
+    included: list[str] = []
+    for number, chunk in enumerate(chunks, start=1):
+        packaged = _package_diff_chunk(number, len(chunks), chunk, as_text=text is not None)
+        candidate = prefix + "\n".join([*included, packaged])
+        if len(candidate.encode()) > max_spec_bytes:
+            break
+        included.append(packaged)
+
+    omission = _omitted_diff_message(paths[_records_in(chunks, len(included)) :])
+    while len((prefix + "\n".join(included) + "\n" + omission).encode()) > max_spec_bytes:
+        if not included:
+            raise ValueError("frozen diff file index exceeds task spec delivery limit")
+        included.pop()
+        omission = _omitted_diff_message(paths[_records_in(chunks, len(included)) :])
+    return prefix + "\n".join(included) + "\n" + omission
+
+
+def _records_in(chunks: list[bytes], count: int) -> int:
+    """Count the complete file records carried by the first ``count`` chunks."""
+
+    return sum(chunk.count(b"diff --git ") for chunk in chunks[:count])
+
+
+def _package_diff_chunk(number: int, total: int, chunk: bytes, *, as_text: bool) -> str:
+    """Render one complete file-boundary chunk for delivery inside a task spec."""
+
+    if as_text:
+        return (
+            f"Frozen diff chunk {number}/{total} ({len(chunk)} bytes):\n"
+            f"<frozen_diff_chunk>\n{chunk.decode('utf-8')}</frozen_diff_chunk>"
+        )
+    encoded = base64.b64encode(chunk).decode("ascii")
+    return (
+        f"Frozen diff chunk {number}/{total} ({len(chunk)} raw bytes; base64):\n"
+        f'<frozen_diff_chunk encoding="base64">{encoded}</frozen_diff_chunk>'
+    )
+
+
+def _omitted_diff_message(paths: list[str]) -> str:
+    """Name every file whose complete diff record was not embedded."""
+
+    if not paths:
+        return "No diff content was omitted; all complete file records are included."
+    return (
+        "Frozen diff content omitted to keep this task spec creatable. The complete file index "
+        "above remains authoritative; omitted complete file records are:\n"
+        + "\n".join(f"- {path}" for path in paths)
+    )
+
+
+def _chunk_diff_by_file(rendered: bytes, budget_bytes: int) -> list[bytes]:
+    """Greedily group complete ``diff --git`` records without losing any bytes."""
+
+    records: list[bytes] = []
+    current: list[bytes] = []
+    for line in rendered.splitlines(keepends=True):
+        if line.startswith(b"diff --git ") and current:
+            records.append(b"".join(current))
+            current = []
+        current.append(line)
+    if current:
+        records.append(b"".join(current))
+    if not records:
+        return [b""]
+
+    chunks: list[bytes] = []
+    chunk = b""
+    for record in records:
+        candidate = chunk + record
+        if chunk and len(candidate) > budget_bytes:
+            chunks.append(chunk)
+            chunk = record
+        else:
+            chunk = candidate
+    chunks.append(chunk)
+    return chunks
+
+
+def _non_utf8_file_details(raw: bytes, paths: list[str]) -> list[tuple[str, str]]:
+    """Report invalid UTF-8 byte sequences against their diff file records."""
+
+    details: list[tuple[str, str]] = []
+    for index, record in enumerate(_chunk_diff_by_file(raw, len(raw) or 1)):
+        invalid: list[str] = []
+        offset = 0
+        while offset < len(record):
+            try:
+                record[offset:].decode("utf-8")
+                break
+            except UnicodeDecodeError as error:
+                invalid.append(record[offset + error.start : offset + error.end].hex())
+                offset += error.end
+        if invalid:
+            named = f"a/{paths[index]}".encode() if index < len(paths) else b""
+            path = (
+                paths[index]
+                if index < len(paths) and named in record
+                else f"file record {index + 1}"
+            )
+            details.append((path, ", ".join(f"0x{value}" for value in invalid)))
+    return details
 
 
 _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})

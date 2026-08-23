@@ -247,6 +247,15 @@ class GraphConfig(BaseModel):
     version: Literal[2] = 2
     max_parallel_lanes: int = Field(default=2, ge=1, le=32)
     max_parallel_workers: int = Field(default=6, ge=1, le=128)
+    frozen_diff_budget_bytes: int = Field(
+        default=65_536,
+        ge=1,
+        le=10_000_000,
+        description=(
+            "Target maximum bytes per frozen-diff stage-input chunk. The documented default "
+            "is 64 KiB; a single file may exceed it because frozen diffs are never truncated."
+        ),
+    )
     review_cycle: ReviewCycleConfig
     roles: RoleProfiles
     stage_budgets: StageBudgets = Field(default_factory=StageBudgets)

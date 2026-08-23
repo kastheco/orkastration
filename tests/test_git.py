@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,12 @@ from orkastrator.models import ValidationRequirement
 def run(cwd: Path, *arguments: str) -> str:
     result = subprocess.run(arguments, cwd=cwd, check=True, capture_output=True, text=True)
     return result.stdout.strip()
+
+
+def run_bytes(cwd: Path, *arguments: str) -> bytes:
+    """Capture a command's stdout without decoding it."""
+
+    return subprocess.run(arguments, cwd=cwd, check=True, capture_output=True).stdout
 
 
 def commit(repo: Path, path: str, content: str, message: str) -> str:
@@ -64,6 +71,43 @@ async def test_disjoint_fixer_commits_integrate_serially(tmp_path: Path) -> None
     assert (lane / "src/one.py").read_text() == "one\n"
     assert (lane / "src/two.py").read_text() == "two\n"
     assert await git.find_cherry_pick(lane_id, one_sha) == first_head
+
+
+async def test_render_diff_returns_the_complete_path_scoped_frozen_text(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "render"
+    lane_id = add_worktree(repo, lane, "render", base)
+    commit(lane, "src/one.py", "one\n", "add one")
+    head = commit(lane, "src/two.py", "two\n", "add two")
+    git = LocalGit()
+
+    rendered = await git.render_diff(lane_id, base, head, ["src/two.py"])
+    complete = await git.render_diff(lane_id, base, head)
+
+    assert b"diff --git a/src/two.py b/src/two.py" in rendered
+    assert b"+two" in rendered
+    assert b"src/one.py" not in rendered
+    assert await git.changed_paths(lane_id, base, head, ["src/two.py"]) == ["src/two.py"]
+    assert hashlib.sha256(complete).hexdigest() == await git.diff_sha256(lane_id, base, head)
+
+
+async def test_render_diff_preserves_non_utf8_frozen_bytes(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "render"
+    lane_id = add_worktree(repo, lane, "render", base)
+    target = lane / "src" / "latin1.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"value = 'caf\xe9'\n")
+    run(lane, "git", "add", "src/latin1.py")
+    run(lane, "git", "commit", "-m", "add latin1 source")
+    head = run(lane, "git", "rev-parse", "HEAD")
+    git = LocalGit()
+
+    rendered = await git.render_diff(lane_id, base, head)
+
+    expected = run_bytes(lane, "git", "diff", "--binary", "--full-index", f"{base}..{head}", "--")
+    assert rendered == expected
+    assert hashlib.sha256(rendered).hexdigest() == await git.diff_sha256(lane_id, base, head)
 
 
 async def test_conflicting_commit_aborts_without_resetting_prior_head(tmp_path: Path) -> None:

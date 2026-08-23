@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,9 +12,9 @@ import pytest
 from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
-from orkastrator.db import AcceptanceAuthorizationRow, EventRow
-from orkastrator.execution import ExecutionController, _next_key
-from orkastrator.git import GitCommandResult, LocalGit
+from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
+from orkastrator.execution import ExecutionController, _format_frozen_diff, _next_key
+from orkastrator.git import GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
     CiReceipt,
@@ -22,6 +24,7 @@ from orkastrator.models import (
     LaneRecord,
     PublicationReceipt,
     ReReviewResult,
+    ReviewRevision,
     StageKind,
     StagePhase,
     SupervisorPlan,
@@ -388,6 +391,8 @@ class FakeGit(LocalGit):
         self.active_sequence_commits: list[str] | None = None
         self.abort_calls = 0
         self.diff_sha256_override: str | None = None
+        self.rendered_diff_override: bytes | None = None
+        self.render_diff_calls: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.lane_validation_fails = False
 
     async def head(self, worktree_id: str) -> str:
@@ -408,15 +413,36 @@ class FakeGit(LocalGit):
         # tests that have nothing to do with what is in the worktree.
         return "a" * 40
 
-    async def changed_paths(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
+    async def changed_paths(
+        self,
+        worktree_id: str,
+        base_sha: str,
+        head_sha: str,
+        paths: Sequence[str] = (),
+    ) -> list[str]:
         if self.changed_override is not None and "finding-" in worktree_id:
             return self.changed_override
+        if paths:
+            return sorted(paths)
         for number in range(1, 10):
             if f"finding-{number}" in worktree_id:
                 return (
                     ["src/file1.py"] if "ci-finding-" in worktree_id else [f"src/file{number}.py"]
                 )
         return ["src/file1.py"]
+
+    async def render_diff(
+        self,
+        worktree_id: str,
+        base_sha: str,
+        head_sha: str,
+        paths: Sequence[str] = (),
+    ) -> bytes:
+        self.render_diff_calls.append((worktree_id, base_sha, head_sha, tuple(paths)))
+        if self.rendered_diff_override is not None:
+            return self.rendered_diff_override
+        path = paths[0] if paths else "src/file1.py"
+        return f"diff --git a/{path} b/{path}\n+frozen {path}\n".encode()
 
     async def resolve_ref(self, worktree_id: str, ref: str) -> str:
         return "a" * 40
@@ -600,6 +626,177 @@ async def test_no_findings_completes_after_initial_review(tmp_path: Path) -> Non
         StageKind.WORKER,
         StageKind.INITIAL_REVIEWER,
     ]
+
+
+async def test_initial_review_spec_contains_the_lane_scoped_frozen_diff(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    await advance_to_initial_review(value, orca, run_id)
+
+    task = next(item for item in orca.tasks_by_id.values() if item["status"] == "dispatched")
+    spec = str(task["spec"])
+    assert "Frozen diff input (supervisor-rendered; do not re-derive it)" in spec
+    assert "Complete file index (1 files):\n- src/file1.py" in spec
+    assert "+frozen src/file1.py" in spec
+    assert git.render_diff_calls[-1] == (
+        "repo::/tmp/issue",
+        "a" * 40,
+        "b" * 40,
+        ("src/file1.py",),
+    )
+
+
+async def test_unrenderable_frozen_diff_does_not_abort_the_monitor_tick(
+    tmp_path: Path,
+) -> None:
+    class MissingWorktreeGit(FakeGit):
+        async def render_diff(
+            self,
+            worktree_id: str,
+            base_sha: str,
+            head_sha: str,
+            paths: Sequence[str] = (),
+        ) -> bytes:
+            if worktree_id == "repo::/tmp/missing-lane":
+                raise GitError("worktree path does not exist: /tmp/missing-lane")
+            return await super().render_diff(worktree_id, base_sha, head_sha, paths)
+
+    orca = FakeOrca()
+    git = MissingWorktreeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal(lane_count=2)).run_id
+    await value.accept(run_id)
+
+    first_lane = store.lanes(run_id)[0]
+    with Session(store._engine) as session:
+        row = session.get(LaneRow, first_lane.lane_id)
+        assert row is not None
+        row.worktree_id = "repo::/tmp/missing-lane"
+        session.commit()
+
+    orca.complete_dispatched()
+    result = await value.monitor(run_id)
+
+    stages = {stage.lane_id: stage for stage in store.stages(run_id)}
+    reviewer_stages = [
+        stage for stage in stages.values() if stage.role is StageKind.INITIAL_REVIEWER
+    ]
+    assert len(reviewer_stages) == 2
+    assert (
+        next(stage for stage in reviewer_stages if stage.lane_id == first_lane.lane_id).orca_task_id
+        is None
+    )
+    assert (
+        next(
+            stage for stage in reviewer_stages if stage.lane_id != first_lane.lane_id
+        ).orca_dispatch_id
+        is not None
+    )
+    assert [launch.role for launch in result.started] == [StageKind.INITIAL_REVIEWER]
+    failures = [
+        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ]
+    assert failures
+    assert failures[-1]["released"] is True
+    assert "worktree path does not exist" in failures[-1]["detail"]
+
+
+async def test_fixer_and_reviewer_specs_scope_the_diff_to_the_finding(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(2))
+
+    fixer_task = next(item for item in orca.tasks_by_id.values() if item["status"] == "dispatched")
+    assert "Complete file index (1 files):\n- src/file2.py" in str(fixer_task["spec"])
+    assert git.render_diff_calls[-1][3] == ("src/file2.py",)
+
+    orca.complete_dispatched(fix_attempt(finding_id="finding-2"))
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.RE_REVIEWER
+    rereview_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
+    assert "Complete file index (1 files):\n- src/file2.py" in rereview_spec
+    assert git.render_diff_calls[-1][3] == ("src/file2.py",)
+
+
+async def test_over_budget_frozen_diff_is_chunked_by_file_without_truncation(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    graph = config().model_copy(update={"frozen_diff_budget_bytes": 65})
+    value, _ = controller(tmp_path, orca, graph_config=graph, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    git.rendered_diff_override = (
+        b"diff --git a/src/file1.py b/src/file1.py\n+first complete record\n"
+        b"diff --git a/src/file2.py b/src/file2.py\n+second complete record\n"
+    )
+    finding = review_finding_data()
+    finding["allowed_write_scope"] = {
+        "paths": ["src/file1.py", "src/file2.py"],
+        "symbols": [],
+    }
+
+    orca.complete_dispatched(initial_review_report_json(finding))
+    result = await value.monitor(run_id)
+
+    spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
+    assert "Complete file index (2 files):\n- src/file1.py\n- src/file2.py" in spec
+    assert "Frozen diff chunk 1/2" in spec
+    assert "Frozen diff chunk 2/2" in spec
+    assert spec.count("+first complete record") == 1
+    assert spec.count("+second complete record") == 1
+    assert "no content is truncated" in spec
+
+
+def test_non_utf8_frozen_diff_is_explicit_and_lossless() -> None:
+    rendered = b"diff --git a/src/latin1.py b/src/latin1.py\n+value = 'caf\xe9'\n"
+    revision = ReviewRevision(base_sha="a" * 40, head_sha="b" * 40, diff_sha256="c" * 64)
+
+    spec = _format_frozen_diff(
+        revision=revision,
+        rendered=rendered,
+        paths=["src/latin1.py"],
+        budget_bytes=65_536,
+        max_spec_bytes=120_000,
+    )
+
+    assert f"rendered_bytes: {len(rendered)}" in spec
+    assert "src/latin1.py: invalid UTF-8 bytes 0xe9" in spec
+    assert 'encoding="base64"' in spec
+    encoded = spec.split('<frozen_diff_chunk encoding="base64">', 1)[1].split(
+        "</frozen_diff_chunk>", 1
+    )[0]
+    assert base64.b64decode(encoded) == rendered
+
+
+async def test_oversized_frozen_diff_keeps_the_stage_spec_creatable(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.rendered_diff_override = (
+        "diff --git a/src/file1.py b/src/file1.py\n" + ("+oversized frozen content\n" * 20_000)
+    ).encode()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    await advance_to_initial_review(value, orca, run_id)
+
+    task = next(item for item in orca.tasks_by_id.values() if item["status"] == "dispatched")
+    spec = str(task["spec"])
+    assert len(spec.encode()) <= 120_000
+    assert "Complete file index (1 files):\n- src/file1.py" in spec
+    assert "Frozen diff content omitted to keep this task spec creatable" in spec
+    assert "omitted complete file records are:\n- src/file1.py" in spec
 
 
 async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Path) -> None:

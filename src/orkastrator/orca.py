@@ -18,6 +18,11 @@ from orkastrator.models import OrcaSnapshot, OrcaWorktree
 
 JsonObject = dict[str, object]
 
+# Linux limits one execve argument to 131,072 bytes. Keep a margin for
+# platform differences while still allowing the normal frozen-diff budget to
+# fit in the task spec.
+MAX_TASK_SPEC_BYTES = 120_000
+
 
 class OrcaError(RuntimeError):
     """Raised when an Orca CLI request fails or violates its JSON contract."""
@@ -153,6 +158,11 @@ class OrcaClient:
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         """Create one Orca Task with optional task-ID dependencies."""
 
+        spec_bytes = len(spec.encode())
+        if spec_bytes > MAX_TASK_SPEC_BYTES:
+            raise OrcaError(
+                f"Orca task spec is {spec_bytes} bytes; maximum is {MAX_TASK_SPEC_BYTES}"
+            )
         arguments = ["orchestration", "task-create", "--spec", spec]
         if dependencies:
             arguments.extend(("--deps", json.dumps(dependencies, separators=(",", ":"))))
