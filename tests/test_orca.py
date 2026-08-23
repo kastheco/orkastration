@@ -8,7 +8,13 @@ from typing import Any
 import pytest
 
 from orkastrator.config import AgentProfile
-from orkastrator.orca import JsonObject, OrcaClient, OrcaError, SubprocessRunner
+from orkastrator.orca import (
+    MAX_TASK_SPEC_BYTES,
+    JsonObject,
+    OrcaClient,
+    OrcaError,
+    SubprocessRunner,
+)
 
 
 class FakeRunner:
@@ -72,6 +78,15 @@ async def test_create_run_and_task_parse_nested_ids() -> None:
         '["task-0"]',
         "--json",
     )
+
+
+async def test_create_task_rejects_specs_over_the_delivery_limit() -> None:
+    runner = FakeRunner([])
+
+    with pytest.raises(OrcaError, match="maximum"):
+        await OrcaClient(runner).create_task("x" * (MAX_TASK_SPEC_BYTES + 1), [])
+
+    assert runner.calls == []
 
 
 async def test_runs_lists_recoverable_orca_runs() -> None:

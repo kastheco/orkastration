@@ -491,8 +491,10 @@ drives the convergence loop rather than the conversation.
 Initial reviewers receive the lane's complete frozen diff. Fixers and re-reviewers receive the same
 supervisor-rendered input scoped to their finding paths, so agents do not have to re-derive what
 changed. `frozen_diff_budget_bytes` controls the target chunk size and defaults to 65,536 bytes.
-Larger diffs are split deterministically between file records with a complete file index; a single
-file may exceed the target, but diff content is never truncated.
+Larger diffs are split deterministically between file records with a complete file index. Task
+specs are capped below Linux's per-argument limit; when all complete chunks cannot fit, the spec
+names every file whose diff content was omitted. A single file may exceed the target, but content
+is never silently truncated.
 
 ### Stage budgets
 

@@ -759,6 +759,7 @@ def test_non_utf8_frozen_diff_is_explicit_and_lossless() -> None:
         rendered=rendered,
         paths=["src/latin1.py"],
         budget_bytes=65_536,
+        max_spec_bytes=120_000,
     )
 
     assert f"rendered_bytes: {len(rendered)}" in spec
@@ -768,6 +769,27 @@ def test_non_utf8_frozen_diff_is_explicit_and_lossless() -> None:
         "</frozen_diff_chunk>", 1
     )[0]
     assert base64.b64decode(encoded) == rendered
+
+
+async def test_oversized_frozen_diff_keeps_the_stage_spec_creatable(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.rendered_diff_override = (
+        "diff --git a/src/file1.py b/src/file1.py\n"
+        + ("+oversized frozen content\n" * 20_000)
+    )
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    await advance_to_initial_review(value, orca, run_id)
+
+    task = next(item for item in orca.tasks_by_id.values() if item["status"] == "dispatched")
+    spec = str(task["spec"])
+    assert len(spec.encode()) <= 120_000
+    assert "Complete file index (1 files):\n- src/file1.py" in spec
+    assert "Frozen diff content omitted to keep this task spec creatable" in spec
+    assert "omitted complete file records are:\n- src/file1.py" in spec
 
 
 async def test_initial_review_must_match_worker_changeset_revision(tmp_path: Path) -> None:
