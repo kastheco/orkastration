@@ -391,7 +391,7 @@ class FakeGit(LocalGit):
         self.active_sequence_commits: list[str] | None = None
         self.abort_calls = 0
         self.diff_sha256_override: str | None = None
-        self.rendered_diff_override: str | None = None
+        self.rendered_diff_override: bytes | None = None
         self.render_diff_calls: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.lane_validation_fails = False
 
@@ -437,12 +437,12 @@ class FakeGit(LocalGit):
         base_sha: str,
         head_sha: str,
         paths: Sequence[str] = (),
-    ) -> str:
+    ) -> bytes:
         self.render_diff_calls.append((worktree_id, base_sha, head_sha, tuple(paths)))
         if self.rendered_diff_override is not None:
             return self.rendered_diff_override
         path = paths[0] if paths else "src/file1.py"
-        return f"diff --git a/{path} b/{path}\n+frozen {path}\n"
+        return f"diff --git a/{path} b/{path}\n+frozen {path}\n".encode()
 
     async def resolve_ref(self, worktree_id: str, ref: str) -> str:
         return "a" * 40
@@ -660,7 +660,7 @@ async def test_unrenderable_frozen_diff_does_not_abort_the_monitor_tick(
             base_sha: str,
             head_sha: str,
             paths: Sequence[str] = (),
-        ) -> str:
+        ) -> bytes:
             if worktree_id == "repo::/tmp/missing-lane":
                 raise GitError("worktree path does not exist: /tmp/missing-lane")
             return await super().render_diff(worktree_id, base_sha, head_sha, paths)
@@ -682,15 +682,23 @@ async def test_unrenderable_frozen_diff_does_not_abort_the_monitor_tick(
     result = await value.monitor(run_id)
 
     stages = {stage.lane_id: stage for stage in store.stages(run_id)}
-    reviewer_stages = [stage for stage in stages.values() if stage.role is StageKind.INITIAL_REVIEWER]
+    reviewer_stages = [
+        stage for stage in stages.values() if stage.role is StageKind.INITIAL_REVIEWER
+    ]
     assert len(reviewer_stages) == 2
-    assert next(stage for stage in reviewer_stages if stage.lane_id == first_lane.lane_id).orca_task_id is None
-    assert next(stage for stage in reviewer_stages if stage.lane_id != first_lane.lane_id).orca_dispatch_id is not None
+    assert (
+        next(stage for stage in reviewer_stages if stage.lane_id == first_lane.lane_id).orca_task_id
+        is None
+    )
+    assert (
+        next(
+            stage for stage in reviewer_stages if stage.lane_id != first_lane.lane_id
+        ).orca_dispatch_id
+        is not None
+    )
     assert [launch.role for launch in result.started] == [StageKind.INITIAL_REVIEWER]
     failures = [
-        event["payload"]
-        for event in store.events(run_id)
-        if event["kind"] == "stage_start_failed"
+        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
     ]
     assert failures
     assert failures[-1]["released"] is True
@@ -729,8 +737,8 @@ async def test_over_budget_frozen_diff_is_chunked_by_file_without_truncation(
     await value.accept(run_id)
     await advance_to_initial_review(value, orca, run_id)
     git.rendered_diff_override = (
-        "diff --git a/src/file1.py b/src/file1.py\n+first complete record\n"
-        "diff --git a/src/file2.py b/src/file2.py\n+second complete record\n"
+        b"diff --git a/src/file1.py b/src/file1.py\n+first complete record\n"
+        b"diff --git a/src/file2.py b/src/file2.py\n+second complete record\n"
     )
     finding = review_finding_data()
     finding["allowed_write_scope"] = {
@@ -764,8 +772,8 @@ def test_non_utf8_frozen_diff_is_explicit_and_lossless() -> None:
 
     assert f"rendered_bytes: {len(rendered)}" in spec
     assert "src/latin1.py: invalid UTF-8 bytes 0xe9" in spec
-    assert "encoding=\"base64\"" in spec
-    encoded = spec.split("<frozen_diff_chunk encoding=\"base64\">", 1)[1].split(
+    assert 'encoding="base64"' in spec
+    encoded = spec.split('<frozen_diff_chunk encoding="base64">', 1)[1].split(
         "</frozen_diff_chunk>", 1
     )[0]
     assert base64.b64decode(encoded) == rendered
@@ -775,9 +783,8 @@ async def test_oversized_frozen_diff_keeps_the_stage_spec_creatable(tmp_path: Pa
     orca = FakeOrca()
     git = FakeGit()
     git.rendered_diff_override = (
-        "diff --git a/src/file1.py b/src/file1.py\n"
-        + ("+oversized frozen content\n" * 20_000)
-    )
+        "diff --git a/src/file1.py b/src/file1.py\n" + ("+oversized frozen content\n" * 20_000)
+    ).encode()
     value, _ = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)

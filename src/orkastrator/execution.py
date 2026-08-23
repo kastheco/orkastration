@@ -2128,9 +2128,7 @@ class ExecutionController:
         diff_bytes = MAX_TASK_SPEC_BYTES - len(empty_diff_spec.encode())
         if diff_bytes < 1:
             raise ValueError(f"stage {stage.stage_id} has no room for frozen diff input")
-        frozen_diff = await self._frozen_diff_input(
-            lane, stage, run_id, max_spec_bytes=diff_bytes
-        )
+        frozen_diff = await self._frozen_diff_input(lane, stage, run_id, max_spec_bytes=diff_bytes)
         spec = f"{prefix}\n\n{frozen_diff}\n\n{context}"
         if len(spec.encode()) > MAX_TASK_SPEC_BYTES:
             raise ValueError(f"stage {stage.stage_id} frozen diff spec exceeds delivery limit")

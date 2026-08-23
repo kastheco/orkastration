@@ -15,6 +15,12 @@ def run(cwd: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def run_bytes(cwd: Path, *arguments: str) -> bytes:
+    """Capture a command's stdout without decoding it."""
+
+    return subprocess.run(arguments, cwd=cwd, check=True, capture_output=True).stdout
+
+
 def commit(repo: Path, path: str, content: str, message: str) -> str:
     target = repo / path
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -82,9 +88,7 @@ async def test_render_diff_returns_the_complete_path_scoped_frozen_text(tmp_path
     assert b"+two" in rendered
     assert b"src/one.py" not in rendered
     assert await git.changed_paths(lane_id, base, head, ["src/two.py"]) == ["src/two.py"]
-    assert hashlib.sha256(complete).hexdigest() == await git.diff_sha256(
-        lane_id, base, head
-    )
+    assert hashlib.sha256(complete).hexdigest() == await git.diff_sha256(lane_id, base, head)
 
 
 async def test_render_diff_preserves_non_utf8_frozen_bytes(tmp_path: Path) -> None:
@@ -101,12 +105,7 @@ async def test_render_diff_preserves_non_utf8_frozen_bytes(tmp_path: Path) -> No
 
     rendered = await git.render_diff(lane_id, base, head)
 
-    expected = subprocess.run(
-        ["git", "diff", "--binary", "--full-index", f"{base}..{head}", "--"],
-        cwd=lane,
-        check=True,
-        capture_output=True,
-    ).stdout
+    expected = run_bytes(lane, "git", "diff", "--binary", "--full-index", f"{base}..{head}", "--")
     assert rendered == expected
     assert hashlib.sha256(rendered).hexdigest() == await git.diff_sha256(lane_id, base, head)
 
