@@ -66,7 +66,7 @@ run concurrently; overlapping scopes serialize. Only resolved fixes integrate.
 
 After local convergence, continue through deterministic branch publication, one draft GitHub PR,
 and exact-SHA checks. Failed checks become scoped CI findings with at most two rounds. orkastrator
-never force-pushes, merges, or deploys.
+never force-pushes or deploys and merges only when `publication.merge` is enabled.
 
 Workers do not have a live question channel to the supervisor. A typed blocked or escalation result
 is their handoff. Inspect its Orca evidence, explain the decision needed, and ask the owner before

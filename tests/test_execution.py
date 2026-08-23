@@ -20,6 +20,7 @@ from orkastrator.models import (
     CiReceipt,
     FindingPhase,
     FindingReason,
+    GraphResult,
     LanePhase,
     LaneRecord,
     PublicationReceipt,
@@ -32,7 +33,7 @@ from orkastrator.models import (
     ValidationResult,
 )
 from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
-from orkastrator.publication import PublicationError, PullRequestLanded
+from orkastrator.publication import IntegrationConflict, PublicationError, PullRequestLanded
 from orkastrator.store import StateStore
 from tests.factories import (
     graph_config_data,
@@ -42,7 +43,11 @@ from tests.factories import (
 
 
 def config(
-    *, max_parallel_lanes: int = 2, max_workers: int = 4, max_fixers: int = 2
+    *,
+    max_parallel_lanes: int = 2,
+    max_workers: int = 4,
+    max_fixers: int = 2,
+    merge: bool = False,
 ) -> GraphConfig:
     raw = graph_config_data(max_parallel_lanes=max_parallel_lanes)
     raw["max_parallel_workers"] = max_workers
@@ -63,6 +68,9 @@ def config(
         "strength": "high",
         "trigger": "capability_mismatch",
     }
+    publication = raw["publication"]
+    assert isinstance(publication, dict)
+    publication["merge"] = merge
     return GraphConfig.model_validate(raw)
 
 
@@ -526,6 +534,7 @@ class FakePublisher:
         self.statuses = list(statuses or ["passed"])
         self.publish_calls: list[tuple[str, str | None]] = []
         self.ready_calls: list[str] = []
+        self.land_calls: list[str] = []
 
     async def publish(
         self,
@@ -559,6 +568,10 @@ class FakePublisher:
     async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt:
         self.ready_calls.append(receipt.head_sha)
         return receipt.model_copy(update={"draft": False})
+
+    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        self.land_calls.append(receipt.head_sha)
+        return receipt.model_copy(update={"landed": True, "merge_sha": "e" * 40})
 
 
 def controller(
@@ -2530,6 +2543,254 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     assert publisher.publish_calls == [("b" * 40, None)]
     assert store.publications(run_id)[0].draft
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
+
+
+async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert publisher.land_calls == []
+    assert store.publications(run_id)[-1].landed is False
+
+
+async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sha(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert publisher.ready_calls == ["b" * 40]
+    assert publisher.land_calls == ["b" * 40]
+    receipt = store.publications(run_id)[-1]
+    assert receipt.landed is True
+    assert receipt.merge_sha == "e" * 40
+
+
+async def test_publication_conflict_routes_to_lane_escalation_without_failing_run(
+    tmp_path: Path,
+) -> None:
+    class ConflictingPublisher(FakePublisher):
+        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            self.land_calls.append(receipt.head_sha)
+            raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+    orca = FakeOrca()
+    publisher = ConflictingPublisher()
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "active", store.events(run_id)
+    assert result.lanes[0].phase is LanePhase.ACTIVE
+    conflict = next(item for item in result.findings if item.origin == "publication_conflict")
+    assert conflict.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    assert conflict.lane_id == result.lanes[0].lane_id
+    assert [item.role for item in result.started] == [StageKind.ESCALATION]
+
+
+async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    class NoScopeGit(FakeGit):
+        async def changed_paths(
+            self,
+            worktree_id: str,
+            base_sha: str,
+            head_sha: str,
+            paths: Sequence[str] = (),
+        ) -> list[str]:
+            return []
+
+    class ConflictingPublisher(FakePublisher):
+        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            self.land_calls.append(receipt.head_sha)
+            raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+    worker = json.loads(worker_result())
+    assert isinstance(worker, dict)
+    worker["changed_paths"] = []
+    orca = FakeOrca()
+    publisher = ConflictingPublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=NoScopeGit(),
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(json.dumps(worker))
+    review = await value.monitor(run_id)
+    assert [launch.role for launch in review.started] == [StageKind.INITIAL_REVIEWER]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked", store.events(run_id)
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    assert blocked
+    assert (
+        blocked[-1]["payload"]["reason"] == "publication conflict has no deterministic lane scope"
+    )
+
+
+class ArmedGit(FakeGit):
+    """A Git fake that only misbehaves once a landing conflict has happened."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+
+
+class ConflictOnLand(FakePublisher):
+    """A publisher whose landing always reports a base-branch conflict."""
+
+    def __init__(self, git: ArmedGit | None = None) -> None:
+        super().__init__()
+        self.git = git
+
+    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        self.land_calls.append(receipt.head_sha)
+        # Arm here, not earlier: the conflict recorder is the only caller whose
+        # Git failures this test is about, and the review phase ahead of it
+        # needs the same fake to work normally.
+        if self.git is not None:
+            self.git.armed = True
+        raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+
+async def _blocked_reason_after_conflict(
+    tmp_path: Path, *, git: ArmedGit | None = None, drop_worktree: bool = False
+) -> tuple[str, GraphResult]:
+    """Drive one lane to a landing conflict and report why the lane blocked."""
+
+    orca = FakeOrca()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git or FakeGit(),
+        publisher=ConflictOnLand(git),
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    if drop_worktree:
+        lane = store.lanes(run_id)[0]
+        with Session(store._engine) as session:
+            row = session.get(LaneRow, lane.lane_id)
+            assert row is not None
+            row.worktree_id = None
+            session.commit()
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    assert blocked, store.events(run_id)
+    reason = blocked[-1]["payload"]["reason"]
+    assert isinstance(reason, str)
+    return reason, result
+
+
+async def test_publication_conflict_without_a_lane_checkout_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    reason, result = await _blocked_reason_after_conflict(tmp_path, drop_worktree=True)
+
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert reason == "publication conflict has no integrated lane checkout"
+
+
+async def test_publication_conflict_with_unreadable_scope_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    class UnreadableScopeGit(ArmedGit):
+        async def changed_paths(
+            self,
+            worktree_id: str,
+            base_sha: str,
+            head_sha: str,
+            paths: Sequence[str] = (),
+        ) -> list[str]:
+            if self.armed:
+                raise GitError("worktree path does not exist: /tmp/gone")
+            return await super().changed_paths(worktree_id, base_sha, head_sha, paths)
+
+    reason, result = await _blocked_reason_after_conflict(tmp_path, git=UnreadableScopeGit())
+
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert reason == (
+        "publication conflict scope unavailable: worktree path does not exist: /tmp/gone"
+    )
+
+
+async def test_publication_conflict_with_unhashable_scope_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    class UnhashableGit(ArmedGit):
+        async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
+            if self.armed:
+                raise GitError("bad object HEAD")
+            return await super().diff_sha256(worktree_id, base_sha, head_sha)
+
+    reason, result = await _blocked_reason_after_conflict(tmp_path, git=UnhashableGit())
+
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert reason == "publication conflict scope unavailable: bad object HEAD"
+
+
+async def test_a_failed_lane_is_not_landed(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher(["pending", "passed"])
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    failed_phase = LanePhase.FAILED
+    orca.complete_dispatched(initial_review_report_json())
+    first = await value.monitor(run_id)
+    assert first.status == "active", store.events(run_id)
+
+    lane = store.lanes(run_id)[0]
+    receipt = store.publications(run_id, lane.lane_id)[-1]
+    store.record_ci_receipt(run_id, lane.lane_id, await publisher.checks(receipt))
+    store.record_publication(run_id, lane.lane_id, await publisher.mark_ready(receipt))
+    assert store.ci_receipts(run_id, lane.lane_id)[-1].status == "passed"
+    assert store.publications(run_id, lane.lane_id)[-1].draft is False
+
+    store.set_lane_phase(run_id, lane.lane_id, failed_phase)
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+    assert publisher.publish_calls == [("b" * 40, None)]
+    assert publisher.land_calls == []
+    assert store.publications(run_id)[-1].landed is False
 
 
 async def test_a_resolved_finding_with_no_integrated_fix_blocks_instead_of_publishing(

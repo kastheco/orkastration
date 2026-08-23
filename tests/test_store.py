@@ -846,7 +846,7 @@ def test_a_published_head_may_land_but_never_un_land(tmp_path: Path) -> None:
     )
 
     store.record_publication(run_id, lane.lane_id, receipt)
-    landed = receipt.model_copy(update={"draft": False, "landed": True})
+    landed = receipt.model_copy(update={"draft": False, "landed": True, "merge_sha": "c" * 40})
     store.record_publication(run_id, lane.lane_id, landed)
 
     assert store.publications(run_id) == [landed]
@@ -856,6 +856,12 @@ def test_a_published_head_may_land_but_never_un_land(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="cannot be un-landed"):
         store.record_publication(run_id, lane.lane_id, receipt)
+    with pytest.raises(ValueError, match="merge sha cannot change"):
+        store.record_publication(
+            run_id,
+            lane.lane_id,
+            landed.model_copy(update={"merge_sha": "d" * 40}),
+        )
     with pytest.raises(ValueError, match="publication identity changed"):
         store.record_publication(
             run_id,
