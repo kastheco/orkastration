@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -64,6 +65,26 @@ async def test_disjoint_fixer_commits_integrate_serially(tmp_path: Path) -> None
     assert (lane / "src/one.py").read_text() == "one\n"
     assert (lane / "src/two.py").read_text() == "two\n"
     assert await git.find_cherry_pick(lane_id, one_sha) == first_head
+
+
+async def test_render_diff_returns_the_complete_path_scoped_frozen_text(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "render"
+    lane_id = add_worktree(repo, lane, "render", base)
+    commit(lane, "src/one.py", "one\n", "add one")
+    head = commit(lane, "src/two.py", "two\n", "add two")
+    git = LocalGit()
+
+    rendered = await git.render_diff(lane_id, base, head, ["src/two.py"])
+    complete = await git.render_diff(lane_id, base, head)
+
+    assert "diff --git a/src/two.py b/src/two.py" in rendered
+    assert "+two" in rendered
+    assert "src/one.py" not in rendered
+    assert await git.changed_paths(lane_id, base, head, ["src/two.py"]) == ["src/two.py"]
+    assert hashlib.sha256(complete.encode()).hexdigest() == await git.diff_sha256(
+        lane_id, base, head
+    )
 
 
 async def test_conflicting_commit_aborts_without_resetting_prior_head(tmp_path: Path) -> None:

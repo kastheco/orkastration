@@ -1333,7 +1333,7 @@ class ExecutionController:
                 continue
             lane = lanes[stage.lane_id]
             dependencies = _completed_dependency(stage, self._store.stages(run_id))
-            spec = self._stage_spec(proposals[lane.name], stage, run_id)
+            spec = await self._stage_spec(proposals[lane.name], lane, stage, run_id)
             recoverable = [
                 task
                 for task in remote_tasks
@@ -2015,7 +2015,13 @@ class ExecutionController:
             return fallback
         return cast(AgentProfile, getattr(self._config.roles, stage.role.value))
 
-    def _stage_spec(self, lane: LaneProposal, stage: StageRecord, run_id: str) -> str:
+    async def _stage_spec(
+        self,
+        lane: LaneProposal,
+        lane_record: LaneRecord,
+        stage: StageRecord,
+        run_id: str,
+    ) -> str:
         context = (
             f"Lane: {lane.name}\nIssue: {lane.issue_id}\nObjective:\n{lane.prompt}\n\n"
             f"Stop condition:\n{lane.stop_condition}"
@@ -2035,6 +2041,7 @@ class ExecutionController:
             )
         if stage.role is StageKind.INITIAL_REVIEWER:
             schema = json.dumps(InitialReviewReport.model_json_schema(), sort_keys=True)
+            frozen_diff = await self._frozen_diff_input(lane_record, stage, run_id)
             return (
                 "Review the exact worker changeset once, read-only. Freeze every actionable "
                 "finding. Omit review_revision everywhere: the supervisor binds it and verifies "
@@ -2045,13 +2052,14 @@ class ExecutionController:
                 "that syntax. A check is satisfied by its exit status alone, so set expect_exit "
                 "when the passing outcome is a non-zero one, as an absence check with rg is. "
                 "Send worker_done with body set to only the JSON "
-                f"contract matching this schema: {schema}\n\n{context}"
+                f"contract matching this schema: {schema}\n\n{frozen_diff}\n\n{context}"
             )
         finding = self._finding_for_stage(run_id, stage)
         contract = finding.effective_contract.model_dump_json()
         if stage.role is StageKind.FIXER:
             schema = json.dumps(FixAttempt.model_json_schema(), sort_keys=True)
             prior = self._store.fix_attempt(finding.finding_key, finding.round - 1)
+            frozen_diff = await self._frozen_diff_input(lane_record, stage, run_id)
             return (
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
@@ -2062,11 +2070,12 @@ class ExecutionController:
                 "commit_sha are read from the record and from Git, so send any placeholder there "
                 "and spend your effort on status, changed_paths and validation_results. Send "
                 f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
-                f"{context}"
+                f"{frozen_diff}\n\n{context}"
             )
         if stage.role is StageKind.RE_REVIEWER:
             attempt = self._store.latest_fix_attempt(finding.finding_key)
             schema = json.dumps(ReReviewResult.model_json_schema(), sort_keys=True)
+            frozen_diff = await self._frozen_diff_input(lane_record, stage, run_id)
             return (
                 f"Re-review only this finding at round {finding.round}: {contract}\n"
                 f"Fixer evidence: {attempt.model_dump_json() if attempt else 'missing'}\n"
@@ -2074,7 +2083,7 @@ class ExecutionController:
                 "finding_id, round, reviewed_commit_sha and every review_revision are read from "
                 "the record and from Git, so send any placeholder there and spend your effort on "
                 "the verdict. Send worker_done with body set to only the JSON matching this "
-                f"schema: {schema}\n\n{context}"
+                f"schema: {schema}\n\n{frozen_diff}\n\n{context}"
             )
         schema = json.dumps(EscalationDecision.model_json_schema(), sort_keys=True)
         return (
@@ -2091,6 +2100,110 @@ class ExecutionController:
             f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
             f"{context}"
         )
+
+    async def _frozen_diff_input(self, lane: LaneRecord, stage: StageRecord, run_id: str) -> str:
+        """Render the exact scoped diff once, then package all of it under the byte budget."""
+
+        if lane.worktree_id is None:
+            raise ValueError(f"stage {stage.stage_id} has no lane worktree for its frozen diff")
+        if stage.role is StageKind.INITIAL_REVIEWER:
+            worker = self._store.worker_result(lane.lane_id)
+            revision = worker.review_revision
+            paths = worker.changed_paths
+        else:
+            finding = self._finding_for_stage(run_id, stage)
+            paths = finding.effective_contract.allowed_write_scope.paths
+            if stage.role is StageKind.FIXER:
+                frozen = finding.effective_contract.review_revision
+                if frozen is None:
+                    raise ValueError(f"finding {finding.finding_id} has no frozen revision")
+                revision = frozen
+            elif stage.role is StageKind.RE_REVIEWER:
+                attempt = self._store.latest_fix_attempt(finding.finding_key)
+                if attempt is None or attempt.commit_sha is None:
+                    raise ValueError("re-review has no committed fixer diff to render")
+                revision = ReviewRevision(
+                    base_sha=self._fix_base_sha(finding),
+                    head_sha=attempt.commit_sha,
+                    diff_sha256=await self._git.diff_sha256(
+                        lane.worktree_id, self._fix_base_sha(finding), attempt.commit_sha
+                    ),
+                )
+            else:
+                raise ValueError(f"stage {stage.stage_id} does not consume a frozen diff")
+
+        rendered = await self._git.render_diff(
+            lane.worktree_id, revision.base_sha, revision.head_sha, paths
+        )
+        file_index = await self._git.changed_paths(
+            lane.worktree_id, revision.base_sha, revision.head_sha, paths
+        )
+        return _format_frozen_diff(
+            revision=revision,
+            rendered=rendered,
+            paths=file_index,
+            budget_bytes=self._config.frozen_diff_budget_bytes,
+        )
+
+
+def _format_frozen_diff(
+    *, revision: ReviewRevision, rendered: str, paths: list[str], budget_bytes: int
+) -> str:
+    """Package a complete diff, splitting only between file records when needed."""
+
+    size = len(rendered.encode())
+    index = "\n".join(f"- {path}" for path in paths) or "(no changed files in scope)"
+    identity = (
+        "Frozen diff input (supervisor-rendered; do not re-derive it):\n"
+        f"base_sha: {revision.base_sha}\n"
+        f"head_sha: {revision.head_sha}\n"
+        f"diff_sha256: {revision.diff_sha256}\n"
+        f"rendered_bytes: {size}\n"
+        f"chunk_budget_bytes: {budget_bytes}\n"
+        f"Complete file index ({len(paths)} files):\n{index}"
+    )
+    if size <= budget_bytes:
+        return f"{identity}\nFrozen diff (complete):\n<frozen_diff>\n{rendered}</frozen_diff>"
+
+    chunks = _chunk_diff_by_file(rendered, budget_bytes)
+    packaged = [
+        f"Frozen diff chunk {number}/{len(chunks)} ({len(chunk.encode())} bytes):\n"
+        f"<frozen_diff_chunk>\n{chunk}</frozen_diff_chunk>"
+        for number, chunk in enumerate(chunks, start=1)
+    ]
+    return (
+        f"{identity}\nFrozen diff is over budget and follows in {len(chunks)} complete, "
+        "deterministic file-boundary chunks. A chunk may exceed the target only when one file "
+        "does; no content is truncated.\n" + "\n".join(packaged)
+    )
+
+
+def _chunk_diff_by_file(rendered: str, budget_bytes: int) -> list[str]:
+    """Greedily group complete ``diff --git`` records without losing any bytes."""
+
+    records: list[str] = []
+    current: list[str] = []
+    for line in rendered.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current:
+            records.append("".join(current))
+            current = []
+        current.append(line)
+    if current:
+        records.append("".join(current))
+    if not records:
+        return [""]
+
+    chunks: list[str] = []
+    chunk = ""
+    for record in records:
+        candidate = f"{chunk}{record}"
+        if chunk and len(candidate.encode()) > budget_bytes:
+            chunks.append(chunk)
+            chunk = record
+        else:
+            chunk = candidate
+    chunks.append(chunk)
+    return chunks
 
 
 _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED})

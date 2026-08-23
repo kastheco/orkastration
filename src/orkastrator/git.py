@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +39,13 @@ class LocalGit:
 
         return (await self._git(worktree_id, "rev-parse", f"{ref}^{{commit}}")).stdout.strip()
 
-    async def changed_paths(self, worktree_id: str, base_sha: str, head_sha: str) -> list[str]:
+    async def changed_paths(
+        self,
+        worktree_id: str,
+        base_sha: str,
+        head_sha: str,
+        paths: Sequence[str] = (),
+    ) -> list[str]:
         """Return normalized paths changed by one exact commit range."""
 
         result = await self._git(
@@ -48,8 +55,30 @@ class LocalGit:
             "--no-renames",
             f"{base_sha}..{head_sha}",
             "--",
+            *paths,
         )
         return sorted({line for line in result.stdout.splitlines() if line})
+
+    async def render_diff(
+        self,
+        worktree_id: str,
+        base_sha: str,
+        head_sha: str,
+        paths: Sequence[str] = (),
+    ) -> str:
+        """Render the binary-capable frozen diff, optionally scoped by Git paths."""
+
+        return (
+            await self._git(
+                worktree_id,
+                "diff",
+                "--binary",
+                "--full-index",
+                f"{base_sha}..{head_sha}",
+                "--",
+                *paths,
+            )
+        ).stdout
 
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
         """Hash the exact binary-capable diff frozen for review."""

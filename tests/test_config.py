@@ -92,6 +92,7 @@ def test_settings_load_yaml_and_explicit_orca_command(
     assert settings.graph.roles.initial_reviewer.fast is False
     assert settings.graph.roles.re_reviewer.strength == "xhigh"
     assert settings.graph.review_cycle.max_fix_rounds_per_finding == 2
+    assert settings.graph.frozen_diff_budget_bytes == 65_536
     assert settings.graph.publication.branch.force_push is False
     assert settings.graph.final_gate.require_all_checks is True
     assert settings.database_path == tmp_path / "state.sqlite3"
@@ -147,6 +148,14 @@ def test_stage_budgets_default_to_unset(tmp_path: Path) -> None:
     assert budgets.for_role("worker").soft_minutes is None
     assert budgets.for_role("worker").hard_minutes is None
     assert budgets.max_timeouts == 2
+
+
+def test_frozen_diff_budget_is_configurable(tmp_path: Path) -> None:
+    path = tmp_path / "graph.yaml"
+    write_config(path)
+    path.write_text(path.read_text() + "\nfrozen_diff_budget_bytes: 1024\n")
+
+    assert load_graph_config(path).frozen_diff_budget_bytes == 1024
 
 
 def test_a_hard_budget_before_its_soft_budget_is_rejected(tmp_path: Path) -> None:
