@@ -30,7 +30,7 @@ you <-> interactive orkastrator supervisor
   orkastrator/<run>/<lane> -> draft PR -> exact-SHA GitHub checks
                                           |
                                           +-- pass -> ready
-                                          |           `-> merge commit  (target, manual today)
+                                          |           `-> merge commit
                                           `-- fail -> scoped CI fix, max 2
 ```
 
@@ -95,10 +95,11 @@ means somebody rejected the branch and blocks the lane, saying so. Publication r
 before it pushes anything, because GitHub deletes the head branch on merge and pushing first would
 recreate it.
 
-**Landing is the target state, not the shipped one.** Today the controller stops at a ready PR and
-the merge is manual. When landing ships it will use a merge commit, never a squash and never a
-fast-forward, so each lane keeps its own history in the base branch, and a lane that conflicts with
-a head that moved under it will raise an integration conflict rather than fail the run.
+**Landing is shipped, but opt-in.** `publication.merge` is `false` by default. When enabled, after
+the final gate passes the controller lands the lane in the current base branch with a real merge
+commit, never a squash and never a fast-forward, and records the resulting merge SHA in the
+publication receipt. A merge conflict raises a lane-scoped `integration_conflict` escalation rather
+than failing the run.
 orkastrator does not deploy.
 
 A finding can settle wrongly - most often because the supervisor lacked a word for what an
