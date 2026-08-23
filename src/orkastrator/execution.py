@@ -53,6 +53,7 @@ from orkastrator.models import (
 from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
 from orkastrator.publication import (
     GitHubPublisher,
+    IntegrationConflict,
     LanePublisher,
     PublicationError,
     PullRequestLanded,
@@ -1691,7 +1692,11 @@ class ExecutionController:
                     and published.head_sha == lane.integration_head_sha
                     and (
                         published.landed
-                        or (published.head_sha == passed_head and not published.draft)
+                        or (
+                            not self._config.publication.merge
+                            and published.head_sha == passed_head
+                            and not published.draft
+                        )
                     )
                 )
                 phase = LanePhase.COMPLETE if reviewed and settled and gated else LanePhase.ACTIVE
@@ -1776,6 +1781,17 @@ class ExecutionController:
                     if ready.head_sha != receipt.head_sha or ready.draft:
                         raise PublicationError("provider did not mark the exact pull request ready")
                     self._store.record_publication(run_id, lane.lane_id, ready)
+                    if self._config.publication.merge:
+                        landed = await self._publisher.land(ready)
+                        if (
+                            landed.head_sha != ready.head_sha
+                            or not landed.landed
+                            or landed.merge_sha is None
+                        ):
+                            raise PublicationError(
+                                "provider did not land the exact pull request with a merge commit"
+                            )
+                        self._store.record_publication(run_id, lane.lane_id, landed)
                 elif ci.status == "failed":
                     await self._record_ci_failure(run_id, lane, publications, ci)
                 self._store.note_publication_progress(run_id, lane.lane_id)
@@ -1790,6 +1806,9 @@ class ExecutionController:
                         receipt.model_copy(update={"draft": False, "landed": True}),
                     )
                 self._store.note_publication_progress(run_id, lane.lane_id)
+            except IntegrationConflict as exc:
+                await self._record_publication_conflict(run_id, lane, str(exc))
+                self._store.note_publication_progress(run_id, lane.lane_id)
             except PublicationError as exc:
                 # One failed observation is not knowledge. `assistant-kas-576`
                 # blocked one second after pushing its branch, on a required-check
@@ -1803,6 +1822,48 @@ class ExecutionController:
                         lane.lane_id,
                         f"{exc} (unchanged over {attempts} publication passes)",
                     )
+
+    async def _record_publication_conflict(
+        self, run_id: str, lane: LaneRecord, detail: str
+    ) -> None:
+        """Freeze a lane-scoped finding and route a base-branch conflict to escalation."""
+
+        if lane.worktree_id is None or lane.integration_head_sha is None:
+            raise ValueError("publication conflict has no integrated lane checkout")
+        worker = self._store.worker_result(lane.lane_id)
+        base_sha = worker.review_revision.base_sha
+        head_sha = lane.integration_head_sha
+        paths = await self._git.changed_paths(lane.worktree_id, base_sha, head_sha)
+        if not paths:
+            paths = worker.changed_paths
+        if not paths:
+            raise ValueError("publication conflict has no deterministic lane scope")
+        finding_id = f"publication-conflict-{head_sha[:12]}"
+        review_revision = ReviewRevision(
+            base_sha=base_sha,
+            head_sha=head_sha,
+            diff_sha256=await self._git.diff_sha256(lane.worktree_id, base_sha, head_sha),
+        )
+        contract = ReviewFinding(
+            id=finding_id,
+            review_revision=review_revision,
+            evidence=[
+                FindingEvidence(
+                    location=FindingLocation(path=path, start_line=1, end_line=1),
+                    claim=detail[:4_000],
+                )
+                for path in paths[:64]
+            ],
+            failure_mode=detail[:4_000],
+            required_outcome=(
+                f"Integrate the lane with current {lane.base_ref} without dropping accepted work."
+            ),
+            allowed_write_scope=AllowedWriteScope(paths=paths[:128]),
+        )
+        finding = self._store.add_finding(
+            run_id, lane.lane_id, contract, origin="publication_conflict"
+        )
+        self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
 
     def _local_lane_settled(self, run_id: str, lane: LaneRecord) -> bool:
         stages = [item for item in self._store.stages(run_id) if item.lane_id == lane.lane_id]

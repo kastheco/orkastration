@@ -73,7 +73,12 @@ class IntegrationBusyError(RuntimeError):
 
 
 FindingOrigin = Literal[
-    "initial_review", "introduced_by_fix", "unrelated", "ci_failure", "worker_blocked"
+    "initial_review",
+    "introduced_by_fix",
+    "unrelated",
+    "ci_failure",
+    "worker_blocked",
+    "publication_conflict",
 ]
 ContractRow = TypeVar("ContractRow", FixAttemptRow, ReReviewRow, EscalationRow)
 
@@ -429,16 +434,25 @@ class StateStore:
                 kind = "lane_published"
             else:
                 previous = PublicationReceipt.model_validate_json(row.payload_json)
-                # Draft and landed are the two facts about a published head that
-                # are allowed to move, and both move in one direction only.
+                # Draft, landed, and the merge sha are the facts about a
+                # published head that may move. The first two move in one
+                # direction; the merge sha may be filled once on landing.
                 # Everything else identifies the publication and must not change.
                 if (
-                    previous.model_copy(update={"draft": receipt.draft, "landed": receipt.landed})
+                    previous.model_copy(
+                        update={
+                            "draft": receipt.draft,
+                            "landed": receipt.landed,
+                            "merge_sha": receipt.merge_sha,
+                        }
+                    )
                     != receipt
                 ):
                     raise ValueError("publication identity changed for an existing head")
                 if previous.landed and not receipt.landed:
                     raise ValueError("a landed publication cannot be un-landed")
+                if previous.merge_sha is not None and previous.merge_sha != receipt.merge_sha:
+                    raise ValueError("a publication merge sha cannot change")
                 row.payload_json = payload
                 row.updated_at = now
                 if receipt.landed and not previous.landed:

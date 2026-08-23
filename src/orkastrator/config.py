@@ -197,7 +197,7 @@ class PublicationConfig(BaseModel):
     scope: Literal["accepted_run"]
     branch: BranchPublicationConfig
     pull_request: PullRequestPublicationConfig
-    merge: Literal[False]
+    merge: bool = False
     deploy: Literal[False]
 
 

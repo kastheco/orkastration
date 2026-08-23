@@ -12,7 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 GitObjectId = Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 FindingId = Annotated[
-    str, StringConstraints(pattern=r"^(?:finding|ci-finding|worker-decision)-[a-z0-9-]+$")
+    str,
+    StringConstraints(
+        pattern=r"^(?:finding|ci-finding|worker-decision|publication-conflict)-[a-z0-9-]+$"
+    ),
 ]
 
 
@@ -549,6 +552,16 @@ class PublicationReceipt(WorkflowContract):
     # branch's history now. Defaults false so receipts written before this
     # field existed still read.
     landed: bool = False
+    # The merge commit created when orkastrator lands the lane. Older receipts
+    # and externally merged pull requests can be landed without this value, but
+    # an automated landing always records it.
+    merge_sha: GitObjectId | None = None
+
+    @model_validator(mode="after")
+    def merge_commit_requires_landing(self) -> PublicationReceipt:
+        if self.merge_sha is not None and not self.landed:
+            raise ValueError("a publication merge sha requires a landed receipt")
+        return self
 
 
 class CiReceipt(WorkflowContract):
@@ -711,7 +724,12 @@ class FindingRecord(BaseModel):
     lane_id: str
     finding_id: str
     origin: Literal[
-        "initial_review", "introduced_by_fix", "unrelated", "ci_failure", "worker_blocked"
+        "initial_review",
+        "introduced_by_fix",
+        "unrelated",
+        "ci_failure",
+        "worker_blocked",
+        "publication_conflict",
     ]
     contract: ReviewFinding
     effective_contract: ReviewFinding

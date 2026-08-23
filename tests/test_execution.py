@@ -29,7 +29,7 @@ from orkastrator.models import (
     ValidationResult,
 )
 from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
-from orkastrator.publication import PublicationError, PullRequestLanded
+from orkastrator.publication import IntegrationConflict, PublicationError, PullRequestLanded
 from orkastrator.store import StateStore
 from tests.factories import (
     graph_config_data,
@@ -39,7 +39,11 @@ from tests.factories import (
 
 
 def config(
-    *, max_parallel_lanes: int = 2, max_workers: int = 4, max_fixers: int = 2
+    *,
+    max_parallel_lanes: int = 2,
+    max_workers: int = 4,
+    max_fixers: int = 2,
+    merge: bool = False,
 ) -> GraphConfig:
     raw = graph_config_data(max_parallel_lanes=max_parallel_lanes)
     raw["max_parallel_workers"] = max_workers
@@ -60,6 +64,9 @@ def config(
         "strength": "high",
         "trigger": "capability_mismatch",
     }
+    publication = raw["publication"]
+    assert isinstance(publication, dict)
+    publication["merge"] = merge
     return GraphConfig.model_validate(raw)
 
 
@@ -500,6 +507,7 @@ class FakePublisher:
         self.statuses = list(statuses or ["passed"])
         self.publish_calls: list[tuple[str, str | None]] = []
         self.ready_calls: list[str] = []
+        self.land_calls: list[str] = []
 
     async def publish(
         self,
@@ -533,6 +541,10 @@ class FakePublisher:
     async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt:
         self.ready_calls.append(receipt.head_sha)
         return receipt.model_copy(update={"draft": False})
+
+    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        self.land_calls.append(receipt.head_sha)
+        return receipt.model_copy(update={"landed": True, "merge_sha": "e" * 40})
 
 
 def controller(
@@ -2333,6 +2345,87 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     assert publisher.publish_calls == [("b" * 40, None)]
     assert store.publications(run_id)[0].draft
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
+
+
+async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert publisher.land_calls == []
+    assert store.publications(run_id)[-1].landed is False
+
+
+async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sha(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert publisher.ready_calls == ["b" * 40]
+    assert publisher.land_calls == ["b" * 40]
+    receipt = store.publications(run_id)[-1]
+    assert receipt.landed is True
+    assert receipt.merge_sha == "e" * 40
+
+
+async def test_publication_conflict_routes_to_lane_escalation_without_failing_run(
+    tmp_path: Path,
+) -> None:
+    class ConflictingPublisher(FakePublisher):
+        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            self.land_calls.append(receipt.head_sha)
+            raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+    orca = FakeOrca()
+    publisher = ConflictingPublisher()
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "active", store.events(run_id)
+    assert result.lanes[0].phase is LanePhase.ACTIVE
+    conflict = next(item for item in result.findings if item.origin == "publication_conflict")
+    assert conflict.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    assert conflict.lane_id == result.lanes[0].lane_id
+    assert [item.role for item in result.started] == [StageKind.ESCALATION]
+
+
+async def test_a_failed_lane_is_not_landed(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    lane = store.lanes(run_id)[0]
+    store.set_lane_phase(run_id, lane.lane_id, LanePhase.FAILED)
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "failed"
+    assert publisher.publish_calls == []
+    assert publisher.land_calls == []
 
 
 async def test_ci_failure_creates_scoped_finding_then_republishes_fix(

@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from orkastrator.config import ConfigError, Settings, config_changes, load_graph_config
+from orkastrator.config import ConfigError, GraphConfig, Settings, config_changes, load_graph_config
+from tests.factories import graph_config_data
 
 
 def write_config(path: Path, *, strength: str = "high") -> None:
@@ -95,6 +96,24 @@ def test_settings_load_yaml_and_explicit_orca_command(
     assert settings.graph.publication.branch.force_push is False
     assert settings.graph.final_gate.require_all_checks is True
     assert settings.database_path == tmp_path / "state.sqlite3"
+
+
+def test_publication_merge_is_an_opt_in_toggle_but_deploy_remains_disabled() -> None:
+    defaults = graph_config_data()
+    publication = defaults["publication"]
+    assert isinstance(publication, dict)
+    publication.pop("merge")
+    assert GraphConfig.model_validate(defaults).publication.merge is False
+
+    enabled = graph_config_data()
+    enabled_publication = enabled["publication"]
+    assert isinstance(enabled_publication, dict)
+    enabled_publication["merge"] = True
+    assert GraphConfig.model_validate(enabled).publication.merge is True
+
+    enabled_publication["deploy"] = True
+    with pytest.raises(ValueError, match="deploy"):
+        GraphConfig.model_validate(enabled)
 
 
 def test_missing_config_is_actionable(tmp_path: Path) -> None:
