@@ -2412,6 +2412,51 @@ async def test_publication_conflict_routes_to_lane_escalation_without_failing_ru
     assert [item.role for item in result.started] == [StageKind.ESCALATION]
 
 
+async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
+    tmp_path: Path,
+) -> None:
+    class NoScopeGit(FakeGit):
+        async def changed_paths(
+            self, worktree_id: str, base_sha: str, head_sha: str
+        ) -> list[str]:
+            return []
+
+    class ConflictingPublisher(FakePublisher):
+        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            self.land_calls.append(receipt.head_sha)
+            raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+    worker = json.loads(worker_result())
+    assert isinstance(worker, dict)
+    worker["changed_paths"] = []
+    orca = FakeOrca()
+    publisher = ConflictingPublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=NoScopeGit(),
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(json.dumps(worker))
+    review = await value.monitor(run_id)
+    assert [launch.role for launch in review.started] == [StageKind.INITIAL_REVIEWER]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked", store.events(run_id)
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    assert blocked
+    assert (
+        blocked[-1]["payload"]["reason"]
+        == "publication conflict has no deterministic lane scope"
+    )
+
+
 async def test_a_failed_lane_is_not_landed(tmp_path: Path) -> None:
     orca = FakeOrca()
     publisher = FakePublisher()

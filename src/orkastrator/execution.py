@@ -1829,20 +1829,37 @@ class ExecutionController:
         """Freeze a lane-scoped finding and route a base-branch conflict to escalation."""
 
         if lane.worktree_id is None or lane.integration_head_sha is None:
-            raise ValueError("publication conflict has no integrated lane checkout")
+            self._store.block_lane(
+                run_id, lane.lane_id, "publication conflict has no integrated lane checkout"
+            )
+            return
         worker = self._store.worker_result(lane.lane_id)
         base_sha = worker.review_revision.base_sha
         head_sha = lane.integration_head_sha
-        paths = await self._git.changed_paths(lane.worktree_id, base_sha, head_sha)
+        try:
+            paths = await self._git.changed_paths(lane.worktree_id, base_sha, head_sha)
+        except GitError as exc:
+            self._store.block_lane(
+                run_id, lane.lane_id, f"publication conflict scope unavailable: {exc}"
+            )
+            return
         if not paths:
             paths = worker.changed_paths
         if not paths:
-            raise ValueError("publication conflict has no deterministic lane scope")
+            self._store.block_lane(
+                run_id, lane.lane_id, "publication conflict has no deterministic lane scope"
+            )
+            return
         finding_id = f"publication-conflict-{head_sha[:12]}"
+        try:
+            diff_sha256 = await self._git.diff_sha256(lane.worktree_id, base_sha, head_sha)
+        except GitError as exc:
+            self._store.block_lane(
+                run_id, lane.lane_id, f"publication conflict scope unavailable: {exc}"
+            )
+            return
         review_revision = ReviewRevision(
-            base_sha=base_sha,
-            head_sha=head_sha,
-            diff_sha256=await self._git.diff_sha256(lane.worktree_id, base_sha, head_sha),
+            base_sha=base_sha, head_sha=head_sha, diff_sha256=diff_sha256
         )
         contract = ReviewFinding(
             id=finding_id,
