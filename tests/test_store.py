@@ -484,6 +484,67 @@ def test_a_finding_cannot_be_settled_into_a_phase_that_is_not_a_decision(
         store.settle_finding(run_id, "finding-absent", phase=FindingPhase.DEFERRED, note="typo")
 
 
+def test_a_finding_cannot_be_settled_resolved_until_its_fix_is_integrated(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "resolved.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(
+            initial_review_report_json(review_finding_data(1), review_finding_data(2))
+        ),
+    )
+    first, second = store.findings(run_id)
+    store.set_finding_state(run_id, first.finding_key, phase=FindingPhase.BLOCKED)
+    store.set_finding_state(run_id, second.finding_key, phase=FindingPhase.BLOCKED)
+
+    # Resolved means the fix is in the lane checkout. Saying so before it is there
+    # publishes the pre-fix head under a receipt that claims otherwise.
+    with pytest.raises(ValueError, match="no integrated fix"):
+        store.settle_finding(
+            run_id, first.finding_id, phase=FindingPhase.RESOLVED, note="looks right to me"
+        )
+    with pytest.raises(KeyError):
+        store.settle_finding(run_id, "finding-absent", phase=FindingPhase.RESOLVED, note="typo")
+
+    # Deferred carries no such claim, so it stays available with nothing integrated.
+    assert (
+        store.settle_finding(
+            run_id, first.finding_id, phase=FindingPhase.DEFERRED, note="tracked elsewhere"
+        ).phase
+        is FindingPhase.DEFERRED
+    )
+
+    store.begin_integration(
+        run_id,
+        second,
+        fixer_commit_sha="d" * 40,
+        source_commits=["d" * 40],
+        source_finding_ids=[first.finding_id],
+        base_sha="b" * 40,
+    )
+    # A receipt only counts once it has actually moved the lane checkout.
+    assert store.integrated_finding_ids(run_id, lane.lane_id) == set()
+    store.finish_integration(
+        run_id, second, status="integrated", integrated_sha="f" * 40, validation_results=[]
+    )
+
+    # One commit can answer several findings, so the receipt's own finding and
+    # everything it names as a source are both settleable.
+    assert store.integrated_finding_ids(run_id, lane.lane_id) == {
+        first.finding_id,
+        second.finding_id,
+    }
+    settled = store.settle_finding(
+        run_id, second.finding_id, phase=FindingPhase.RESOLVED, note="integrated"
+    )
+    assert settled.phase is FindingPhase.RESOLVED
+
+
 def test_a_round_level_contract_constraint_is_rebuilt_around_the_stage(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     store = StateStore(path)
