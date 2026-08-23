@@ -18,6 +18,11 @@ from orkastrator.models import OrcaSnapshot, OrcaWorktree
 
 JsonObject = dict[str, object]
 
+# Linux limits one execve argument to 131,072 bytes. Keep a margin for
+# platform differences while still allowing the normal frozen-diff budget to
+# fit in the task spec.
+MAX_TASK_SPEC_BYTES = 120_000
+
 
 class OrcaError(RuntimeError):
     """Raised when an Orca CLI request fails or violates its JSON contract."""
@@ -153,6 +158,11 @@ class OrcaClient:
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]:
         """Create one Orca Task with optional task-ID dependencies."""
 
+        spec_bytes = len(spec.encode())
+        if spec_bytes > MAX_TASK_SPEC_BYTES:
+            raise OrcaError(
+                f"Orca task spec is {spec_bytes} bytes; maximum is {MAX_TASK_SPEC_BYTES}"
+            )
         arguments = ["orchestration", "task-create", "--spec", spec]
         if dependencies:
             arguments.extend(("--deps", json.dumps(dependencies, separators=(",", ":"))))
@@ -251,6 +261,7 @@ class OrcaClient:
         repo_selector: str,
         worktree_id: str | None,
         profile: AgentProfile,
+        orca_run_id: str,
         base_ref: str | None = None,
         parent_worktree_id: str | None = None,
     ) -> tuple[str, str, str | None, JsonObject]:
@@ -272,9 +283,12 @@ class OrcaClient:
                 base_ref=base_ref,
                 parent_worktree_id=parent_worktree_id,
                 profile=profile,
+                orca_run_id=orca_run_id,
             )
 
-        arguments = ["orchestration", "worker-start", "--task", task_id]
+        # Naming the run keeps the start independent of whichever run the
+        # coordinator terminal happens to be bound to when it fires.
+        arguments = ["orchestration", "worker-start", "--task", task_id, "--run", orca_run_id]
         if worktree_id is None:
             placement = "new-child" if parent_worktree_id is not None else "new-top-level"
             arguments.extend(
@@ -323,10 +337,12 @@ class OrcaClient:
         base_ref: str | None,
         parent_worktree_id: str | None,
         profile: AgentProfile,
+        orca_run_id: str,
     ) -> tuple[str, str, str | None, JsonObject]:
         """Launch fast provider argv, then attach it to a supervised Dispatch."""
 
         resolved_worktree = worktree_id
+        created_worktree: str | None = None
         if resolved_worktree is None:
             arguments = ["worktree", "create", "--name", lane_name]
             if parent_worktree_id is None:
@@ -339,47 +355,81 @@ class OrcaClient:
             arguments.append("--json")
             worktree_response = await self._ok(*arguments)
             resolved_worktree = _worktree_id(worktree_response)
+            created_worktree = resolved_worktree
 
-        terminal_response = await self._ok(
-            "terminal",
-            "create",
-            "--worktree",
-            f"id:{resolved_worktree}",
-            "--title",
-            f"{lane_name}-{profile.agent}-fast",
-            "--command",
-            shlex.join(_fast_agent_command(profile)),
-            "--json",
-        )
-        terminal_handle = _required_recursive_string(terminal_response, "terminalHandle", "handle")
-        await self._ok(
-            "terminal",
-            "wait",
-            "--terminal",
-            terminal_handle,
-            "--for",
-            "tui-idle",
-            "--timeout-ms",
-            "20000",
-            "--json",
-        )
-        # worker-start defaults its worktree selector to the calling terminal's own
-        # checkout. orkastrator drives Orca from a floating coordinator terminal that
-        # has none, so the placement has to be named explicitly even when --terminal
-        # already identifies the agent pane.
-        response = await self._ok(
-            "orchestration",
-            "worker-start",
-            "--task",
-            task_id,
-            "--terminal",
-            terminal_handle,
-            "--worktree",
-            f"id:{resolved_worktree}",
-            "--json",
-        )
-        dispatch_id = _required_recursive_string(response, "dispatchId")
+        # A start that fails after this point has no stage to record the checkout
+        # against, so nothing else will ever reclaim it. The caller retries the
+        # stage every reconcile, which turns one unstartable stage into one
+        # abandoned worktree per tick until somebody notices the disk.
+        try:
+            terminal_response = await self._ok(
+                "terminal",
+                "create",
+                "--worktree",
+                f"id:{resolved_worktree}",
+                "--title",
+                f"{lane_name}-{profile.agent}-fast",
+                "--command",
+                shlex.join(_fast_agent_command(profile)),
+                "--json",
+            )
+            terminal_handle = _required_recursive_string(
+                terminal_response, "terminalHandle", "handle"
+            )
+            wait_response = await self._ok(
+                "terminal",
+                "wait",
+                "--terminal",
+                terminal_handle,
+                "--for",
+                "tui-idle",
+                "--timeout-ms",
+                "20000",
+                "--json",
+            )
+            # `ok` here only says the wait ran, not that it was satisfied. An agent
+            # parked on its own prompt - an untrusted directory, an expired login -
+            # reports `satisfied: false` and a reason, and every command after this
+            # one then fails against a TUI that is not listening. Read the reason
+            # while it is still attributable instead of surfacing whatever the next
+            # call happens to return.
+            _require_idle(wait_response, terminal_handle)
+            # worker-start defaults its worktree selector to the calling terminal's own
+            # checkout. orkastrator drives Orca from a floating coordinator terminal that
+            # has none, so the placement has to be named explicitly even when --terminal
+            # already identifies the agent pane.
+            response = await self._ok(
+                "orchestration",
+                "worker-start",
+                "--task",
+                task_id,
+                "--run",
+                orca_run_id,
+                "--terminal",
+                terminal_handle,
+                "--worktree",
+                f"id:{resolved_worktree}",
+                "--json",
+            )
+            dispatch_id = _required_recursive_string(response, "dispatchId")
+        except BaseException:
+            if created_worktree is not None:
+                await self._discard_worktree(created_worktree)
+            raise
         return dispatch_id, resolved_worktree, terminal_handle, response
+
+    async def _discard_worktree(self, worktree_id: str) -> None:
+        """Drop a checkout this start created and will never hand to a stage.
+
+        Best effort on purpose: the caller is already raising the failure that
+        matters, and losing a worktree is not worth replacing that failure with
+        a cleanup error nobody asked about.
+        """
+
+        try:
+            await self._ok("worktree", "rm", "--worktree", f"id:{worktree_id}", "--force", "--json")
+        except (OrcaError, OrcaTimeout):
+            return
 
     async def worker_turns(self, dispatch_id: str, limit: int = 50) -> list[str]:
         """Signatures of the recent assistant tool calls on one dispatched worker.
@@ -545,6 +595,26 @@ class OrcaClient:
             detail = _error_detail(response.get("error"))
             raise OrcaError(f"Orca returned a non-success response{detail}")
         return response
+
+
+def _require_idle(response: JsonObject, terminal_handle: str) -> None:
+    """Refuse a terminal whose wait reported that it never went idle.
+
+    Only an explicit `satisfied: false` is refused. An Orca that reports no wait
+    outcome at all is left alone deliberately: the failure being caught here is a
+    stated negative, and treating a missing field as one would make the supervisor
+    depend on a response shape it has no reason to require.
+    """
+
+    result = response.get("result")
+    wait = result.get("wait") if isinstance(result, dict) else None
+    if not isinstance(wait, dict) or wait.get("satisfied") is not False:
+        return
+    reason = wait.get("blockedReason") or wait.get("status") or "unknown"
+    raise OrcaError(
+        f"agent terminal {terminal_handle} never became idle before its task was "
+        f"dispatched: {reason}"
+    )
 
 
 def _error_detail(error: object) -> str:
