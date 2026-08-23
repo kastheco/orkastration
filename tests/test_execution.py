@@ -11,9 +11,9 @@ import pytest
 from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
-from orkastrator.db import AcceptanceAuthorizationRow, EventRow
+from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
 from orkastrator.execution import ExecutionController, _next_key
-from orkastrator.git import GitCommandResult, LocalGit
+from orkastrator.git import GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
     CiReceipt,
@@ -646,6 +646,53 @@ async def test_initial_review_spec_contains_the_lane_scoped_frozen_diff(tmp_path
         "b" * 40,
         ("src/file1.py",),
     )
+
+
+async def test_unrenderable_frozen_diff_does_not_abort_the_monitor_tick(
+    tmp_path: Path,
+) -> None:
+    class MissingWorktreeGit(FakeGit):
+        async def render_diff(
+            self,
+            worktree_id: str,
+            base_sha: str,
+            head_sha: str,
+            paths: Sequence[str] = (),
+        ) -> str:
+            if worktree_id == "repo::/tmp/missing-lane":
+                raise GitError("worktree path does not exist: /tmp/missing-lane")
+            return await super().render_diff(worktree_id, base_sha, head_sha, paths)
+
+    orca = FakeOrca()
+    git = MissingWorktreeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal(lane_count=2)).run_id
+    await value.accept(run_id)
+
+    first_lane = store.lanes(run_id)[0]
+    with Session(store._engine) as session:
+        row = session.get(LaneRow, first_lane.lane_id)
+        assert row is not None
+        row.worktree_id = "repo::/tmp/missing-lane"
+        session.commit()
+
+    orca.complete_dispatched()
+    result = await value.monitor(run_id)
+
+    stages = {stage.lane_id: stage for stage in store.stages(run_id)}
+    reviewer_stages = [stage for stage in stages.values() if stage.role is StageKind.INITIAL_REVIEWER]
+    assert len(reviewer_stages) == 2
+    assert next(stage for stage in reviewer_stages if stage.lane_id == first_lane.lane_id).orca_task_id is None
+    assert next(stage for stage in reviewer_stages if stage.lane_id != first_lane.lane_id).orca_dispatch_id is not None
+    assert [launch.role for launch in result.started] == [StageKind.INITIAL_REVIEWER]
+    failures = [
+        event["payload"]
+        for event in store.events(run_id)
+        if event["kind"] == "stage_start_failed"
+    ]
+    assert failures
+    assert failures[-1]["released"] is True
+    assert "worktree path does not exist" in failures[-1]["detail"]
 
 
 async def test_fixer_and_reviewer_specs_scope_the_diff_to_the_finding(tmp_path: Path) -> None:

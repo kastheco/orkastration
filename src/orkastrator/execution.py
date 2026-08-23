@@ -1333,7 +1333,14 @@ class ExecutionController:
                 continue
             lane = lanes[stage.lane_id]
             dependencies = _completed_dependency(stage, self._store.stages(run_id))
-            spec = await self._stage_spec(proposals[lane.name], lane, stage, run_id)
+            try:
+                spec = await self._stage_spec(proposals[lane.name], lane, stage, run_id)
+            except (OrcaError, GitError, ValueError, KeyError) as exc:
+                # A stage whose frozen input cannot be rendered is refused on
+                # its own. Leave it unbound so the next tick can retry after
+                # the worktree or persisted result becomes readable again.
+                self._store.record_stage_start_failure(run_id, stage, str(exc), released=True)
+                continue
             recoverable = [
                 task
                 for task in remote_tasks
