@@ -262,6 +262,37 @@ async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
     )
 
 
+async def test_create_worktree_pins_the_requested_base_before_worker_start() -> None:
+    runner = FakeRunner(
+        [{"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}}]
+    )
+    client = OrcaClient(runner)
+
+    worktree_id, _ = await client.create_worktree(
+        lane_name="issue-123-worker",
+        repo_selector="id:repo",
+        base_ref="main",
+    )
+
+    assert worktree_id == "repo::/tmp/issue-123"
+    assert runner.calls == [
+        (
+            "worktree",
+            "create",
+            "--name",
+            "issue-123-worker",
+            "--no-parent",
+            "--repo",
+            "id:repo",
+            "--setup",
+            "run",
+            "--base-branch",
+            "main",
+            "--json",
+        )
+    ]
+
+
 async def test_start_worker_reuses_lane_worktree() -> None:
     runner = FakeRunner([{"ok": True, "result": {"dispatchId": "dispatch-2"}}])
     client = OrcaClient(runner)

@@ -642,6 +642,7 @@ class LaneRecord(BaseModel):
     issue_id: str
     repo_selector: str
     base_ref: str
+    base_sha: GitObjectId | None = None
     phase: LanePhase
     worktree_id: str | None
     review_head_sha: GitObjectId | None

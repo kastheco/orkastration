@@ -616,6 +616,47 @@ class StateStore:
                 lane.updated_at = _now()
             self._event(session, run_id, row.lane_id, "stage_started", payload)
 
+    def record_worker_checkout(
+        self, run_id: str, stage_id: str, worktree_id: str, base_sha: str | None = None
+    ) -> None:
+        """Persist a worker checkout and, once known, its immutable build base."""
+
+        with self._session() as session:
+            row = session.get(WorkflowStageRow, stage_id)
+            if row is None:
+                raise KeyError(f"unknown stage {stage_id}")
+            if row.role != StageKind.WORKER.value:
+                raise ValueError(f"stage {stage_id} is not a worker")
+            if row.worktree_id is not None and row.worktree_id != worktree_id:
+                raise ValueError(f"worker stage {stage_id} already has another checkout")
+            lane = session.get(LaneRow, row.lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {row.lane_id}")
+            if lane.worktree_id is not None and lane.worktree_id != worktree_id:
+                raise ValueError(f"lane {lane.lane_id} already has another checkout")
+            if base_sha is not None and lane.base_sha is not None and lane.base_sha != base_sha:
+                raise ValueError(f"lane {lane.lane_id} already has another frozen base")
+            changed = (
+                row.worktree_id != worktree_id
+                or lane.worktree_id != worktree_id
+                or (base_sha is not None and lane.base_sha is None)
+            )
+            if not changed:
+                return
+            row.worktree_id = worktree_id
+            lane.worktree_id = worktree_id
+            if base_sha is not None:
+                lane.base_sha = base_sha
+            row.updated_at = _now()
+            lane.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                row.lane_id,
+                "worker_checkout_recorded",
+                {"stage_id": stage_id, "worktree_id": worktree_id, "base_sha": base_sha},
+            )
+
     def reserve_stage_start(
         self,
         run_id: str,
@@ -2210,6 +2251,7 @@ class StateStore:
             "supervisor_runs": (("orca_run_id", "TEXT"),),
             "lanes": (
                 ("base_ref", "TEXT NOT NULL DEFAULT 'HEAD'"),
+                ("base_sha", "TEXT"),
                 ("review_head_sha", "TEXT"),
                 ("integration_head_sha", "TEXT"),
             ),
@@ -2278,6 +2320,7 @@ def _lane(row: LaneRow) -> LaneRecord:
         issue_id=row.issue_id,
         repo_selector=row.repo_selector,
         base_ref=row.base_ref,
+        base_sha=row.base_sha,
         phase=LanePhase(row.phase),
         worktree_id=row.worktree_id,
         review_head_sha=row.review_head_sha,

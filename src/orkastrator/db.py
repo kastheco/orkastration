@@ -30,6 +30,7 @@ class LaneRow(SQLModel, table=True):
     issue_id: str
     repo_selector: str
     base_ref: str = "HEAD"
+    base_sha: str | None = None
     agent_id: str = "graph"
     phase: str
     worktree_id: str | None = None

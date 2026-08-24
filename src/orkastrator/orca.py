@@ -365,6 +365,28 @@ class OrcaClient:
         # is enough and no handle needs carrying.
         return dispatch_id, resolved_worktree, None, response
 
+    async def create_worktree(
+        self,
+        *,
+        lane_name: str,
+        repo_selector: str,
+        base_ref: str | None = None,
+        parent_worktree_id: str | None = None,
+    ) -> tuple[str, JsonObject]:
+        """Create a checkout before any worker can mutate it."""
+
+        arguments = ["worktree", "create", "--name", lane_name]
+        if parent_worktree_id is None:
+            arguments.append("--no-parent")
+        else:
+            arguments.extend(("--parent-worktree", f"id:{parent_worktree_id}"))
+        arguments.extend(("--repo", repo_selector, "--setup", "run"))
+        if base_ref is not None:
+            arguments.extend(("--base-branch", base_ref))
+        arguments.append("--json")
+        response = await self._ok(*arguments)
+        return _worktree_id(response), response
+
     async def _start_fast_worker(
         self,
         *,
@@ -382,17 +404,12 @@ class OrcaClient:
         resolved_worktree = worktree_id
         created_worktree: str | None = None
         if resolved_worktree is None:
-            arguments = ["worktree", "create", "--name", lane_name]
-            if parent_worktree_id is None:
-                arguments.append("--no-parent")
-            else:
-                arguments.extend(("--parent-worktree", f"id:{parent_worktree_id}"))
-            arguments.extend(("--repo", repo_selector, "--setup", "run"))
-            if base_ref is not None:
-                arguments.extend(("--base-branch", base_ref))
-            arguments.append("--json")
-            worktree_response = await self._ok(*arguments)
-            resolved_worktree = _worktree_id(worktree_response)
+            resolved_worktree, _ = await self.create_worktree(
+                lane_name=lane_name,
+                repo_selector=repo_selector,
+                base_ref=base_ref,
+                parent_worktree_id=parent_worktree_id,
+            )
             created_worktree = resolved_worktree
 
         # A start that fails after this point has no stage to record the checkout

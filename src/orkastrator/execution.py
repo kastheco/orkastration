@@ -78,6 +78,15 @@ class OrcaGraphController(Protocol):
 
     async def tasks(self, orca_run_id: str) -> list[JsonObject]: ...
 
+    async def create_worktree(
+        self,
+        *,
+        lane_name: str,
+        repo_selector: str,
+        base_ref: str | None = None,
+        parent_worktree_id: str | None = None,
+    ) -> tuple[str, JsonObject]: ...
+
     async def start_worker(
         self,
         *,
@@ -206,6 +215,9 @@ class ExecutionController:
                     raise ValueError(
                         f"Orca Dispatch {dispatch_id} omitted its worker worktree identity"
                     )
+                await self._prepare_worker_checkout(
+                    run_id, lanes[stage.lane_id], stage, worktree_id
+                )
                 self._store.mark_stage_started(
                     run_id,
                     stage.stage_id,
@@ -233,6 +245,9 @@ class ExecutionController:
                     raise ValueError(
                         f"Orca Dispatch {dispatch_id} omitted its worker worktree identity"
                     )
+                await self._prepare_worker_checkout(
+                    run_id, lanes[stage.lane_id], stage, worktree_id
+                )
                 self._store.mark_stage_started(
                     run_id,
                     stage.stage_id,
@@ -1035,8 +1050,8 @@ class ExecutionController:
             raise ValueError("worker worktree contains uncommitted changes")
         revision = result.review_revision
         lane = next(item for item in self._store.lanes(run_id) if item.lane_id == stage.lane_id)
-        if await self._git.resolve_ref(stage.worktree_id, lane.base_ref) != revision.base_sha:
-            raise ValueError("worker review base does not match the configured lane base_ref")
+        if lane.base_sha != revision.base_sha:
+            raise ValueError("worker review base does not match the frozen lane base")
         if await self._git.head(stage.worktree_id) != revision.head_sha:
             raise ValueError("worker review head does not match the lane checkout")
         if not await self._git.is_ancestor(stage.worktree_id, revision.base_sha, revision.head_sha):
@@ -1582,6 +1597,18 @@ class ExecutionController:
         if stage.orca_task_id is None:  # already checked before the slot was reserved
             raise ValueError(f"stage {stage.stage_id} has no Orca task")
         placement = self._placement(run_id, lane, stage)
+        if stage.role is StageKind.WORKER:
+            worker_worktree = placement.worktree_id
+            if worker_worktree is None:
+                worker_worktree, _ = await self._orca.create_worktree(
+                    lane_name=_worker_name(lane.name, stage),
+                    repo_selector=lane.repo_selector,
+                    base_ref=lane.base_ref,
+                )
+            await self._prepare_worker_checkout(
+                run_id, lane, stage, worker_worktree, before_dispatch=True
+            )
+            placement = WorkerPlacement(worktree_id=worker_worktree)
         # `use_run` binds the coordinator terminal, and that binding is one piece
         # of shared Orca state: a second supervisor process binding its own run
         # moves it out from under this one, after which `worker-start` resolves
@@ -1637,6 +1664,32 @@ class ExecutionController:
             dispatch_id=dispatch_id,
             worktree_id=worktree_id,
         )
+
+    async def _prepare_worker_checkout(
+        self,
+        run_id: str,
+        lane: LaneRecord,
+        stage: StageRecord,
+        worktree_id: str,
+        *,
+        before_dispatch: bool = False,
+    ) -> None:
+        """Persist a worker checkout and freeze its base before dispatch."""
+
+        if stage.role is not StageKind.WORKER:
+            return
+        self._store.record_worker_checkout(run_id, stage.stage_id, worktree_id)
+        if lane.base_sha is not None:
+            return
+        if before_dispatch:
+            # Worktree creation already resolved the requested ref. HEAD is that
+            # exact result and cannot move with the shared branch ref.
+            base_sha = await self._git.resolve_ref(worktree_id, "HEAD")
+        else:
+            base_sha = stage.start_head_sha or await self._git.resolve_ref(
+                worktree_id, lane.base_ref
+            )
+        self._store.record_worker_checkout(run_id, stage.stage_id, worktree_id, base_sha)
 
     def _placement(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> WorkerPlacement:
         """Resolve the exact existing or isolated checkout for one role."""

@@ -67,6 +67,12 @@ def test_store_records_dynamic_worker_and_idempotent_stage_updates(tmp_path: Pat
     store.mark_accepted(run_id, "orca-run-1")
     store.bind_stage_task(run_id, worker.stage_id, "task-1")
     store.bind_stage_task(run_id, worker.stage_id, "task-1")
+    store.record_worker_checkout(
+        run_id,
+        worker.stage_id,
+        "repo::/tmp/issue-123",
+        "a" * 40,
+    )
     store.mark_stage_started(
         run_id,
         worker.stage_id,
@@ -82,6 +88,8 @@ def test_store_records_dynamic_worker_and_idempotent_stage_updates(tmp_path: Pat
     updated_worker = store.stages(run_id)[0]
     assert updated_lane.phase is LanePhase.ACTIVE
     assert updated_lane.worktree_id == "repo::/tmp/issue-123"
+    assert updated_lane.base_ref == "main"
+    assert updated_lane.base_sha == "a" * 40
     assert updated_worker.phase is StagePhase.COMPLETED
     assert updated_worker.released is True
 

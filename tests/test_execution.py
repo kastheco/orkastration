@@ -227,6 +227,7 @@ class FakeOrca:
         self.fail_after_worker_start = False
         self.refuse_starts: set[str] = set()
         self.timeout_starts: set[str] = set()
+        self.created_worktrees: list[dict[str, object]] = []
 
     async def create_run(self, objective: str) -> tuple[str, JsonObject]:
         assert objective.startswith("Do work\n\norkastrator run: ")
@@ -270,6 +271,11 @@ class FakeOrca:
         assert orca_run_id.startswith("orca-run-")
         self._refresh_ready()
         return list(self.tasks_by_id.values())
+
+    async def create_worktree(self, **kwargs: object) -> tuple[str, JsonObject]:
+        worktree_id = "repo::/tmp/issue"
+        self.created_worktrees.append({**kwargs, "worktree_id": worktree_id})
+        return worktree_id, {"ok": True, "worktreeId": worktree_id}
 
     async def start_worker(self, **kwargs: object) -> tuple[str, str, str | None, JsonObject]:
         task_id = str(kwargs["task_id"])
@@ -377,6 +383,8 @@ class FakeOrca:
 class FakeGit(LocalGit):
     def __init__(self) -> None:
         self.heads: dict[str, str] = {"repo::/tmp/issue": "b" * 40}
+        self.resolved_refs = {"HEAD": "a" * 40, "main": "a" * 40}
+        self.resolve_calls: list[tuple[str, str]] = []
         self.integrated: dict[str, str] = {}
         self.changed_override: list[str] | None = None
         self.head_override: str | None = None
@@ -453,7 +461,8 @@ class FakeGit(LocalGit):
         return f"diff --git a/{path} b/{path}\n+frozen {path}\n".encode()
 
     async def resolve_ref(self, worktree_id: str, ref: str) -> str:
-        return "a" * 40
+        self.resolve_calls.append((worktree_id, ref))
+        return self.resolved_refs.get(ref, "a" * 40)
 
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
         if self.diff_sha256_override is not None and worktree_id == "repo::/tmp/issue":
@@ -621,6 +630,36 @@ async def test_accept_materializes_only_worker_and_starts_first_wave(tmp_path: P
     assert [stage.role for stage in result.stages] == [StageKind.WORKER]
     assert [launch.role for launch in result.started] == [StageKind.WORKER]
     assert len(orca.tasks_by_id) == 1
+
+
+async def test_worker_validation_uses_the_base_frozen_when_its_lane_started(
+    tmp_path: Path,
+) -> None:
+    git = FakeGit()
+
+    class MovingRefOrca(FakeOrca):
+        async def create_worktree(self, **kwargs: object) -> tuple[str, JsonObject]:
+            created = await super().create_worktree(**kwargs)
+            git.resolved_refs["main"] = "d" * 40
+            return created
+
+    orca = MovingRefOrca()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_result())
+    result = await value.monitor(run_id)
+
+    lane = store.lanes(run_id)[0]
+    assert lane.base_ref == "main"
+    assert lane.base_sha == "a" * 40
+    assert git.resolve_calls == [("repo::/tmp/issue", "HEAD")]
+    assert result.status == "active"
+    assert [stage.role for stage in result.stages] == [
+        StageKind.WORKER,
+        StageKind.INITIAL_REVIEWER,
+    ]
 
 
 async def test_no_findings_completes_after_initial_review(tmp_path: Path) -> None:
@@ -1919,7 +1958,8 @@ async def test_accepting_a_fix_rechecks_it_instead_of_replaying_the_stored_verdi
 
 async def test_a_stage_whose_worker_died_is_dispatched_again(tmp_path: Path) -> None:
     orca = FakeOrca()
-    value, store = controller(tmp_path, orca)
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     first = [stage for stage in store.stages(run_id) if stage.orca_dispatch_id is not None]
@@ -1935,6 +1975,7 @@ async def test_a_stage_whose_worker_died_is_dispatched_again(tmp_path: Path) -> 
     assert [launch.role for launch in result.started] == [StageKind.WORKER]
     restarted = [stage for stage in store.stages(run_id) if stage.orca_dispatch_id is not None]
     assert restarted
+    assert git.resolve_calls == [("repo::/tmp/issue", "HEAD")]
 
 
 async def test_a_stage_that_committed_before_dying_is_not_dispatched_again(
