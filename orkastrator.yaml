@@ -1,5 +1,5 @@
 version: 2
-max_parallel_lanes: 3
+max_parallel_lanes: 6
 max_parallel_workers: 6
 
 review_cycle:
@@ -78,7 +78,7 @@ publication:
     create_or_update: true
     initial_state: draft
     mark_ready_after_final_gate: true
-  merge: false
+  merge: true
   deploy: false
 
 final_gate:
