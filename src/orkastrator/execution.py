@@ -1673,6 +1673,10 @@ class ExecutionController:
             # the adjudicator the code as it stood *before* the fix. Every verdict
             # it gave was about the wrong tree; approve_unchanged in particular
             # was unanimous because the fix was genuinely absent from what it read.
+            # A rejected fixer is excluded on purpose. Its checkout holds no
+            # commit worth adjudicating, and pointing the escalation at one is
+            # how a finding whose fixer never committed became permanently
+            # unstartable once that checkout was reclaimed.
             fixed = [
                 item
                 for item in self._store.stages(run_id)
@@ -1680,6 +1684,7 @@ class ExecutionController:
                 and item.finding_id == stage.finding_id
                 and item.role is StageKind.FIXER
                 and item.processed
+                and item.phase is not StagePhase.FAILED
                 and item.worktree_id is not None
             ]
             if fixed:
