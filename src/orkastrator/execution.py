@@ -1642,7 +1642,12 @@ class ExecutionController:
         """Resolve the exact existing or isolated checkout for one role."""
 
         if stage.role is StageKind.WORKER:
-            return WorkerPlacement(worktree_id=None, base_ref=lane.base_ref)
+            # A worker stage that already recorded a checkout is being started a
+            # second time, and that checkout holds whatever it committed before
+            # it stopped. Handing it a fresh one from the base ref abandons that
+            # commit, so a lane that blocked on a decision would pay for the
+            # whole implementation again to answer it.
+            return WorkerPlacement(worktree_id=stage.worktree_id, base_ref=lane.base_ref)
         if stage.role is StageKind.FIXER:
             if lane.worktree_id is None:
                 raise ValueError("fixer lane has no integration checkout")

@@ -3817,3 +3817,31 @@ async def test_an_unchanged_run_records_the_policy_it_was_accepted_under(tmp_pat
     assert [
         item for item in store.events(run_id) if item["kind"] == "supervisor_reauthorized_policy"
     ] == []
+
+
+async def test_restarted_worker_returns_to_its_own_checkout(tmp_path: Path) -> None:
+    """A second worker start reuses the checkout holding the first one's commit."""
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    worker = next(stage for stage in store.stages(run_id) if stage.role is StageKind.WORKER)
+    assert worker.worktree_id is not None
+    first_worktree = worker.worktree_id
+
+    # A worker that reports a decision it cannot make lands here: the stage is
+    # rejected, but its commit is real and lives in that checkout.
+    store.sync_stage(run_id, worker.stage_id, StagePhase.READY, None)
+    store.reset_stage_reservation(
+        run_id,
+        next(item for item in store.stages(run_id) if item.stage_id == worker.stage_id),
+    )
+    orca.tasks_by_id[str(worker.orca_task_id)]["status"] = "ready"
+
+    await value.monitor(run_id)
+
+    restarts = [start for start in orca.starts if start["task_id"] == worker.orca_task_id]
+    assert len(restarts) == 2
+    assert restarts[-1]["worktree_id"] == first_worktree
