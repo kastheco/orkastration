@@ -1642,7 +1642,12 @@ class ExecutionController:
         """Resolve the exact existing or isolated checkout for one role."""
 
         if stage.role is StageKind.WORKER:
-            return WorkerPlacement(worktree_id=None, base_ref=lane.base_ref)
+            # A worker stage that already recorded a checkout is being started a
+            # second time, and that checkout holds whatever it committed before
+            # it stopped. Handing it a fresh one from the base ref abandons that
+            # commit, so a lane that blocked on a decision would pay for the
+            # whole implementation again to answer it.
+            return WorkerPlacement(worktree_id=stage.worktree_id, base_ref=lane.base_ref)
         if stage.role is StageKind.FIXER:
             if lane.worktree_id is None:
                 raise ValueError("fixer lane has no integration checkout")
@@ -1673,6 +1678,10 @@ class ExecutionController:
             # the adjudicator the code as it stood *before* the fix. Every verdict
             # it gave was about the wrong tree; approve_unchanged in particular
             # was unanimous because the fix was genuinely absent from what it read.
+            # A rejected fixer is excluded on purpose. Its checkout holds no
+            # commit worth adjudicating, and pointing the escalation at one is
+            # how a finding whose fixer never committed became permanently
+            # unstartable once that checkout was reclaimed.
             fixed = [
                 item
                 for item in self._store.stages(run_id)
@@ -1680,6 +1689,7 @@ class ExecutionController:
                 and item.finding_id == stage.finding_id
                 and item.role is StageKind.FIXER
                 and item.processed
+                and item.phase is not StagePhase.FAILED
                 and item.worktree_id is not None
             ]
             if fixed:
@@ -1698,8 +1708,13 @@ class ExecutionController:
         for lane in self._store.lanes(run_id):
             lane_stages = [stage for stage in stages if stage.lane_id == lane.lane_id]
             lane_findings = by_lane_findings.get(lane.lane_id, [])
+            # Only a failure nothing has answered condemns the lane. A rejected
+            # stage is marked processed by the rejection that routed it onward,
+            # and its finding then runs another round; counting that stage
+            # forever left a lane permanently failed while its own findings were
+            # resolving, which is a status no later event could clear.
             if lane.phase is LanePhase.FAILED or any(
-                stage.phase is StagePhase.FAILED for stage in lane_stages
+                stage.phase is StagePhase.FAILED and not stage.processed for stage in lane_stages
             ):
                 phase = LanePhase.FAILED
             elif lane.phase is LanePhase.BLOCKED or any(

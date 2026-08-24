@@ -1,6 +1,7 @@
 """Orca JSON adapter contract tests."""
 
 import asyncio
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from orkastrator.orca import (
     JsonObject,
     OrcaClient,
     OrcaError,
+    OrcaOutcomeUnknown,
     SubprocessRunner,
 )
 
@@ -385,6 +387,10 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
         "terminal-1",
         "--worktree",
         "id:repo::/tmp/issue-123",
+        # A frozen finding's spec is a large paste, and the default settle wait
+        # expires on it while the agent is already reading.
+        "--timeout-ms",
+        "180000",
         "--json",
     )
 
@@ -880,3 +886,102 @@ async def test_worker_start_names_its_run_so_a_drifted_binding_cannot_misroute_i
 
     assert supervised.calls[0][:2] == ("orchestration", "worker-start")
     assert supervised.calls[0][supervised.calls[0].index("--run") + 1] == "run_8a5347dc0ec9"
+
+
+class StallingRunner:
+    """Answer the fast-start sequence, but fail `worker-start` the way Orca does."""
+
+    def __init__(self, *, dispatch_id: str | None) -> None:
+        self.dispatch_id = dispatch_id
+        self.calls: list[tuple[str, ...]] = []
+
+    async def run(self, arguments: Sequence[str]) -> JsonObject:
+        self.calls.append(tuple(arguments))
+        head = arguments[0:2]
+        if head == ("worktree", "create"):
+            return {"ok": True, "result": {"worktreeId": "repo::/tmp/issue-123"}}
+        if head == ("terminal", "create"):
+            return {"ok": True, "result": {"terminalHandle": "terminal-1"}}
+        if head == ("terminal", "wait"):
+            return {"ok": True, "result": {"wait": {"satisfied": True}}}
+        if head == ("orchestration", "worker-start"):
+            result: JsonObject = {
+                "state": "failed",
+                "failedStage": "dispatch_input",
+                "lastError": "agent_prompt_stalled",
+            }
+            if self.dispatch_id is not None:
+                result["dispatchId"] = self.dispatch_id
+            raise OrcaOutcomeUnknown("stalled", {"ok": True, "result": result})
+        return {"ok": True, "result": {}}
+
+
+async def test_subprocess_runner_surfaces_unresolved_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero exit that still answers `ok` is an outcome, not a refusal."""
+
+    payload = {
+        "ok": True,
+        "result": {
+            "dispatchId": "dispatch-9",
+            "state": "failed",
+            "failedStage": "dispatch_input",
+            "lastError": "agent_prompt_stalled",
+        },
+    }
+    process = FakeProcess(stdout=json.dumps(payload).encode(), returncode=1)
+
+    async def create(*arguments: str, **kwargs: Any) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    with pytest.raises(OrcaOutcomeUnknown) as caught:
+        await SubprocessRunner(("orca-ide",), Path("/tmp"), 1).run(("status", "--json"))
+
+    # The old path read `error`, found none, and raised with an empty detail.
+    assert "agent_prompt_stalled" in str(caught.value)
+    assert "dispatch_input" in str(caught.value)
+    assert caught.value.payload == payload
+
+
+async def test_fast_worker_adopts_a_stalled_start() -> None:
+    """A stalled prompt keeps its Dispatch and its checkout."""
+
+    runner = StallingRunner(dispatch_id="dispatch-7")
+    client = OrcaClient(runner)
+
+    dispatch_id, worktree_id, terminal_handle, _ = await client.start_worker(
+        task_id="task-1",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id=None,
+        orca_run_id="run-1",
+        profile=profile(fast=True),
+    )
+
+    assert (dispatch_id, worktree_id, terminal_handle) == (
+        "dispatch-7",
+        "repo::/tmp/issue-123",
+        "terminal-1",
+    )
+    assert not [call for call in runner.calls if call[0:2] == ("worktree", "rm")]
+
+
+async def test_fast_worker_discards_a_stall_that_names_no_dispatch() -> None:
+    """Without a Dispatch there is nothing to adopt, so the checkout goes back."""
+
+    runner = StallingRunner(dispatch_id=None)
+    client = OrcaClient(runner)
+
+    with pytest.raises(OrcaOutcomeUnknown):
+        await client.start_worker(
+            task_id="task-1",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id=None,
+            orca_run_id="run-1",
+            profile=profile(fast=True),
+        )
+
+    assert runner.calls[-1][0:2] == ("worktree", "rm")

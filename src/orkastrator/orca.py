@@ -23,6 +23,14 @@ JsonObject = dict[str, object]
 # fit in the task spec.
 MAX_TASK_SPEC_BYTES = 120_000
 
+# `worker-start` waits for the agent TUI to settle around the pasted task spec
+# before it calls the Dispatch ready. A frozen finding carries its evidence and
+# its schema, so that paste is routinely tens of kilobytes and the default wait
+# expires while the agent is already reading it. Orca then records the Task as
+# failed, which no amount of recovery on this side can talk back out of. Wait
+# long enough that only a real stall reaches that state.
+WORKER_START_TIMEOUT_MS = 180_000
+
 
 class OrcaError(RuntimeError):
     """Raised when an Orca CLI request fails or violates its JSON contract."""
@@ -38,6 +46,25 @@ class OrcaTimeout(OrcaError):
     back races the recovery that would have adopted it. Callers that can tell
     the difference should; this is what lets them.
     """
+
+
+class OrcaOutcomeUnknown(OrcaError):
+    """Raised when Orca exits non-zero but still answers with a typed envelope.
+
+    `worker-start` exits 1 for both `failed` and `outcome_unknown`, and its own
+    documentation says the JSON still carries the stage, the effects, and the
+    Dispatch it created. A stall reported at `dispatch_input` is the clearest
+    case: Orca stopped waiting for the TUI to settle, but the agent is already
+    holding the prompt and running. Treating that envelope as a refused command
+    threw away a live worker and, worse, the checkout its commit lived in.
+
+    The payload is carried so a caller that can adopt the Dispatch does, instead
+    of guessing from an error string.
+    """
+
+    def __init__(self, message: str, payload: JsonObject) -> None:
+        super().__init__(message)
+        self.payload = payload
 
 
 class CommandRunner(Protocol):
@@ -77,8 +104,19 @@ class SubprocessRunner:
         if process.returncode != 0:
             # Orca reports command failures as a JSON envelope on stdout and leaves
             # stderr empty, so stdout is the only place the typed error code lives.
+            envelope = _envelope(stdout)
             detail = _failure_detail(stdout) or stderr.decode(errors="replace").strip()
             message = f"Orca command failed with rc={process.returncode}: {detail[:2_000]}"
+            # A non-zero exit that still reports `ok` is Orca describing an
+            # outcome, not refusing the command. Hand the envelope back so the
+            # caller can read what actually happened; the empty detail this used
+            # to produce is what made a stalled prompt look like a dead lane.
+            if envelope is not None and envelope.get("ok") is True:
+                raise OrcaOutcomeUnknown(
+                    f"Orca command reported an unresolved outcome with"
+                    f" rc={process.returncode}: {_outcome_detail(envelope)[:2_000]}",
+                    envelope,
+                )
             # Orca times out internally too, and reports it as its own typed code
             # rather than by making this call hang. Same undefined outcome.
             if detail.startswith("timeout"):
@@ -398,19 +436,32 @@ class OrcaClient:
             # checkout. orkastrator drives Orca from a floating coordinator terminal that
             # has none, so the placement has to be named explicitly even when --terminal
             # already identifies the agent pane.
-            response = await self._ok(
-                "orchestration",
-                "worker-start",
-                "--task",
-                task_id,
-                "--run",
-                orca_run_id,
-                "--terminal",
-                terminal_handle,
-                "--worktree",
-                f"id:{resolved_worktree}",
-                "--json",
-            )
+            try:
+                response = await self._ok(
+                    "orchestration",
+                    "worker-start",
+                    "--task",
+                    task_id,
+                    "--run",
+                    orca_run_id,
+                    "--terminal",
+                    terminal_handle,
+                    "--worktree",
+                    f"id:{resolved_worktree}",
+                    "--timeout-ms",
+                    str(WORKER_START_TIMEOUT_MS),
+                    "--json",
+                )
+            except OrcaOutcomeUnknown as exc:
+                # Orca gave up waiting for the TUI to settle around a large
+                # prompt and called the start failed. The Dispatch it names is
+                # still real and the agent is still holding the prompt, so adopt
+                # it and let reconcile decide from the Task, which is the only
+                # place a genuine stall stays visible. Discarding here is what
+                # turned one slow paste into a dead lane and a deleted checkout.
+                response = exc.payload
+                if _optional_recursive_string(response, "dispatchId") is None:
+                    raise
             dispatch_id = _required_recursive_string(response, "dispatchId")
         except BaseException:
             if created_worktree is not None:
@@ -632,16 +683,37 @@ def _error_detail(error: object) -> str:
     return ""
 
 
-def _failure_detail(stdout: bytes) -> str:
-    """Read the typed error out of an Orca failure envelope printed on stdout."""
+def _envelope(stdout: bytes) -> JsonObject | None:
+    """Parse an Orca response envelope, or None when stdout was not one."""
 
     try:
         value = json.loads(stdout)
     except json.JSONDecodeError:
-        return ""
-    if not isinstance(value, dict):
+        return None
+    return cast(JsonObject, value) if isinstance(value, dict) else None
+
+
+def _failure_detail(stdout: bytes) -> str:
+    """Read the typed error out of an Orca failure envelope printed on stdout."""
+
+    value = _envelope(stdout)
+    if value is None:
         return ""
     return _error_detail(value.get("error")).removeprefix(": ")
+
+
+def _outcome_detail(envelope: JsonObject) -> str:
+    """Describe a non-zero exit that still answered with a typed result."""
+
+    result = envelope.get("result")
+    if not isinstance(result, dict):
+        return "no result"
+    parts = [
+        f"{key}={result[key]}"
+        for key in ("state", "failedStage", "lastError")
+        if isinstance(result.get(key), str)
+    ]
+    return " ".join(parts) or "no outcome fields"
 
 
 def _object(value: object, field: str) -> JsonObject:
@@ -678,6 +750,15 @@ def _required_recursive_string(value: object, *keys: str) -> str:
                 continue
     joined = "/".join(keys)
     raise OrcaError(f"Orca response omitted {joined}")
+
+
+def _optional_recursive_string(value: object, *keys: str) -> str | None:
+    """Same search as `_required_recursive_string`, but absence is an answer."""
+
+    try:
+        return _required_recursive_string(value, *keys)
+    except OrcaError:
+        return None
 
 
 def _worktree_id(response: JsonObject) -> str:
