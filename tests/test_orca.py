@@ -387,6 +387,10 @@ async def test_fast_codex_worker_uses_custom_argv_before_supervised_dispatch() -
         "terminal-1",
         "--worktree",
         "id:repo::/tmp/issue-123",
+        # A frozen finding's spec is a large paste, and the default settle wait
+        # expires on it while the agent is already reading.
+        "--timeout-ms",
+        "180000",
         "--json",
     )
 

@@ -23,6 +23,14 @@ JsonObject = dict[str, object]
 # fit in the task spec.
 MAX_TASK_SPEC_BYTES = 120_000
 
+# `worker-start` waits for the agent TUI to settle around the pasted task spec
+# before it calls the Dispatch ready. A frozen finding carries its evidence and
+# its schema, so that paste is routinely tens of kilobytes and the default wait
+# expires while the agent is already reading it. Orca then records the Task as
+# failed, which no amount of recovery on this side can talk back out of. Wait
+# long enough that only a real stall reaches that state.
+WORKER_START_TIMEOUT_MS = 180_000
+
 
 class OrcaError(RuntimeError):
     """Raised when an Orca CLI request fails or violates its JSON contract."""
@@ -440,6 +448,8 @@ class OrcaClient:
                     terminal_handle,
                     "--worktree",
                     f"id:{resolved_worktree}",
+                    "--timeout-ms",
+                    str(WORKER_START_TIMEOUT_MS),
                     "--json",
                 )
             except OrcaOutcomeUnknown as exc:
