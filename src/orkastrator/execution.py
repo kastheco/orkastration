@@ -1708,8 +1708,13 @@ class ExecutionController:
         for lane in self._store.lanes(run_id):
             lane_stages = [stage for stage in stages if stage.lane_id == lane.lane_id]
             lane_findings = by_lane_findings.get(lane.lane_id, [])
+            # Only a failure nothing has answered condemns the lane. A rejected
+            # stage is marked processed by the rejection that routed it onward,
+            # and its finding then runs another round; counting that stage
+            # forever left a lane permanently failed while its own findings were
+            # resolving, which is a status no later event could clear.
             if lane.phase is LanePhase.FAILED or any(
-                stage.phase is StagePhase.FAILED for stage in lane_stages
+                stage.phase is StagePhase.FAILED and not stage.processed for stage in lane_stages
             ):
                 phase = LanePhase.FAILED
             elif lane.phase is LanePhase.BLOCKED or any(
