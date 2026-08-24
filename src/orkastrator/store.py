@@ -1063,6 +1063,15 @@ class StateStore:
                 {"finding_ids": [finding.id for finding in report.findings]},
             )
 
+    def initial_review(self, lane_id: str) -> InitialReviewReport | None:
+        """Return the lane's frozen initial review for crash-safe replay."""
+
+        with self._session() as session:
+            row = session.exec(
+                select(InitialReviewRow).where(InitialReviewRow.lane_id == lane_id)
+            ).first()
+            return None if row is None else InitialReviewReport.model_validate_json(row.report_json)
+
     def record_worker_result(self, run_id: str, lane_id: str, result: WorkerResult) -> None:
         payload = result.model_dump_json()
         with self._session() as session:
@@ -1459,6 +1468,15 @@ class StateStore:
                         "status": attempt.status,
                     },
                 )
+
+    def fix_attempt_for_stage(self, stage_id: str) -> FixAttempt | None:
+        """Return the supervisor-frozen attempt for one fixer stage, if any."""
+
+        with self._session() as session:
+            row = session.exec(
+                select(FixAttemptRow).where(FixAttemptRow.stage_id == stage_id)
+            ).first()
+            return None if row is None else FixAttempt.model_validate_json(row.payload_json)
 
     def record_re_review(
         self, run_id: str, finding: FindingRecord, stage: StageRecord, result: ReReviewResult

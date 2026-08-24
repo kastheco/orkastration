@@ -157,7 +157,13 @@ def fix_attempt(
             "validation_results": (
                 validation
                 if validation is not None
-                else [{"command": "pytest", "status": "passed", "output": "passed"}]
+                else [
+                    {
+                        "command": "uv run --extra dev pytest",
+                        "status": "passed",
+                        "output": "passed",
+                    }
+                ]
             ),
             "scope_expansion_required": (
                 {"paths": ["src/shared.py"], "reason": "Required."}
@@ -410,6 +416,7 @@ class FakeGit(LocalGit):
         self.rendered_diff_override: bytes | None = None
         self.render_diff_calls: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.lane_validation_fails = False
+        self.fixer_validation_fails = False
 
     async def head(self, worktree_id: str) -> str:
         if worktree_id == "repo::/tmp/issue" and self.lane_head_override is not None:
@@ -530,11 +537,13 @@ class FakeGit(LocalGit):
         self.validation_calls.append([item.command for item in requirements])
         status = (
             "failed"
-            if self.lane_validation_fails and worktree_id == "repo::/tmp/issue"
+            if (self.lane_validation_fails and worktree_id == "repo::/tmp/issue")
+            or (self.fixer_validation_fails and "finding-" in worktree_id)
             else "passed"
         )
         return [
-            ValidationResult(command="pytest", status=status, output=status) for _ in requirements
+            ValidationResult(command=item.command, status=status, output=status)
+            for item in requirements
         ]
 
 
@@ -1285,6 +1294,51 @@ async def test_partial_re_review_discovery_replays_idempotently(tmp_path: Path) 
     assert phases["finding-3"] is FindingPhase.DEFERRED
 
 
+async def test_re_review_validation_that_dirties_the_fixer_checkout_is_rejected(
+    tmp_path: Path,
+) -> None:
+    class DirtyDiscoveryGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self.validation_dirtied_checkout = False
+
+        async def validate(
+            self, worktree_id: str, requirements: list[ValidationRequirement]
+        ) -> list[ValidationResult]:
+            results = await super().validate(worktree_id, requirements)
+            if len(self.validation_calls) >= 3:
+                self.validation_dirtied_checkout = True
+            return results
+
+        async def is_clean(self, worktree_id: str) -> bool:
+            return not self.validation_dirtied_checkout
+
+    orca = FakeOrca()
+    git = DirtyDiscoveryGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(
+        re_review(
+            "regression_introduced_by_fix",
+            new_findings=[
+                {"origin": "introduced_by_fix", "finding": review_finding_data(2)}
+            ],
+        )
+    )
+
+    result = await value.monitor(run_id)
+
+    assert len(store.findings(run_id)) == 1
+    rejected = [event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"]
+    assert any("validation dirtied" in str(event["payload"]) for event in rejected)
+    assert result.findings[0].phase is FindingPhase.ESCALATING
+    assert result.findings[0].escalation_reason is FindingReason.AMBIGUOUS_RESULT
+
+
 @pytest.mark.parametrize(
     "discovered",
     [
@@ -1401,7 +1455,9 @@ async def test_adjudicator_may_omit_the_revision_of_a_revised_contract(
     tmp_path: Path,
 ) -> None:
     orca = FakeOrca()
-    value, store = controller(tmp_path, orca)
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
@@ -1429,7 +1485,9 @@ async def test_accepting_a_verified_fix_settles_the_finding_instead_of_refixing(
     tmp_path: Path,
 ) -> None:
     orca = FakeOrca()
-    value, store = controller(tmp_path, orca)
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
@@ -1465,7 +1523,9 @@ async def test_approving_a_finding_unchanged_starts_the_next_fix_round(
     tmp_path: Path,
 ) -> None:
     orca = FakeOrca()
-    value, store = controller(tmp_path, orca)
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
@@ -1560,7 +1620,13 @@ async def test_an_in_flight_fixer_does_not_hold_up_an_unrelated_re_review(tmp_pa
         str(first_fixer["task_id"]),
         fix_attempt(
             "finding-1",
-            validation=[{"command": "pytest", "status": "passed", "output": "passed"}],
+            validation=[
+                {
+                    "command": "uv run --extra dev pytest",
+                    "status": "passed",
+                    "output": "passed",
+                }
+            ],
         ),
     )
 
@@ -1590,7 +1656,11 @@ async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: P
     fixer_starts = [item for item in orca.starts if "fixer" in str(item["lane_name"])]
     for start in fixer_starts:
         finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
-        command = "pytest" if finding_id == "finding-1" else "pytest tests/test_two.py"
+        command = (
+            "uv run --extra dev pytest"
+            if finding_id == "finding-1"
+            else "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_two.py"
+        )
         orca.complete_task(
             str(start["task_id"]),
             fix_attempt(
@@ -1620,7 +1690,10 @@ async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: P
     assert [item.status for item in receipts] == ["integrated", "integrated"]
     assert len({item.integrated_sha for item in receipts}) == 2
     assert store.lanes(run_id)[0].integration_head_sha == receipts[-1].integrated_sha
-    assert git.validation_calls[-1] == ["pytest", "pytest tests/test_two.py"]
+    assert git.validation_calls[-1] == [
+        "uv run --extra dev pytest",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_two.py",
+    ]
 
 
 async def test_introduced_regression_integrates_the_approved_composite_chain(
@@ -1655,7 +1728,12 @@ async def test_introduced_regression_integrates_the_approved_composite_chain(
             "finding-2",
             base_sha=original_commit,
             validation=[
-                {"command": "pytest tests/regression.py", "status": "passed", "output": "passed"}
+                {
+                    "command": "uv run --extra dev pytest --no-cov -p no:cacheprovider "
+                    "tests/regression.py",
+                    "status": "passed",
+                    "output": "passed",
+                }
             ],
         )
     )
@@ -1668,7 +1746,10 @@ async def test_introduced_regression_integrates_the_approved_composite_chain(
     receipt = store.integrations(run_id)[0]
     assert receipt.source_commits == [original_commit, corrected_commit]
     assert receipt.source_finding_ids == ["finding-1", "finding-2"]
-    assert git.validation_calls[-1] == ["pytest", "pytest tests/regression.py"]
+    assert git.validation_calls[-1] == [
+        "uv run --extra dev pytest",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/regression.py",
+    ]
 
 
 async def test_integrated_receipt_replay_settles_every_composite_finding(
@@ -1807,7 +1888,9 @@ async def test_an_adjudicator_that_never_settles_a_finding_is_bounded(
     tmp_path: Path,
 ) -> None:
     orca = FakeOrca()
-    value, store = controller(tmp_path, orca)
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
@@ -3178,9 +3261,11 @@ async def test_adjudicated_worker_decision_resumes_as_a_bounded_fixer(tmp_path: 
     assert result.findings[0].round == 2
 
 
-async def test_fixer_missing_a_required_validation_escalates(tmp_path: Path) -> None:
+async def test_supervisor_observed_required_validation_failure_escalates(tmp_path: Path) -> None:
     orca = FakeOrca()
-    value, _ = controller(tmp_path, orca)
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, _ = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
@@ -3192,15 +3277,25 @@ async def test_fixer_missing_a_required_validation_escalates(tmp_path: Path) -> 
     assert [launch.role for launch in result.started] == [StageKind.ESCALATION]
 
 
-async def test_fixer_reporting_a_failed_required_validation_escalates(tmp_path: Path) -> None:
+async def test_fixer_report_cannot_override_a_supervisor_observed_failure(tmp_path: Path) -> None:
     orca = FakeOrca()
-    value, _ = controller(tmp_path, orca)
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, _ = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
 
     orca.complete_dispatched(
-        fix_attempt(validation=[{"command": "pytest", "status": "failed", "output": "1 failed"}])
+        fix_attempt(
+            validation=[
+                {
+                    "command": "uv run --extra dev pytest",
+                    "status": "passed",
+                    "output": "fixer claimed pass",
+                }
+            ]
+        )
     )
     result = await value.monitor(run_id)
 
@@ -3217,7 +3312,11 @@ async def test_fixer_may_add_its_own_proof_beyond_the_contract(tmp_path: Path) -
     orca.complete_dispatched(
         fix_attempt(
             validation=[
-                {"command": "pytest", "status": "passed", "output": "passed"},
+                {
+                    "command": "uv run --extra dev pytest",
+                    "status": "passed",
+                    "output": "passed",
+                },
                 {"command": "pytest tests/test_one.py", "status": "passed", "output": "passed"},
             ]
         )
@@ -3228,9 +3327,34 @@ async def test_fixer_may_add_its_own_proof_beyond_the_contract(tmp_path: Path) -
     assert [launch.role for launch in result.started] == [StageKind.RE_REVIEWER]
 
 
-async def test_an_adjudicated_retry_at_the_ceiling_is_granted_once(tmp_path: Path) -> None:
+async def test_supervisor_evidence_caps_optional_fixer_proof_at_contract_limit(
+    tmp_path: Path,
+) -> None:
     orca = FakeOrca()
     value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    extra = [
+        {"command": f"proof-{index}", "status": "passed", "output": "passed"}
+        for index in range(64)
+    ]
+    orca.complete_dispatched(fix_attempt(validation=extra))
+
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.RE_REVIEWING
+    attempt = store.latest_fix_attempt(result.findings[0].finding_key)
+    assert attempt is not None
+    assert len(attempt.validation_results) == 64
+    assert attempt.validation_results[0].command == "uv run --extra dev pytest"
+
+
+async def test_an_adjudicated_retry_at_the_ceiling_is_granted_once(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.fixer_validation_fails = True
+    value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
@@ -3280,6 +3404,305 @@ async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
     assert not result.findings
     rejected = [event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"]
     assert any("without a shell" in str(event["payload"]) for event in rejected)
+
+
+async def test_supervisor_freezes_scoped_pytest_intent_as_a_runnable_command(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    finding = review_finding_data()
+    finding["validation"] = [
+        {"command": "uv run pytest -q tests/test_execution.py", "expected": "passes"},
+        {
+            "command": "uv run pytest -q tests/test_execution.py::test_one",
+            "expected": "passes",
+        },
+        {"command": "pytest tests/test_git.py -q", "expected": "passes"},
+        {
+            "command": "uv run --extra dev pytest --no-cov -p no:cacheprovider "
+            "tests/test_models.py -q",
+            "expected": "passes",
+        },
+        {
+            "command": "uv run pytest --no-cov tests/unit",
+            "expected": "passes",
+        },
+        {"command": "pytest --maxfail 1", "expected": "passes"},
+        {"command": "pytest --color yes", "expected": "passes"},
+        {"command": "pytest --cov-fail-under 90", "expected": "passes"},
+        {"command": "python -m pytest -q tests/test_cli.py", "expected": "passes"},
+        {"command": "python3 -m pytest tests/test_store.py -q", "expected": "passes"},
+        {"command": "pytest --collect-only", "expected": "passes"},
+        {"command": "pytest --ignore tests/integration", "expected": "passes"},
+        {"command": "pytest --ignore=tests/integration", "expected": "passes"},
+        {"command": "pytest -p no:warnings", "expected": "passes"},
+        {"command": "pytest -W error", "expected": "passes"},
+        {"command": "pytest --pastebin failed", "expected": "passes"},
+        {"command": "pytest --deselect=tests/test_cli.py", "expected": "passes"},
+        {"command": "pytest --setup-only", "expected": "passes"},
+    ]
+
+    await advance_to_fixer(value, orca, run_id, finding)
+
+    requirements = store.findings(run_id)[0].effective_contract.validation
+    assert [item.command for item in requirements] == [
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider -q tests/test_execution.py",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider -q "
+        "tests/test_execution.py::test_one",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_git.py -q",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_models.py -q",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/unit",
+        "uv run --extra dev pytest --maxfail 1",
+        "uv run --extra dev pytest --color yes",
+        "uv run --extra dev pytest --cov-fail-under 90",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider -q tests/test_cli.py",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_store.py -q",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider --collect-only",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider --ignore tests/integration",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider --ignore=tests/integration",
+        "uv run --extra dev pytest -p no:warnings",
+        "uv run --extra dev pytest -W error",
+        "uv run --extra dev pytest --pastebin failed",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider "
+        "--deselect=tests/test_cli.py",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider --setup-only",
+    ]
+    assert all(item.baseline_result is not None for item in requirements)
+
+
+async def test_initial_review_replay_reuses_the_frozen_validation_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json(review_finding_data()))
+
+    record_receipt = store.record_lifecycle_receipt
+    crashed = False
+
+    def crash_after_contract(*args: object, **kwargs: object) -> None:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after contract persistence")
+        record_receipt(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "record_lifecycle_receipt", crash_after_contract)
+    with pytest.raises(RuntimeError, match="crash after contract persistence"):
+        await value.monitor(run_id)
+    assert len(git.validation_calls) == 1
+
+    await value.monitor(run_id)
+
+    assert len(git.validation_calls) == 1
+
+
+async def test_fixer_replay_reuses_the_supervisor_observed_head_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+
+    record_receipt = store.record_lifecycle_receipt
+    crashed = False
+
+    def crash_after_contract(*args: object, **kwargs: object) -> None:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after fixer persistence")
+        record_receipt(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "record_lifecycle_receipt", crash_after_contract)
+    with pytest.raises(RuntimeError, match="crash after fixer persistence"):
+        await value.monitor(run_id)
+    assert len(git.validation_calls) == 2
+
+    await value.monitor(run_id)
+
+    assert len(git.validation_calls) == 2
+
+
+async def test_validation_failure_identical_at_base_and_fix_head_does_not_spend_round(
+    tmp_path: Path,
+) -> None:
+    class IdenticallyFailingGit(FakeGit):
+        async def validate(
+            self, worktree_id: str, requirements: list[ValidationRequirement]
+        ) -> list[ValidationResult]:
+            self.validation_calls.append([item.command for item in requirements])
+            duration = "0.41s" if len(self.validation_calls) == 1 else "0.73s"
+            return [
+                    ValidationResult(
+                        command=item.command,
+                        status="failed",
+                        output=f"1 failed, 19 passed in {duration}\ncoverage threshold not met",
+                )
+                for item in requirements
+            ]
+
+    orca = FakeOrca()
+    git = IdenticallyFailingGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    finding = review_finding_data()
+    finding["validation"] = [
+        {"command": "uv run pytest -q tests/test_execution.py", "expected": "passes"}
+    ]
+    await advance_to_fixer(value, orca, run_id, finding)
+    command = (
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider -q tests/test_execution.py"
+    )
+
+    orca.complete_dispatched(
+        fix_attempt(
+            validation=[
+                    {
+                        "command": command,
+                        "status": "failed",
+                        "output": "fixer-reported output is ignored",
+                    }
+            ]
+        )
+    )
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].round == 1
+    assert result.findings[0].phase is FindingPhase.RE_REVIEWING
+    assert result.started[0].role is StageKind.RE_REVIEWER
+    attempt = store.latest_fix_attempt(result.findings[0].finding_key)
+    assert attempt is not None
+    assert attempt.validation_results[0].status == "failed"
+    assert len(git.validation_calls) == 2
+
+
+async def test_identical_early_failure_with_multiple_checks_does_not_spend_round(
+    tmp_path: Path,
+) -> None:
+    class StopOnFailureGit(FakeGit):
+        async def validate(
+            self, worktree_id: str, requirements: list[ValidationRequirement]
+        ) -> list[ValidationResult]:
+            self.validation_calls.append([item.command for item in requirements])
+            return [
+                ValidationResult(
+                    command=requirements[0].command,
+                    status="failed",
+                    output=f"same failure for {requirements[0].command}",
+                )
+            ]
+
+    orca = FakeOrca()
+    git = StopOnFailureGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    finding = review_finding_data()
+    finding["validation"] = [
+        {"command": "pytest tests/test_one.py", "expected": "passes"},
+        {"command": "pytest tests/test_two.py", "expected": "passes"},
+    ]
+    await advance_to_fixer(value, orca, run_id, finding)
+    orca.complete_dispatched(fix_attempt())
+
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].round == 1
+    assert result.findings[0].phase is FindingPhase.RE_REVIEWING
+    assert len(git.validation_calls) == 4
+
+
+async def test_duplicate_commands_in_different_workdirs_are_distinct_requirements(
+    tmp_path: Path,
+) -> None:
+    class WorkdirFailureGit(FakeGit):
+        async def validate(
+            self, worktree_id: str, requirements: list[ValidationRequirement]
+        ) -> list[ValidationResult]:
+            self.validation_calls.append([item.command for item in requirements])
+            requirement = requirements[0]
+            failed = "finding-" in worktree_id and requirement.workdir == "packages/two"
+            return [
+                ValidationResult(
+                    command=requirement.command,
+                    status="failed" if failed else "passed",
+                    output="failed" if failed else "passed",
+                )
+            ]
+
+    orca = FakeOrca()
+    git = WorkdirFailureGit()
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    finding = review_finding_data()
+    finding["validation"] = [
+        {"command": "pytest", "workdir": "packages/one", "expected": "passes"},
+        {"command": "pytest", "workdir": "packages/two", "expected": "passes"},
+    ]
+    await advance_to_fixer(value, orca, run_id, finding)
+    orca.complete_dispatched(fix_attempt())
+
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.ESCALATING
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+
+
+async def test_fixer_cannot_claim_the_base_failure_without_reproducing_it_at_head(
+    tmp_path: Path,
+) -> None:
+    class DivergingValidationGit(FakeGit):
+        async def validate(
+            self, worktree_id: str, requirements: list[ValidationRequirement]
+        ) -> list[ValidationResult]:
+            self.validation_calls.append([item.command for item in requirements])
+            output = (
+                "E AssertionError: batch had 1 failed in 5s"
+                if len(self.validation_calls) == 1
+                else "E AssertionError: batch had 1 failed in 10s"
+            )
+            return [
+                ValidationResult(command=item.command, status="failed", output=output)
+                for item in requirements
+            ]
+
+    orca = FakeOrca()
+    git = DivergingValidationGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    command = "uv run --extra dev pytest"
+
+    orca.complete_dispatched(
+        fix_attempt(
+            validation=[
+                {"command": command, "status": "failed", "output": "base failure"}
+            ]
+        )
+    )
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].phase is FindingPhase.ESCALATING
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+    attempt = store.latest_fix_attempt(result.findings[0].finding_key)
+    assert attempt is not None
+    assert attempt.validation_results[0].output == "E AssertionError: batch had 1 failed in 10s"
+    assert len(git.validation_calls) == 2
 
 
 def test_a_reopened_stage_no_longer_counts_toward_its_family() -> None:

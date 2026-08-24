@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
+import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
@@ -48,6 +50,7 @@ from orkastrator.models import (
     StageRecord,
     SupervisorPlan,
     ValidationRequirement,
+    ValidationResult,
     WorkerBlocked,
     WorkerResult,
 )
@@ -424,9 +427,11 @@ class ExecutionController:
             self._store.record_worker_result(run_id, stage.lane_id, result)
             return
         if stage.role is StageKind.INITIAL_REVIEWER:
-            report = InitialReviewReport.model_validate_json(lifecycle.body)
-            worker = self._store.worker_result(stage.lane_id)
-            verified = await self._verified_review(stage, report, worker.review_revision)
+            verified = self._store.initial_review(stage.lane_id)
+            if verified is None:
+                report = InitialReviewReport.model_validate_json(lifecycle.body)
+                worker = self._store.worker_result(stage.lane_id)
+                verified = await self._verified_review(stage, report, worker.review_revision)
             self._store.record_initial_review(run_id, stage.lane_id, verified)
             return
         finding = self._finding_for_stage(run_id, stage)
@@ -470,7 +475,24 @@ class ExecutionController:
             frozen.head_sha,
         ):
             raise ValueError("initial review revision does not match the worker changeset")
-        _reject_unrunnable_validation(report)
+        governed = report.model_copy(
+            update={
+                "review_revision": frozen,
+                "findings": [
+                    finding.model_copy(
+                        update={
+                            "review_revision": frozen,
+                            "validation": [
+                                _govern_validation_requirement(requirement)
+                                for requirement in finding.validation
+                            ],
+                        }
+                    )
+                    for finding in report.findings
+                ],
+            }
+        )
+        _reject_unrunnable_validation(governed)
         if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
             raise ValueError("initial review checkout contains uncommitted changes")
         if await self._git.head(stage.worktree_id) != frozen.head_sha:
@@ -478,17 +500,34 @@ class ExecutionController:
         observed = await self._git.diff_sha256(stage.worktree_id, frozen.base_sha, frozen.head_sha)
         if observed != frozen.diff_sha256:
             raise ValueError("initial review checkout does not reproduce the frozen worker diff")
-        if reported == frozen:
-            return report
-        return report.model_copy(
-            update={
-                "review_revision": frozen,
-                "findings": [
-                    finding.model_copy(update={"review_revision": frozen})
-                    for finding in report.findings
-                ],
-            }
+        frozen_findings = await self._freeze_validation_baselines(
+            stage.worktree_id, governed.findings
         )
+        if not await self._git.is_clean(stage.worktree_id):
+            raise ValueError("initial review validation dirtied its checkout")
+        return governed.model_copy(update={"findings": frozen_findings})
+
+    async def _freeze_validation_baselines(
+        self, worktree_id: str, findings: list[ReviewFinding]
+    ) -> list[ReviewFinding]:
+        """Govern validation argv and observe it once before any fixer runs."""
+
+        baselines: dict[tuple[str, str | None, int], ValidationResult] = {}
+        frozen_findings: list[ReviewFinding] = []
+        for finding in findings:
+            requirements: list[ValidationRequirement] = []
+            for requirement in finding.validation:
+                key = (requirement.command, requirement.workdir, requirement.expect_exit)
+                baseline = baselines.get(key)
+                if baseline is None:
+                    results = await self._git.validate(worktree_id, [requirement])
+                    if not results:
+                        raise ValueError("validation runner returned no baseline result")
+                    baseline = results[0]
+                    baselines[key] = baseline
+                requirements.append(requirement.model_copy(update={"baseline_result": baseline}))
+            frozen_findings.append(finding.model_copy(update={"validation": requirements}))
+        return frozen_findings
 
     async def _apply_worker_block(
         self, run_id: str, stage: StageRecord, blocked: WorkerBlocked
@@ -539,9 +578,34 @@ class ExecutionController:
         self, run_id: str, finding: FindingRecord, stage: StageRecord, attempt: FixAttempt
     ) -> None:
         attempt = await self._bound_fix_attempt(finding, stage, attempt)
+        persisted = self._store.fix_attempt_for_stage(stage.stage_id)
+        if persisted is not None:
+            attempt = persisted
+        elif attempt.status == "fixed":
+            if stage.worktree_id is None:
+                raise ValueError("fixed attempt omitted its isolated worktree")
+            observed = await self._observe_validation_requirements(
+                stage.worktree_id, finding.effective_contract.validation
+            )
+            required_commands = {
+                requirement.command for requirement in finding.effective_contract.validation
+            }
+            extra_evidence = [
+                result
+                for result in attempt.validation_results
+                if result.command not in required_commands
+            ][: 64 - len(observed)]
+            attempt = FixAttempt.model_validate(
+                {
+                    **attempt.model_dump(mode="python"),
+                    "validation_results": [*observed, *extra_evidence],
+                }
+            )
         self._store.record_fix_attempt(run_id, finding, stage, attempt)
         if attempt.status == "fixed":
-            if not _validation_satisfied(finding, attempt):
+            if not _validation_satisfied(
+                finding, attempt
+            ) and not _validation_failed_identically_at_base_and_head(finding, attempt):
                 self._escalate(run_id, finding, FindingReason.VALIDATION_FAILED)
                 return
             if not await self._validate_fixer_commit(run_id, finding, stage, attempt):
@@ -568,6 +632,19 @@ class ExecutionController:
             )
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
+
+    async def _observe_validation_requirements(
+        self, worktree_id: str, requirements: list[ValidationRequirement]
+    ) -> list[ValidationResult]:
+        """Observe every requirement even though the runner stops at first failure."""
+
+        observed: list[ValidationResult] = []
+        for requirement in requirements:
+            result = await self._git.validate(worktree_id, [requirement])
+            if len(result) != 1:
+                raise ValueError("validation runner returned an incomplete result")
+            observed.append(result[0])
+        return observed
 
     @staticmethod
     def _bind_revision(finding: FindingRecord, contract: ReviewFinding) -> ReviewFinding:
@@ -642,6 +719,37 @@ class ExecutionController:
                 ],
             }
         )
+        persisted = self._store.re_review_for_stage(stage.stage_id)
+        if persisted is None:
+            governed_discovery_findings = [
+                item.finding.model_copy(
+                    update={
+                        "validation": [
+                            _govern_validation_requirement(requirement)
+                            for requirement in item.finding.validation
+                        ]
+                    }
+                )
+                for item in result.new_findings
+            ]
+            _reject_unrunnable_findings(governed_discovery_findings)
+            governed_discoveries = await self._freeze_validation_baselines(
+                stage.worktree_id, governed_discovery_findings
+            )
+            if not await self._git.is_clean(stage.worktree_id):
+                raise ValueError("re-review validation dirtied its checkout")
+            result = result.model_copy(
+                update={
+                    "new_findings": [
+                        item.model_copy(update={"finding": governed})
+                        for item, governed in zip(
+                            result.new_findings, governed_discoveries, strict=True
+                        )
+                    ]
+                }
+            )
+        else:
+            result = persisted
         existing = self._store.findings(run_id, finding.lane_id)
         _validate_discovered_findings(existing, result)
         existing_ids = {item.finding_id for item in existing}
@@ -653,7 +761,6 @@ class ExecutionController:
         # verdict about a different commit; keyed on the round, the retry's own
         # re-review read as the first one being rewritten and was refused, which
         # left the rebase unable to finish what it was sent to do.
-        persisted = self._store.re_review_for_stage(stage.stage_id)
         if persisted is not None and persisted != result:
             raise ValueError("re-review result changed after persistence")
         if collisions and persisted is None:
@@ -2260,6 +2367,9 @@ class ExecutionController:
                 "workdir instead of `cd`. This review is rejected outright if any command uses "
                 "that syntax. A check is satisfied by its exit status alone, so set expect_exit "
                 "when the passing outcome is a non-zero one, as an absence check with rg is. "
+                "Name pytest scope as usual but omit baseline_result: the supervisor pins the "
+                "project environment, disables repository-wide coverage for scoped pytest runs, "
+                "and records the base observation before freezing the finding. "
                 "Send worker_done with body set to only the JSON "
                 f"contract matching this schema: {schema}"
             )
@@ -2552,6 +2662,11 @@ _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase
 # guesswork that goes stale. Counting them needs no taxonomy: the transient case
 # clears itself on the next tick, and the real one does not.
 _PUBLICATION_ATTEMPTS = 3
+_PYTEST_SUMMARY_DURATION = re.compile(
+    r"^(?P<prefix>(?:\d+ (?:failed|passed|errors?|skipped|warnings?|xfailed|xpassed|"
+    r"deselected|subtests passed)\b|no tests ran\b)[^\n]*?)"
+    r"\bin \d+(?:\.\d+)?s(?: \([^\n)]*\))?(?P<suffix>[ \t]*)$",
+)
 
 _RETRY_MARKER = ":retry"
 """Separates a stage key from the ordinal that makes a repeat of it dispatchable."""
@@ -2605,7 +2720,13 @@ def _reject_unrunnable_validation(report: InitialReviewReport) -> None:
     still dispatched and can restate the requirement.
     """
 
-    for finding in report.findings:
+    _reject_unrunnable_findings(report.findings)
+
+
+def _reject_unrunnable_findings(findings: list[ReviewFinding]) -> None:
+    """Reject finding commands whose syntax the shell-free runner cannot honor."""
+
+    for finding in findings:
         for requirement in finding.validation:
             found = sorted({token for token in SHELL_OPERATORS if token in requirement.command})
             if found:
@@ -2616,6 +2737,149 @@ def _reject_unrunnable_validation(report: InitialReviewReport) -> None:
                 )
 
 
+def _govern_validation_requirement(requirement: ValidationRequirement) -> ValidationRequirement:
+    """Turn reviewer pytest intent into the repository's runnable invocation."""
+
+    try:
+        arguments = shlex.split(requirement.command)
+    except ValueError:
+        return requirement.model_copy(update={"baseline_result": None})
+    pytest_arguments = _pytest_arguments(arguments)
+    if pytest_arguments is None:
+        return requirement.model_copy(update={"baseline_result": None})
+    already_safe = _has_supervisor_pytest_flags(pytest_arguments)
+    pytest_arguments = _without_supervisor_pytest_flags(pytest_arguments)
+    governed = ["uv", "run", "--extra", "dev", "pytest"]
+    if already_safe or _is_scoped_pytest(pytest_arguments):
+        governed.extend(("--no-cov", "-p", "no:cacheprovider"))
+    governed.extend(pytest_arguments)
+    return requirement.model_copy(
+        update={"command": shlex.join(governed), "baseline_result": None}
+    )
+
+
+def _pytest_arguments(arguments: list[str]) -> list[str] | None:
+    """Return pytest intent without trusting the reviewer's environment wrapper."""
+
+    if not arguments:
+        return None
+    if arguments[0] == "pytest":
+        return arguments[1:]
+    if len(arguments) >= 3 and arguments[0] in {"python", "python3"}:
+        return arguments[3:] if arguments[1:3] == ["-m", "pytest"] else None
+    if arguments[0] == "uv" and "run" in arguments[1:]:
+        run_index = arguments.index("run", 1)
+        try:
+            pytest_index = arguments.index("pytest", run_index + 1)
+        except ValueError:
+            return None
+        return arguments[pytest_index + 1 :]
+    return None
+
+
+def _is_scoped_pytest(arguments: list[str]) -> bool:
+    """Recognize a test/module selection that cannot satisfy whole-package coverage."""
+
+    selectors = {
+        "-k",
+        "-m",
+        "--co",
+        "--collect-only",
+        "--deselect",
+        "--ff",
+        "--ignore",
+        "--ignore-glob",
+        "--lf",
+        "--pyargs",
+        "--setup-only",
+    }
+    options_with_values = {
+        "-n",
+        "-o",
+        "-p",
+        "-W",
+        "--assert",
+        "--basetemp",
+        "--capture",
+        "--color",
+        "--confcutdir",
+        "--cov",
+        "--cov-config",
+        "--cov-context",
+        "--cov-fail-under",
+        "--cov-report",
+        "--dist",
+        "--durations",
+        "--durations-min",
+        "--import-mode",
+        "--junit-prefix",
+        "--junitxml",
+        "--log-cli-level",
+        "--log-date-format",
+        "--log-file",
+        "--log-file-date-format",
+        "--log-file-format",
+        "--log-file-level",
+        "--log-format",
+        "--log-level",
+        "--maxfail",
+        "--numprocesses",
+        "--override-ini",
+        "--pastebin",
+        "--rootdir",
+        "--tb",
+        "--verbosity",
+    }
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if (
+            argument in selectors
+            or argument.startswith(
+                ("-k=", "-m=", "--deselect=", "--ignore=", "--ignore-glob=")
+            )
+            or "::" in argument
+        ):
+            return True
+        if argument in options_with_values:
+            index += 2
+            continue
+        if not argument.startswith("-"):
+            return True
+        index += 1
+    return False
+
+
+def _has_supervisor_pytest_flags(arguments: list[str]) -> bool:
+    """Preserve an explicit safe invocation even when its scope is unconventional."""
+
+    return "--no-cov" in arguments or any(
+        arguments[index : index + 2] == ["-p", "no:cacheprovider"]
+        or argument == "-pno:cacheprovider"
+        for index, argument in enumerate(arguments)
+    )
+
+
+def _without_supervisor_pytest_flags(arguments: list[str]) -> list[str]:
+    """Remove flags orkastrator owns before adding its canonical form once."""
+
+    cleaned: list[str] = []
+    index = 0
+    while index < len(arguments):
+        if arguments[index] == "--no-cov":
+            index += 1
+            continue
+        if arguments[index : index + 2] == ["-p", "no:cacheprovider"]:
+            index += 2
+            continue
+        if arguments[index] == "-pno:cacheprovider":
+            index += 1
+            continue
+        cleaned.append(arguments[index])
+        index += 1
+    return cleaned
+
+
 def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
     """Require the finding's own validation list, and treat it as the whole obligation.
 
@@ -2624,14 +2888,51 @@ def _validation_satisfied(finding: FindingRecord, attempt: FixAttempt) -> bool:
     suite to close one bounded finding is the cost this workflow exists to avoid.
     """
 
-    observed = {
-        result.command: result.status
-        for result in attempt.validation_results
-        if result.status == "passed"
-    }
-    return all(
-        requirement.command in observed for requirement in finding.effective_contract.validation
+    requirements = finding.effective_contract.validation
+    observed = attempt.validation_results[: len(requirements)]
+    return len(observed) == len(requirements) and all(
+        result.command == requirement.command and result.status == "passed"
+        for requirement, result in zip(requirements, observed, strict=True)
     )
+
+
+def _validation_failed_identically_at_base_and_head(
+    finding: FindingRecord, attempt: FixAttempt
+) -> bool:
+    """Ignore only failed gates whose supervisor-frozen base result is unchanged."""
+
+    requirements = finding.effective_contract.validation
+    observed_results = attempt.validation_results[: len(requirements)]
+    if len(observed_results) != len(requirements):
+        return False
+    matched_failure = False
+    for requirement, observed in zip(requirements, observed_results, strict=True):
+        if observed.command != requirement.command:
+            return False
+        if observed.status == "passed":
+            continue
+        baseline = requirement.baseline_result
+        if (
+            observed.status != "failed"
+            or baseline is None
+            or baseline.status != "failed"
+            or baseline.command != observed.command
+            or _validation_failure_fingerprint(baseline.output)
+            != _validation_failure_fingerprint(observed.output)
+        ):
+            return False
+        matched_failure = True
+    return matched_failure
+
+
+def _validation_failure_fingerprint(output: str) -> str:
+    """Remove pytest summary timing while preserving assertion evidence."""
+
+    summary, separator, evidence = output.partition("\n")
+    stable_summary = _PYTEST_SUMMARY_DURATION.sub(
+        r"\g<prefix>in <duration>\g<suffix>", summary
+    )
+    return separator.join((stable_summary, evidence)) if separator else stable_summary
 
 
 def _task_id(task: JsonObject) -> str:

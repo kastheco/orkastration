@@ -218,6 +218,14 @@ SHELL_OPERATORS = ("&&", "||", "|", ";", ">", "<", "$(", "`")
 """Syntax only a shell resolves, which the validation runner never provides."""
 
 
+class ValidationResult(WorkflowContract):
+    """Observed result of one validation command."""
+
+    command: str = Field(min_length=1, max_length=2_000)
+    status: Literal["passed", "failed", "skipped"]
+    output: str = Field(default="", max_length=8_000)
+
+
 class ValidationRequirement(WorkflowContract):
     """One deterministic check required by a finding contract."""
 
@@ -233,6 +241,8 @@ class ValidationRequirement(WorkflowContract):
     symbol requires. Without this the reviewer can only write the command and
     say what it means in prose, and the runner reads the prose as a failure.
     """
+    baseline_result: ValidationResult | None = None
+    """Supervisor-observed result against the unmodified reviewed head."""
 
     @model_validator(mode="after")
     def _contained_workdir(self) -> ValidationRequirement:
@@ -316,14 +326,6 @@ class InitialReviewReport(WorkflowContract):
         for finding_id in by_id:
             visit(finding_id)
         return self
-
-
-class ValidationResult(WorkflowContract):
-    """Observed result of one fixer validation command."""
-
-    command: str = Field(min_length=1, max_length=2_000)
-    status: Literal["passed", "failed", "skipped"]
-    output: str = Field(default="", max_length=8_000)
 
 
 class WorkerResult(WorkflowContract):
