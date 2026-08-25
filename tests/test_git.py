@@ -78,6 +78,35 @@ async def test_base_resolution_fetches_and_reports_a_stale_tracking_branch(
     assert await git.head(lane_id) == remote_head
 
 
+async def test_base_resolution_ignores_an_unrelated_unreachable_remote(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, local_base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_base)
+    run(source, "git", "branch", "--set-upstream-to", "origin/main", "main")
+
+    other = tmp_path / "other"
+    run(tmp_path, "git", "clone", str(remote), str(other))
+    run(other, "git", "config", "user.name", "orkastrator test")
+    run(other, "git", "config", "user.email", "orkastrator@example.test")
+    run(other, "git", "checkout", "main")
+    remote_head = commit(other, "src/remote.py", "remote\n", "remote change")
+    run(other, "git", "push", "origin", "main")
+    run(source, "git", "remote", "add", "upstream", str(tmp_path / "missing.git"))
+
+    resolution = await LocalGit().resolve_base(lane_id, "main")
+
+    assert resolution.requested_sha == local_base
+    assert resolution.resolved_ref == "origin/main"
+    assert resolution.base_sha == remote_head
+    assert resolution.tracking_sha == remote_head
+    assert resolution.behind_by == 1
+
+
 async def test_base_resolution_does_not_rewind_an_ahead_local_branch(
     tmp_path: Path,
 ) -> None:

@@ -55,21 +55,29 @@ class LocalGit:
     async def resolve_base(self, worktree_id: str, ref: str) -> BaseResolution:
         """Fetch, then resolve a lane base and its remote tracking source."""
 
-        await self._git(worktree_id, "fetch", "--all", "--prune")
-        requested_sha = await self.resolve_ref(worktree_id, ref)
         symbolic = await self._git(
             worktree_id, "rev-parse", "--symbolic-full-name", ref, check=False
         )
         full_ref = symbolic.stdout.strip() if symbolic.returncode == 0 else ""
         tracking_ref: str | None = None
+        fetch_remote: str | None = None
         if full_ref.startswith("refs/heads/"):
             upstream = await self._git(
                 worktree_id,
                 "for-each-ref",
-                "--format=%(upstream:short)",
+                "--format=%(upstream:short)|%(upstream:remotename)",
                 full_ref,
             )
-            tracking_ref = upstream.stdout.strip() or None
+            upstream_ref, separator, remote_name = upstream.stdout.strip().partition("|")
+            tracking_ref = upstream_ref or None
+            if tracking_ref is not None and separator and remote_name not in {"", "."}:
+                fetch_remote = remote_name
+        elif full_ref.startswith("refs/remotes/"):
+            remote_ref = full_ref.removeprefix("refs/remotes/")
+            fetch_remote = remote_ref.partition("/")[0] or None
+        if fetch_remote is not None:
+            await self._git(worktree_id, "fetch", fetch_remote, "--prune")
+        requested_sha = await self.resolve_ref(worktree_id, ref)
         if tracking_ref is None:
             return BaseResolution(
                 requested_ref=ref,
