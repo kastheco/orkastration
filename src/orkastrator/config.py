@@ -236,6 +236,15 @@ class FinalGateConfig(BaseModel):
     # decided not to enforce. Exact names only - a substring rule would silently
     # widen the moment somebody names a real suite "advisory rollout".
     advisory_checks: list[str] = Field(default_factory=list, max_length=32)
+    # A repository that publishes no checks at all cannot be gated. `checks`
+    # reports pending for an empty result, because an empty result usually means
+    # GitHub has not registered the push's workflow runs yet and reading that as
+    # a pass would merge a lane whose CI never ran. A repository with no
+    # `.github/workflows` never leaves that state: the lane polls forever and
+    # neither passes nor fails. Setting this says the empty result is the final
+    # answer for this repository, not a race. It cannot weaken a repository that
+    # does publish checks, because those never reach the empty case.
+    treat_no_checks_as_passed: bool = False
     on_failure: FinalGateFailureConfig
 
 

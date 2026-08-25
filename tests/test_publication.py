@@ -432,6 +432,79 @@ async def test_a_branch_github_has_not_registered_yet_stays_pending() -> None:
     assert [item.name for item in observed.checks] == ["check-discovery"]
 
 
+def _no_checks_runner(sha: str) -> QueueRunner:
+    return QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        result("", "no checks reported on the 'orkastrator/run-12345678/issue-123' branch", 1),
+        result(json.dumps([{"check_runs": []}])),
+        result(json.dumps({"state": "pending", "statuses": []})),
+    )
+
+
+def _no_checks_receipt(sha: str) -> PublicationReceipt:
+    return PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+
+
+async def test_a_repository_that_publishes_no_checks_can_be_declared_ungated() -> None:
+    """A repository with no workflows never leaves the "nothing reported" state.
+
+    Without an explicit opt-out its lane polls forever: the empty result is read
+    as a race that will resolve, and it never does. `treat_no_checks_as_passed`
+    is the owner saying the empty result is final for this repository.
+    """
+
+    sha = "d" * 40
+
+    observed = await GitHubPublisher(
+        runner=_no_checks_runner(sha), treat_no_checks_as_passed=True
+    ).checks(_no_checks_receipt(sha))
+
+    assert observed.status == "passed"
+    assert [item.name for item in observed.checks] == ["check-discovery"]
+
+
+async def test_declaring_a_repository_ungated_does_not_pass_a_real_pending_check() -> None:
+    """The opt-out answers "this repository reports nothing", not "stop waiting".
+
+    A check that exists and reported pending is still a race worth another tick,
+    so the flag must not shortcut it.
+    """
+
+    sha = "e" * 40
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        result(
+            json.dumps(
+                [
+                    {
+                        "name": "tests",
+                        "bucket": "pending",
+                        "link": "https://github.com/check/1",
+                        "description": "queued",
+                    }
+                ]
+            ),
+            returncode=8,
+        ),
+    )
+
+    observed = await GitHubPublisher(
+        runner=runner, treat_no_checks_as_passed=True
+    ).checks(_no_checks_receipt(sha))
+
+    assert observed.status == "pending"
+    assert [item.name for item in observed.checks] == ["tests"]
+
+
 async def test_a_check_the_repository_does_not_enforce_cannot_block_the_lane() -> None:
     """The supervisor must not be stricter than the repository it publishes into.
 
