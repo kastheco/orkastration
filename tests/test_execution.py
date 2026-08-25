@@ -1913,7 +1913,7 @@ async def test_accepting_a_conflicted_fix_rebuilds_it_on_the_lane_head(
     )
     lane_head = store.lanes(run_id)[0].integration_head_sha
     assert lane_head is not None
-    integrations_before = git.integration_count
+    aborts_before = git.abort_calls
 
     orca.complete_dispatched(
         escalation("integration_conflict", "accept_fix", finding_id=conflicted.finding_id)
@@ -1924,7 +1924,7 @@ async def test_accepting_a_conflicted_fix_rebuilds_it_on_the_lane_head(
     assert retried.dispatch_base_sha == lane_head
     assert retried.phase is FindingPhase.FIXING
     assert retried.round == conflicted.round
-    assert git.integration_count == integrations_before
+    assert git.abort_calls == aborts_before
 
 
 async def test_a_conflict_at_the_round_ceiling_rebases_before_blocking(
