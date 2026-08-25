@@ -234,6 +234,7 @@ class FakeOrca:
         self.refuse_starts: set[str] = set()
         self.timeout_starts: set[str] = set()
         self.created_worktrees: list[dict[str, object]] = []
+        self.discarded_worktrees: list[str] = []
 
     async def create_run(self, objective: str) -> tuple[str, JsonObject]:
         assert objective.startswith("Do work\n\norkastrator run: ")
@@ -282,6 +283,9 @@ class FakeOrca:
         worktree_id = "repo::/tmp/issue"
         self.created_worktrees.append({**kwargs, "worktree_id": worktree_id})
         return worktree_id, {"ok": True, "worktreeId": worktree_id}
+
+    async def discard_worktree(self, worktree_id: str) -> None:
+        self.discarded_worktrees.append(worktree_id)
 
     async def start_worker(self, **kwargs: object) -> tuple[str, str, str | None, JsonObject]:
         task_id = str(kwargs["task_id"])
@@ -2312,6 +2316,39 @@ async def test_one_stage_that_cannot_start_does_not_park_the_rest_of_the_wave(
     assert "task_not_startable" in str(failures[0]["detail"])
 
 
+async def test_store_refusal_discards_the_worker_worktree_created_for_that_start(
+    tmp_path: Path,
+) -> None:
+    """A checkout the store never accepted has no later owner to reclaim it."""
+
+    class RacingLaneCheckoutOrca(FakeOrca):
+        async def create_worktree(self, **kwargs: object) -> tuple[str, JsonObject]:
+            created = await super().create_worktree(**kwargs)
+            lane = store.lanes(run_id)[0]
+            with Session(store._engine) as session:
+                row = session.get(LaneRow, lane.lane_id)
+                assert row is not None
+                row.worktree_id = "repo::/tmp/existing-lane"
+                session.add(row)
+                session.commit()
+            return created
+
+    orca = RacingLaneCheckoutOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+
+    result = await value.accept(run_id)
+
+    assert result.stages[0].phase is StagePhase.DISPATCHED
+    assert orca.starts[-1]["worktree_id"] == "repo::/tmp/existing-lane"
+    assert len(orca.created_worktrees) == 1
+    assert orca.discarded_worktrees == ["repo::/tmp/issue"]
+    failures = [
+        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ]
+    assert "already has another checkout" in str(failures[-1]["detail"])
+
+
 async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
     tmp_path: Path,
 ) -> None:
@@ -2771,6 +2808,9 @@ async def test_resuming_live_failed_worker_retries_without_reblocking(
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     failed_worker = store.stages(run_id)[0]
+    lane_worktree = store.lanes(run_id)[0].worktree_id
+    assert lane_worktree is not None
+    assert len(orca.created_worktrees) == 1
 
     orca.fail_dispatched()
     blocked_result = await value.monitor(run_id)
@@ -2789,6 +2829,14 @@ async def test_resuming_live_failed_worker_retries_without_reblocking(
     assert retired.phase is StagePhase.FAILED
     assert ":resumed" in retired.stage_key
     assert len([event for event in store.events(run_id) if event["kind"] == "lane_blocked"]) == 1
+    resumed = next(
+        stage
+        for stage in resumed_result.stages
+        if stage.role is StageKind.WORKER and stage.stage_id != failed_worker.stage_id
+    )
+    assert resumed.worktree_id == lane_worktree
+    assert orca.starts[-1]["worktree_id"] == lane_worktree
+    assert len(orca.created_worktrees) == 1
 
 
 async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(

@@ -90,6 +90,8 @@ class OrcaGraphController(Protocol):
         parent_worktree_id: str | None = None,
     ) -> tuple[str, JsonObject]: ...
 
+    async def discard_worktree(self, worktree_id: str) -> None: ...
+
     async def start_worker(
         self,
         *,
@@ -1708,15 +1710,25 @@ class ExecutionController:
         placement = self._placement(run_id, lane, stage)
         if stage.role is StageKind.WORKER:
             worker_worktree = placement.worktree_id
+            created_worktree: str | None = None
             if worker_worktree is None:
                 worker_worktree, _ = await self._orca.create_worktree(
                     lane_name=_worker_name(lane.name, stage),
                     repo_selector=lane.repo_selector,
                     base_ref=lane.base_ref,
                 )
-            await self._prepare_worker_checkout(
-                run_id, lane, stage, worker_worktree, before_dispatch=True
-            )
+                created_worktree = worker_worktree
+            try:
+                await self._prepare_worker_checkout(
+                    run_id, lane, stage, worker_worktree, before_dispatch=True
+                )
+            except BaseException:
+                recorded = next(
+                    item for item in self._store.stages(run_id) if item.stage_id == stage.stage_id
+                ).worktree_id
+                if created_worktree is not None and recorded != created_worktree:
+                    await self._orca.discard_worktree(created_worktree)
+                raise
             placement = WorkerPlacement(worktree_id=worker_worktree)
         # `use_run` binds the coordinator terminal, and that binding is one piece
         # of shared Orca state: a second supervisor process binding its own run
@@ -1804,12 +1816,14 @@ class ExecutionController:
         """Resolve the exact existing or isolated checkout for one role."""
 
         if stage.role is StageKind.WORKER:
-            # A worker stage that already recorded a checkout is being started a
-            # second time, and that checkout holds whatever it committed before
-            # it stopped. Handing it a fresh one from the base ref abandons that
-            # commit, so a lane that blocked on a decision would pay for the
-            # whole implementation again to answer it.
-            return WorkerPlacement(worktree_id=stage.worktree_id, base_ref=lane.base_ref)
+            # A worker being resumed may be a replacement stage with no checkout
+            # of its own. The lane's checkout still holds whatever the prior
+            # worker committed before it stopped, so handing the replacement a
+            # fresh one from the base ref would abandon that work.
+            return WorkerPlacement(
+                worktree_id=stage.worktree_id or lane.worktree_id,
+                base_ref=lane.base_ref,
+            )
         if stage.role is StageKind.FIXER:
             if lane.worktree_id is None:
                 raise ValueError("fixer lane has no integration checkout")
