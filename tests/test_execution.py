@@ -2658,6 +2658,30 @@ async def test_resuming_names_the_lane_when_that_lane_is_not_blocked(tmp_path: P
     assert [item.name for item in value.resume(run_id, blocked.name, "note")] == [blocked.name]
 
 
+async def test_a_lane_blocked_for_the_same_reason_is_recorded_once(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    lane = store.lanes(run_id)[0]
+
+    for _ in range(5):
+        store.block_lane(run_id, lane.lane_id, "worker stage failed")
+    store.block_lane(run_id, lane.lane_id, "and now the checkout is gone too")
+    store.block_lane(run_id, lane.lane_id, "and now the checkout is gone too")
+
+    reasons = [
+        event["payload"]["reason"]
+        for event in store.events(run_id)
+        if event["kind"] == "lane_blocked"
+    ]
+    assert reasons == ["worker stage failed", "and now the checkout is gone too"]
+    # Re-entering the phase is its own occasion, even for a reason already seen.
+    value.resume(run_id, lane.name, "note")
+    store.block_lane(run_id, lane.lane_id, "and now the checkout is gone too")
+    assert len([item for item in store.events(run_id) if item["kind"] == "lane_blocked"]) == 3
+
+
 async def test_resuming_a_run_with_nothing_blocked_is_refused(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, _ = controller(tmp_path, orca)
