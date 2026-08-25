@@ -86,7 +86,17 @@ class LocalGit:
                 base_sha=requested_sha,
             )
 
-        tracking_sha = await self.resolve_ref(worktree_id, tracking_ref)
+        tracking_result = await self._git(
+            worktree_id, "rev-parse", f"{tracking_ref}^{{commit}}", check=False
+        )
+        if tracking_result.returncode != 0:
+            return BaseResolution(
+                requested_ref=ref,
+                requested_sha=requested_sha,
+                resolved_ref=ref,
+                base_sha=requested_sha,
+            )
+        tracking_sha = tracking_result.stdout.strip()
         counts = await self._git(
             worktree_id,
             "rev-list",

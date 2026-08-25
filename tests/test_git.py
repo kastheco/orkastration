@@ -107,6 +107,34 @@ async def test_base_resolution_ignores_an_unrelated_unreachable_remote(
     assert resolution.behind_by == 1
 
 
+async def test_base_resolution_falls_back_when_tracking_branch_was_pruned(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, local_base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    run(source, "git", "checkout", "-b", "feature")
+    run(source, "git", "push", "-u", "origin", "feature")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_base)
+
+    other = tmp_path / "other"
+    run(tmp_path, "git", "clone", str(remote), str(other))
+    run(other, "git", "fetch", "origin", "feature")
+    run(other, "git", "checkout", "-b", "feature", "FETCH_HEAD")
+    run(other, "git", "push", "origin", "--delete", "feature")
+
+    resolution = await LocalGit().resolve_base(lane_id, "feature")
+
+    assert resolution.requested_sha == local_base
+    assert resolution.resolved_ref == "feature"
+    assert resolution.base_sha == local_base
+    assert resolution.tracking_ref is None
+    assert resolution.tracking_sha is None
+    assert resolution.behind_by == 0
+
+
 async def test_base_resolution_does_not_rewind_an_ahead_local_branch(
     tmp_path: Path,
 ) -> None:
