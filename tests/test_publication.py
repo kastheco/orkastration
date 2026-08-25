@@ -201,6 +201,47 @@ async def test_land_preserves_a_non_conflict_provider_failure() -> None:
         await GitHubPublisher(runner=runner).land(receipt)
 
 
+async def test_land_records_a_moved_head_merged_during_a_failed_merge() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    open_state = {
+        "headRefOid": receipt.head_sha,
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "mergeCommit": None,
+    }
+    merged_state = {
+        "headRefOid": "c" * 40,
+        "state": "MERGED",
+        "isDraft": False,
+        "mergeable": "UNKNOWN",
+        "mergeStateStatus": "UNKNOWN",
+        "mergeCommit": {"oid": "d" * 40},
+    }
+    runner = QueueRunner(
+        result(json.dumps(open_state)),
+        result(stderr="pull request was already merged", returncode=1),
+        result(json.dumps(merged_state)),
+    )
+
+    landed = await GitHubPublisher(runner=runner).land(receipt)
+
+    assert landed.landed is True
+    assert landed.head_sha == "b" * 40
+    assert landed.merged_head_sha == "c" * 40
+    assert landed.merge_sha == "d" * 40
+
+
 async def test_a_merge_sha_requires_a_landed_receipt() -> None:
     with pytest.raises(ValueError, match="requires a landed receipt"):
         PublicationReceipt(

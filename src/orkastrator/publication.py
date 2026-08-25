@@ -326,6 +326,9 @@ class GitHubPublisher:
             state = await self._gh_json(
                 path, "pr", "view", receipt.pull_request_url, "--json", fields
             )
+            landed = _landed_receipt(state, receipt)
+            if landed is not None:
+                return landed
             _raise_if_integration_conflict(state, receipt)
             detail = (result.stderr or result.stdout).strip()[:2_000]
             raise PublicationError(f"GitHub merge failed: {detail}")
