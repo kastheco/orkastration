@@ -23,12 +23,14 @@ class PullRequestLanded(PublicationError):
 
     Merged and closed are opposite outcomes, and collapsing both into "no longer
     open" reports the lane succeeding as the lane failing. This carries the
-    merged head so the caller can check that what landed is what it published.
+    landed receipt so the caller can preserve both the published and merged heads.
     """
 
-    def __init__(self, head_sha: str):
-        super().__init__(f"the authorized lane pull request was merged at {head_sha}")
-        self.head_sha = head_sha
+    def __init__(self, receipt: PublicationReceipt):
+        merged_head_sha = receipt.merged_head_sha or receipt.head_sha
+        super().__init__(f"the authorized lane pull request was merged at {merged_head_sha}")
+        self.head_sha = merged_head_sha
+        self.receipt = receipt
 
 
 class IntegrationConflict(PublicationError):
@@ -234,7 +236,7 @@ class GitHubPublisher:
             "view",
             receipt.pull_request_url,
             "--json",
-            "headRefOid,state,isDraft",
+            "headRefOid,state,isDraft,mergeCommit",
         )
         _verify_pull_request(pull_request, receipt)
         required = await self._required_pr_checks(path, receipt.pull_request_url)
@@ -285,7 +287,7 @@ class GitHubPublisher:
             "view",
             receipt.pull_request_url,
             "--json",
-            "headRefOid,state,isDraft",
+            "headRefOid,state,isDraft,mergeCommit",
         )
         _verify_pull_request(state, receipt)
         if isinstance(state, dict) and state.get("isDraft") is False:
@@ -332,6 +334,18 @@ class GitHubPublisher:
         landed = _landed_receipt(state, receipt)
         if landed is None:
             raise PublicationError("GitHub did not report the pull request merged")
+        return landed
+
+    async def record_external_merge(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        """Observe and record a merge performed outside orkastrator."""
+
+        fields = "headRefOid,state,isDraft,mergeable,mergeStateStatus,mergeCommit"
+        state = await self._gh_json(
+            Path.cwd(), "pr", "view", receipt.pull_request_url, "--json", fields
+        )
+        landed = _landed_receipt(state, receipt)
+        if landed is None:
+            raise PublicationError("the authorized lane pull request is not merged")
         return landed
 
     async def _default_branch(self, path: Path, repository: str) -> str:
@@ -445,18 +459,20 @@ def _pull_request_state(payload: dict[object, object]) -> str:
 def _verify_pull_request(payload: object, receipt: PublicationReceipt) -> None:
     if not isinstance(payload, dict):
         raise PublicationError("GitHub returned invalid pull-request state")
+    if _pull_request_state(payload) == "MERGED":
+        landed = _landed_receipt(payload, receipt)
+        if landed is None:
+            raise PublicationError("GitHub did not report the pull request merged")
+        raise PullRequestLanded(landed)
     if payload.get("headRefOid") != receipt.head_sha:
         raise PublicationError("pull request head does not match the published revision")
-    if _pull_request_state(payload) == "MERGED":
-        # Merged between publishing this head and observing it. The head is
-        # identical, so what landed is exactly what this lane published; the
-        # caller records that rather than counting a failed pass.
-        raise PullRequestLanded(receipt.head_sha)
 
 
 def _raise_if_integration_conflict(payload: object, receipt: PublicationReceipt) -> None:
     if not isinstance(payload, dict):
         raise PublicationError("GitHub returned invalid pull-request state")
+    if _pull_request_state(payload) == "MERGED":
+        return
     if payload.get("headRefOid") != receipt.head_sha:
         raise PublicationError("pull request head does not match the published revision")
     if payload.get("mergeable") == "CONFLICTING" or payload.get("mergeStateStatus") == "DIRTY":
@@ -468,18 +484,28 @@ def _raise_if_integration_conflict(payload: object, receipt: PublicationReceipt)
 def _landed_receipt(payload: object, receipt: PublicationReceipt) -> PublicationReceipt | None:
     if not isinstance(payload, dict):
         raise PublicationError("GitHub returned invalid pull-request state")
-    if payload.get("headRefOid") != receipt.head_sha:
-        raise PublicationError("pull request head does not match the published revision")
     state = _pull_request_state(payload)
     if state != "MERGED":
+        if payload.get("headRefOid") != receipt.head_sha:
+            raise PublicationError("pull request head does not match the published revision")
         return None
+    merged_head_sha = payload.get("headRefOid")
+    if not isinstance(merged_head_sha, str) or not merged_head_sha:
+        raise PublicationError("GitHub did not report the merged pull-request head")
     merge_commit = payload.get("mergeCommit")
     merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
     if not isinstance(merge_sha, str) or not merge_sha:
         raise PublicationError("GitHub did not report the resulting merge commit")
     if merge_sha == receipt.head_sha:
         raise PublicationError("GitHub did not create a merge commit")
-    return receipt.model_copy(update={"draft": False, "landed": True, "merge_sha": merge_sha})
+    return receipt.model_copy(
+        update={
+            "draft": False,
+            "landed": True,
+            "merged_head_sha": merged_head_sha,
+            "merge_sha": merge_sha,
+        }
+    )
 
 
 def _merge_subject(receipt: PublicationReceipt) -> str:

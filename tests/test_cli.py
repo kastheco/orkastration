@@ -21,6 +21,7 @@ from orkastrator.models import (
     OrcaSnapshot,
     PolicyReauthorization,
     ProposalReceipt,
+    PublicationReceipt,
     SupervisorPlan,
 )
 from orkastrator.orca import OrcaError
@@ -355,3 +356,54 @@ def test_confirming_a_policy_change_without_a_reason_is_refused(
     assert result.exit_code == 1
     assert "--confirm needs --note" in result.stderr
     assert FakeReauthorizingController.calls == []
+
+
+def test_record_external_merge_persists_the_observed_landing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    store = StateStore(database_path)
+    store.setup()
+    run_id = store.record_proposal(proposal())
+    lane = store.lanes(run_id)[0]
+    published = PublicationReceipt(
+        run_id=run_id,
+        lane=lane.name,
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch=f"orkastrator/{run_id[:12]}/{lane.name}",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    store.record_publication(run_id, lane.lane_id, published)
+    settings = SimpleNamespace(database_path=database_path, github_command=("gh",))
+    monkeypatch.setattr(cli, "_components", lambda: (settings, store, FakeOrca()))
+
+    class ExternallyMerged:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        async def record_external_merge(
+            self, receipt: PublicationReceipt
+        ) -> PublicationReceipt:
+            return receipt.model_copy(
+                update={
+                    "landed": True,
+                    "merged_head_sha": "c" * 40,
+                    "merge_sha": "d" * 40,
+                }
+            )
+
+    monkeypatch.setattr(cli, "GitHubPublisher", ExternallyMerged)
+
+    result = runner.invoke(
+        cli.app, ["record-external-merge", run_id, "--lane", lane.name, "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    recorded = json.loads(result.stdout)
+    assert recorded["head_sha"] == "b" * 40
+    assert recorded["merged_head_sha"] == "c" * 40
+    assert recorded["merge_sha"] == "d" * 40
+    assert store.publications(run_id, lane.lane_id) == [PublicationReceipt.model_validate(recorded)]

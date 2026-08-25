@@ -4290,7 +4290,16 @@ async def test_a_merged_pull_request_lands_the_lane_instead_of_failing_it(
 
     class MergedWhileObserving(FakePublisher):
         async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
-            raise PullRequestLanded(receipt.head_sha)
+            raise PullRequestLanded(
+                receipt.model_copy(
+                    update={
+                        "draft": False,
+                        "landed": True,
+                        "merged_head_sha": "c" * 40,
+                        "merge_sha": "d" * 40,
+                    }
+                )
+            )
 
     orca = FakeOrca()
     publisher = MergedWhileObserving()
@@ -4306,6 +4315,9 @@ async def test_a_merged_pull_request_lands_the_lane_instead_of_failing_it(
     receipt = store.publications(run_id)[-1]
     assert receipt.landed is True
     assert receipt.draft is False
+    assert receipt.head_sha == "b" * 40
+    assert receipt.merged_head_sha == "c" * 40
+    assert receipt.merge_sha == "d" * 40
     assert [item["kind"] for item in store.events(run_id)].count("pull_request_landed") == 1
     # A merge is not a check result, and recording one would claim CI passed for
     # a head whose checks now belong to the base branch's history.

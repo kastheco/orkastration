@@ -16,6 +16,7 @@ from orkastrator.publication import (
     PublicationError,
     PullRequestLanded,
     _github_repository,
+    _raise_if_integration_conflict,
 )
 
 
@@ -821,15 +822,137 @@ async def test_a_merge_observed_after_publishing_raises_landed_not_an_error() ->
         head_sha=sha,
         draft=True,
     )
+    merge_sha = "c" * 40
     runner = QueueRunner(
-        result(json.dumps({"headRefOid": sha, "state": "MERGED", "isDraft": False}))
+        result(
+            json.dumps(
+                {
+                    "headRefOid": sha,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "mergeCommit": {"oid": merge_sha},
+                }
+            )
+        )
     )
 
     with pytest.raises(PullRequestLanded) as landed:
         await GitHubPublisher(runner=runner).checks(receipt)
 
     assert landed.value.head_sha == sha
+    assert landed.value.receipt.head_sha == sha
+    assert landed.value.receipt.merged_head_sha == sha
+    assert landed.value.receipt.merge_sha == merge_sha
     assert isinstance(landed.value, PublicationError)
+
+
+async def test_a_moved_head_is_recorded_when_the_pull_request_is_merged() -> None:
+    published_sha = "b" * 40
+    merged_head_sha = "c" * 40
+    merge_sha = "d" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=published_sha,
+        draft=False,
+    )
+    runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": merged_head_sha,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "mergeCommit": {"oid": merge_sha},
+                }
+            )
+        )
+    )
+
+    landed = await GitHubPublisher(runner=runner).record_external_merge(receipt)
+
+    assert landed.landed is True
+    assert landed.head_sha == published_sha
+    assert landed.merged_head_sha == merged_head_sha
+    assert landed.merge_sha == merge_sha
+
+
+async def test_checks_report_a_moved_merged_head_as_landed() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": "c" * 40,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "mergeCommit": {"oid": "d" * 40},
+                }
+            )
+        )
+    )
+
+    with pytest.raises(PullRequestLanded) as landed:
+        await GitHubPublisher(runner=runner).checks(receipt)
+
+    assert landed.value.receipt.head_sha == "b" * 40
+    assert landed.value.receipt.merged_head_sha == "c" * 40
+    assert landed.value.receipt.merge_sha == "d" * 40
+
+
+async def test_a_moved_head_is_still_refused_while_the_pull_request_is_open() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": "c" * 40, "state": "OPEN", "isDraft": False}))
+    )
+
+    with pytest.raises(PublicationError, match="does not match the published revision"):
+        await GitHubPublisher(runner=runner).checks(receipt)
+
+
+def test_a_merged_moved_head_is_not_reported_as_an_integration_conflict() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+
+    _raise_if_integration_conflict(
+        {
+            "headRefOid": "c" * 40,
+            "state": "MERGED",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+        },
+        receipt,
+    )
 
 
 async def test_an_unknown_pull_request_state_is_named_rather_than_guessed() -> None:

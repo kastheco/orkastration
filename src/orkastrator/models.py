@@ -554,6 +554,10 @@ class PublicationReceipt(WorkflowContract):
     # branch's history now. Defaults false so receipts written before this
     # field existed still read.
     landed: bool = False
+    # The branch revision GitHub says was merged. This normally equals
+    # `head_sha`, but remains separate because a maintainer may advance the
+    # pull-request branch after orkastrator publishes its frozen revision.
+    merged_head_sha: GitObjectId | None = None
     # The merge commit created when orkastrator lands the lane. Older receipts
     # and externally merged pull requests can be landed without this value, but
     # an automated landing always records it.
@@ -563,6 +567,8 @@ class PublicationReceipt(WorkflowContract):
     def merge_commit_requires_landing(self) -> PublicationReceipt:
         if self.merge_sha is not None and not self.landed:
             raise ValueError("a publication merge sha requires a landed receipt")
+        if self.merged_head_sha is not None and not self.landed:
+            raise ValueError("a publication merged head requires a landed receipt")
         return self
 
 
