@@ -86,6 +86,7 @@ final_gate:
   # Name it here so the supervisor enforces the same set the repository does.
   advisory_checks:
     - packages/browser Chrome conformance (advisory)
+    - mypy (advisory)
   on_failure:
     create_scoped_finding: true
     scope_source:

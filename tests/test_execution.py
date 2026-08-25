@@ -4295,7 +4295,7 @@ async def test_accepting_a_conflicted_composite_fix_retries_integration(
 ) -> None:
     orca = FakeOrca()
     git = FakeGit()
-    value, store = controller(tmp_path, orca, git=git)
+    value, _store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())

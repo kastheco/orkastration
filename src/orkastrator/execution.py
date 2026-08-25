@@ -887,15 +887,16 @@ class ExecutionController:
                 )
                 self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
                 return
-            if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
-                if self._rebase_conflicted_fix(run_id, finding):
-                    self._store.set_finding_state(
-                        run_id,
-                        finding.finding_key,
-                        phase=FindingPhase.PENDING_FIX,
-                        round=finding.round,
-                    )
-                    return
+            if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT and (
+                self._rebase_conflicted_fix(run_id, finding)
+            ):
+                self._store.set_finding_state(
+                    run_id,
+                    finding.finding_key,
+                    phase=FindingPhase.PENDING_FIX,
+                    round=finding.round,
+                )
+                return
             await self._integrate_fix(run_id, finding, attempt, readjudicated=True)
         elif decision.action in {"approve_unchanged", "approve_scope_revision"}:
             limit = self._config.review_cycle.max_fix_rounds_per_finding

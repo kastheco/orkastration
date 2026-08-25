@@ -92,8 +92,13 @@ final_gate:
   # kashh's own `all-checks` job deletes this suite from the set it requires
   # while its launch boundary is intermittent (.github/workflows/pr-checks.yml).
   # Name it here so the supervisor enforces the same set the repository does.
+  #
+  # This repository's own `mypy (advisory)` job is the same shape: it runs so the
+  # standing error count stays visible, and it does not gate, because a check
+  # nothing on main can pass is not a gate.
   advisory_checks:
     - packages/browser Chrome conformance (advisory)
+    - mypy (advisory)
 
   on_failure:
     create_scoped_finding: true
