@@ -98,11 +98,17 @@ class LocalGit:
                 f"behind its remote tracking branch {tracking_ref} at {tracking_sha} and "
                 f"{ahead_by} commit(s) ahead; refusing to discard the divergent local commits"
             )
+        if behind_by:
+            resolved_ref = tracking_ref
+            base_sha = tracking_sha
+        else:
+            resolved_ref = ref
+            base_sha = requested_sha
         return BaseResolution(
             requested_ref=ref,
             requested_sha=requested_sha,
-            resolved_ref=tracking_ref,
-            base_sha=tracking_sha,
+            resolved_ref=resolved_ref,
+            base_sha=base_sha,
             tracking_ref=tracking_ref,
             tracking_sha=tracking_sha,
             behind_by=behind_by,

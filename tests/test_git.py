@@ -78,6 +78,31 @@ async def test_base_resolution_fetches_and_reports_a_stale_tracking_branch(
     assert await git.head(lane_id) == remote_head
 
 
+async def test_base_resolution_does_not_rewind_an_ahead_local_branch(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, _base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    local_head = commit(source, "src/local.py", "local\n", "local change")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_head)
+
+    git = LocalGit()
+    resolution = await git.resolve_base(lane_id, "main")
+    await git.pin_base(lane_id, resolution.base_sha)
+
+    assert resolution.requested_sha == local_head
+    assert resolution.resolved_ref == "main"
+    assert resolution.base_sha == local_head
+    assert resolution.tracking_ref == "origin/main"
+    assert resolution.tracking_sha == _base
+    assert resolution.behind_by == 0
+    assert await git.head(lane_id) == local_head
+    assert await git.is_ancestor(lane_id, resolution.base_sha, local_head)
+
+
 async def test_divergent_tracking_base_refuses_with_both_shas_and_distance(
     tmp_path: Path,
 ) -> None:
