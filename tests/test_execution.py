@@ -416,6 +416,10 @@ class FakeGit(LocalGit):
         self.commit_count_override: int | None = None
         self.commit_chain_override: list[str] | None = None
         self.validation_calls: list[list[str]] = []
+        # These fixtures assert the governed pytest command, so keep the
+        # coverage-configured repository as the default and let a test say
+        # when it is standing in for one that configures none.
+        self.coverage_configured = True
         self.clean_override: bool | None = None
         self.lane_clean_override: bool | None = None
         self.in_progress = False
@@ -428,6 +432,9 @@ class FakeGit(LocalGit):
         self.render_diff_calls: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.lane_validation_fails = False
         self.fixer_validation_fails = False
+
+    async def pytest_coverage_configured(self, worktree_id: str | None) -> bool:
+        return self.coverage_configured
 
     async def head(self, worktree_id: str) -> str:
         if worktree_id == "repo::/tmp/issue" and self.lane_head_override is not None:
@@ -3782,6 +3789,47 @@ async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
     assert not result.findings
     rejected = [event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"]
     assert any("without a shell" in str(event["payload"]) for event in rejected)
+
+
+async def test_a_repository_without_coverage_configured_is_not_given_no_cov(
+    tmp_path: Path,
+) -> None:
+    """Do not hand pytest a flag its plugin set does not define.
+
+    `--no-cov` comes from pytest-cov. A repository that configures no coverage
+    has no such option, so pytest exits on `unrecognized arguments: --no-cov`
+    before collecting anything - and it does that at the finding's base head and
+    at every fix head alike. The fix loop cannot tell that from a check that
+    genuinely fails: run 88360089 lost twelve findings that way, each with a
+    correct fixer commit on disk, because every round re-ran a command that could
+    never pass and blocked on the retry cap.
+    """
+
+    orca = FakeOrca()
+    git = FakeGit()
+    git.coverage_configured = False
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    finding = review_finding_data()
+    finding["validation"] = [
+        {"command": "pytest tests/test_git.py -q", "expected": "passes"},
+        {
+            "command": "uv run --extra dev pytest --no-cov tests/test_models.py",
+            "expected": "passes",
+        },
+    ]
+
+    await advance_to_fixer(value, orca, run_id, finding)
+
+    requirements = store.findings(run_id)[0].effective_contract.validation
+    assert [item.command for item in requirements] == [
+        "uv run --extra dev pytest -p no:cacheprovider tests/test_git.py -q",
+        "uv run --extra dev pytest -p no:cacheprovider tests/test_models.py",
+    ]
+    # The cache provider is a builtin, so that half of the governed form is
+    # always available and stays on regardless of what the repository configures.
+    assert all("--no-cov" not in item.command for item in requirements)
 
 
 async def test_supervisor_freezes_scoped_pytest_intent_as_a_runnable_command(

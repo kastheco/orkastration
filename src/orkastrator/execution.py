@@ -494,6 +494,7 @@ class ExecutionController:
             frozen.head_sha,
         ):
             raise ValueError("initial review revision does not match the worker changeset")
+        coverage_configured = await self._git.pytest_coverage_configured(stage.worktree_id)
         governed = report.model_copy(
             update={
                 "review_revision": frozen,
@@ -502,7 +503,9 @@ class ExecutionController:
                         update={
                             "review_revision": frozen,
                             "validation": [
-                                _govern_validation_requirement(requirement)
+                                _govern_validation_requirement(
+                                    requirement, coverage_configured=coverage_configured
+                                )
                                 for requirement in finding.validation
                             ],
                         }
@@ -744,7 +747,14 @@ class ExecutionController:
                 item.finding.model_copy(
                     update={
                         "validation": [
-                            _govern_validation_requirement(requirement)
+                            _govern_validation_requirement(
+                                requirement,
+                                coverage_configured=(
+                                    await self._git.pytest_coverage_configured(
+                                        stage.worktree_id
+                                    )
+                                ),
+                            )
                             for requirement in item.finding.validation
                         ]
                     }
@@ -2888,8 +2898,19 @@ def _reject_unrunnable_findings(findings: list[ReviewFinding]) -> None:
                 )
 
 
-def _govern_validation_requirement(requirement: ValidationRequirement) -> ValidationRequirement:
-    """Turn reviewer pytest intent into the repository's runnable invocation."""
+def _govern_validation_requirement(
+    requirement: ValidationRequirement, *, coverage_configured: bool = True
+) -> ValidationRequirement:
+    """Turn reviewer pytest intent into the repository's runnable invocation.
+
+    `--no-cov` is a pytest-cov flag, so it only exists where pytest-cov is loaded.
+    Adding it to a repository that does not configure coverage does not disable
+    anything: pytest exits on `unrecognized arguments: --no-cov` before collecting
+    a test, and every check governed this way fails identically forever. That is
+    not a fix that failed, but it is indistinguishable from one, so the loop spends
+    its adjudications and blocks the lane. Add the flag where the repository asked
+    for coverage, which is where it is both needed and accepted.
+    """
 
     try:
         arguments = shlex.split(requirement.command)
@@ -2902,7 +2923,9 @@ def _govern_validation_requirement(requirement: ValidationRequirement) -> Valida
     pytest_arguments = _without_supervisor_pytest_flags(pytest_arguments)
     governed = ["uv", "run", "--extra", "dev", "pytest"]
     if already_safe or _is_scoped_pytest(pytest_arguments):
-        governed.extend(("--no-cov", "-p", "no:cacheprovider"))
+        if coverage_configured:
+            governed.append("--no-cov")
+        governed.extend(("-p", "no:cacheprovider"))
     governed.extend(pytest_arguments)
     return requirement.model_copy(
         update={"command": shlex.join(governed), "baseline_result": None}
