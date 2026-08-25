@@ -321,6 +321,52 @@ def test_watch_survives_a_terminal_lane_while_another_stage_is_dispatched(
     assert payload["exit_reason"] == "terminal_graph"
 
 
+@pytest.mark.parametrize("terminal_phase", [LanePhase.BLOCKED, LanePhase.FAILED])
+def test_watch_survives_every_lane_terminal_while_a_stage_is_still_dispatched(
+    fake_wiring: None, terminal_phase: LanePhase
+) -> None:
+    """A lane reaches its terminal phase before its last stage comes back.
+
+    A finding blocks the lane the moment it is adjudicated, but the escalation or
+    fixer stage that produced that verdict is still a live Orca task, and so are
+    the stages of any other lane whose own findings blocked this tick. Reading the
+    lane phases alone therefore says the graph is finished while work is still
+    dispatched, and the watch exits on the tick that would have collected it. Only
+    a graph with nothing in flight is actually finished.
+    """
+
+    FakeController.monitor_results = [
+        StatusResult(
+            run_id="run-1",
+            status=terminal_phase.value,
+            lanes=[StatusLane(phase=terminal_phase), StatusLane(phase=terminal_phase)],
+            stages=[StatusStage(phase=StagePhase.DISPATCHED)],
+        ),
+        StatusResult(
+            run_id="run-1",
+            status=terminal_phase.value,
+            lanes=[StatusLane(phase=terminal_phase), StatusLane(phase=terminal_phase)],
+            stages=[StatusStage(phase=StagePhase.STARTING)],
+        ),
+        StatusResult(
+            run_id="run-1",
+            status=terminal_phase.value,
+            lanes=[StatusLane(phase=terminal_phase), StatusLane(phase=terminal_phase)],
+            stages=[StatusStage(phase=StagePhase.COMPLETED)],
+        ),
+    ]
+
+    result = runner.invoke(
+        cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"]
+    )
+
+    assert result.exit_code == 0
+    # Every queued tick was consumed, so the watch did not stop on either of the
+    # two where a stage was still in flight.
+    assert FakeController.monitor_results == []
+    assert json.loads(result.stdout)["exit_reason"] == "terminal_graph"
+
+
 def test_answer_reads_the_body_from_a_file(fake_wiring: None, tmp_path: Path) -> None:
     """A five-part direction is not something anyone types onto a command line."""
 

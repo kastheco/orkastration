@@ -19,9 +19,9 @@ from orkastrator.execution import ExecutionController
 from orkastrator.git import GitError
 from orkastrator.locks import RunLockedError, held_runs, run_lock
 from orkastrator.models import (
+    TERMINAL_LANE_PHASES,
     FindingPhase,
     FindingReason,
-    LanePhase,
     PolicyReauthorization,
     StagePhase,
     SupervisorPlan,
@@ -159,8 +159,7 @@ def monitor(
             if result.questions:
                 return result.model_copy(update={"exit_reason": "unanswered_question"})
             terminal_lanes = bool(result.lanes) and all(
-                lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}
-                for lane in result.lanes
+                lane.phase in TERMINAL_LANE_PHASES for lane in result.lanes
             )
             in_flight = any(
                 stage.phase in {StagePhase.STARTING, StagePhase.DISPATCHED}

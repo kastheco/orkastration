@@ -46,6 +46,15 @@ class LanePhase(StrEnum):
     FAILED = "failed"
 
 
+TERMINAL_LANE_PHASES = frozenset({LanePhase.BLOCKED, LanePhase.COMPLETE, LanePhase.FAILED})
+"""Lane phases nothing in the graph moves a lane out of on its own.
+
+A blocked lane is as finished as a complete one from the graph's side: only an
+owner reopening a finding restarts it. Naming the set once keeps a caller asking
+whether a run still has work from having to restate which phases those are.
+"""
+
+
 class StagePhase(StrEnum):
     """Locally observed Orca Task lifecycle."""
 
