@@ -3841,42 +3841,39 @@ def test_a_reopened_stage_no_longer_counts_toward_its_family() -> None:
     assert _next_key(settled | {base}, base) == f"{base}:retry1"
 
 
-def test_a_retired_reopened_failure_no_longer_latches_its_lane(tmp_path: Path) -> None:
+async def test_a_retired_reopened_failure_no_longer_latches_its_lane(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, store = controller(tmp_path, orca)
     run_id = value.propose(proposal()).run_id
-    lane = store.lanes(run_id)[0]
-    store.record_initial_review(
-        run_id,
-        lane.lane_id,
-        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
-    )
-    finding = store.findings(run_id)[0]
-    stage = store.ensure_stage(
-        run_id,
-        lane.lane_id,
-        stage_key=f"{lane.lane_id}:{finding.finding_id}:re-review:1",
-        role=StageKind.RE_REVIEWER,
-        finding_key=finding.finding_key,
-        finding_id=finding.finding_id,
-        round=1,
-    )
-    store.bind_stage_task(run_id, stage.stage_id, "failed-task")
-    store.sync_stage(run_id, stage.stage_id, StagePhase.FAILED, None)
-    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
 
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    failed_stage = next(
+        stage
+        for stage in store.stages(run_id)
+        if stage.role is StageKind.RE_REVIEWER
+    )
+    orca.fail_dispatched()
+    await value.monitor(run_id)
+
+    finding = store.findings(run_id)[0]
     store.reopen_finding(
         run_id,
         finding.finding_id,
         phase=FindingPhase.PENDING_RE_REVIEW,
-        note="replace the failed attempt",
+        note="replace the failed re-review attempt",
     )
+    recovered = await value.monitor(run_id)
 
-    retired = next(item for item in store.stages(run_id) if item.stage_id == stage.stage_id)
+    retired = next(
+        item for item in store.stages(run_id) if item.stage_id == failed_stage.stage_id
+    )
     assert retired.phase is StagePhase.FAILED
     assert ":reopened" in retired.stage_key
-    assert value._derive_status(run_id) == "active"
-    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
+    assert recovered.status == "active"
+    assert recovered.lanes[0].phase is LanePhase.ACTIVE
 
 
 async def test_a_conflict_retry_is_rebuilt_on_the_lane_head_it_has_to_land_on(
