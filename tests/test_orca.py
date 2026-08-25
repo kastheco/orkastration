@@ -308,6 +308,37 @@ async def test_start_worker_reuses_lane_worktree() -> None:
     assert "id:repo::/tmp/issue-123" in runner.calls[0]
 
 
+async def test_start_worker_rejects_a_reported_failure() -> None:
+    runner = FakeRunner(
+        [{"ok": True, "result": {"state": "failed", "dispatchId": "dispatch-2"}}]
+    )
+
+    with pytest.raises(OrcaError, match="worker start reported failure"):
+        await OrcaClient(runner).start_worker(
+            task_id="task-2",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id="repo::/tmp/issue-123",
+            orca_run_id="run-1",
+            profile=profile(),
+        )
+
+
+async def test_start_worker_does_not_require_a_reported_state() -> None:
+    runner = FakeRunner([{"ok": True, "result": {"dispatchId": "dispatch-2"}}])
+
+    dispatch_id, _, _, _ = await OrcaClient(runner).start_worker(
+        task_id="task-2",
+        lane_name="issue-123",
+        repo_selector="id:repo",
+        worktree_id="repo::/tmp/issue-123",
+        orca_run_id="run-1",
+        profile=profile(),
+    )
+
+    assert dispatch_id == "dispatch-2"
+
+
 async def test_start_fixer_uses_child_worktree_at_exact_review_head() -> None:
     runner = FakeRunner(
         [
@@ -469,6 +500,38 @@ async def test_fast_worker_rejects_unsupported_agent() -> None:
             orca_run_id="run-1",
             profile=profile(agent="omp", fast=True),
         )
+
+
+async def test_failed_fast_worker_start_closes_its_terminal() -> None:
+    runner = FakeRunner(
+        [
+            {"ok": True, "result": {"terminalHandle": "terminal-1"}},
+            {"ok": True, "result": {"wait": {"satisfied": True}}},
+            {
+                "ok": True,
+                "result": {"state": "failed", "dispatchId": "dispatch-1"},
+            },
+            {"ok": True, "result": {}},
+        ]
+    )
+
+    with pytest.raises(OrcaError, match="worker start reported failure"):
+        await OrcaClient(runner).start_worker(
+            task_id="task-1",
+            lane_name="issue-123",
+            repo_selector="id:repo",
+            worktree_id="repo::/tmp/issue-123",
+            orca_run_id="run-1",
+            profile=profile(fast=True),
+        )
+
+    assert runner.calls[-1] == (
+        "terminal",
+        "close",
+        "--terminal",
+        "terminal-1",
+        "--json",
+    )
 
 
 @pytest.mark.parametrize(
@@ -792,6 +855,7 @@ async def test_a_terminal_that_never_went_idle_refuses_the_start_by_its_reason()
                 },
             },
             {"ok": True, "result": {}},
+            {"ok": True, "result": {}},
         ]
     )
 
@@ -829,6 +893,7 @@ async def test_a_failed_start_leaves_a_caller_supplied_worktree_alone() -> None:
                 "ok": True,
                 "result": {"wait": {"satisfied": False, "blockedReason": "login-required"}},
             },
+            {"ok": True, "result": {}},
         ]
     )
 
@@ -856,6 +921,7 @@ async def test_cleanup_failure_does_not_replace_the_start_failure() -> None:
                 "ok": True,
                 "result": {"wait": {"satisfied": False, "blockedReason": "codex-trust-prompt"}},
             },
+            {"ok": False, "error": {"code": "terminal_busy", "message": "in use"}},
             {"ok": False, "error": {"code": "worktree_busy", "message": "in use"}},
         ]
     )

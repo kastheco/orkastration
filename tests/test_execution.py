@@ -2312,6 +2312,33 @@ async def test_one_stage_that_cannot_start_does_not_park_the_rest_of_the_wave(
     assert "task_not_startable" in str(failures[0]["detail"])
 
 
+async def test_repeated_start_failures_block_the_lane_instead_of_redispatching(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    orca.refuse_starts.add("task-1")
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+
+    await value.accept(run_id)
+    result = await value.monitor(run_id)
+
+    stage = store.stages(run_id)[0]
+    assert stage.phase is StagePhase.FAILED
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert result.status == "blocked"
+    failures = [
+        event for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ]
+    assert len(failures) == 3
+
+    await value.monitor(run_id)
+
+    assert [
+        event for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ] == failures
+
+
 async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
     tmp_path: Path,
 ) -> None:
@@ -2346,6 +2373,45 @@ async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
     assert adopted.orca_dispatch_id == "dispatch-1"
     # Adopted, never started twice.
     assert [start["task_id"] for start in orca.starts] == ["task-1", "task-2"]
+
+
+async def test_recovered_dispatch_clears_the_start_failure_streak(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    orca.refuse_starts.add("task-1")
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+
+    await value.accept(run_id)
+    assert len(
+        [event for event in store.events(run_id) if event["kind"] == "stage_start_failed"]
+    ) == 2
+
+    orca.refuse_starts.remove("task-1")
+    orca.timeout_starts.add("task-1")
+    await value.monitor(run_id)
+    await value.monitor(run_id)
+
+    stage = store.stages(run_id)[0]
+    assert any(
+        event["kind"] == "stage_started"
+        and event["payload"].get("recovered") is True
+        and event["payload"].get("stage_id") == stage.stage_id
+        for event in store.events(run_id)
+    )
+    store.sync_stage(run_id, stage.stage_id, StagePhase.READY, None)
+    store.release_dead_dispatch(run_id, store.stages(run_id)[0])
+    orca.refuse_starts.add("task-1")
+    await value._start_ready(run_id)
+
+    failures = [
+        event
+        for event in store.events(run_id)
+        if event["kind"] == "stage_start_failed" and event["payload"]["released"] is True
+    ]
+    assert len(failures) == 3
+    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
 
 
 async def test_a_blocked_lane_does_not_stop_a_lane_that_is_still_working(

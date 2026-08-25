@@ -200,6 +200,15 @@ class ExecutionController:
         for stage in self._store.stages(run_id):
             if stage.orca_task_id is None:
                 continue
+            if (
+                stage.phase is StagePhase.FAILED
+                and stage.orca_dispatch_id is None
+                and lanes[stage.lane_id].phase is LanePhase.BLOCKED
+            ):
+                # A start-retry ceiling is a local refusal to dispatch again.
+                # Orca's Task remains ready because no worker ever started, so
+                # syncing that state back would erase the ceiling every tick.
+                continue
             task_id = stage.orca_task_id
             task = by_id.get(task_id)
             if task is None:
@@ -226,7 +235,11 @@ class ExecutionController:
                     stage.stage_id,
                     dispatch_id,
                     worktree_id,
-                    {"recovered": True, "dispatchId": dispatch_id},
+                    {
+                        "recovered": True,
+                        "dispatchId": dispatch_id,
+                        "stage_id": stage.stage_id,
+                    },
                 )
                 stage = stage.model_copy(update={"orca_dispatch_id": dispatch_id})
                 phase = StagePhase.DISPATCHED
@@ -256,7 +269,11 @@ class ExecutionController:
                     stage.stage_id,
                     dispatch_id,
                     worktree_id,
-                    {"recovered": True, "dispatchId": dispatch_id},
+                    {
+                        "recovered": True,
+                        "dispatchId": dispatch_id,
+                        "stage_id": stage.stage_id,
+                    },
                 )
             result_json = _task_result_json(task)
             self._store.sync_stage(
@@ -1698,7 +1715,29 @@ class ExecutionController:
                 # what raising out of this loop did.
                 self._store.reset_stage_reservation(run_id, stage)
                 self._store.record_stage_start_failure(run_id, stage, str(exc), released=True)
+                attempts = self._start_failure_streak(run_id, stage.stage_id)
+                if attempts >= _STAGE_START_ATTEMPTS:
+                    self._store.sync_stage(run_id, stage.stage_id, StagePhase.FAILED, None)
+                    self._store.block_lane(
+                        run_id,
+                        stage.lane_id,
+                        f"stage {stage.stage_key} failed to start {attempts} times: {exc}",
+                    )
         return started
+
+    def _start_failure_streak(self, run_id: str, stage_id: str) -> int:
+        """Count refused starts since this stage last started successfully."""
+
+        attempts = 0
+        for event in reversed(self._store.events(run_id)):
+            payload = event["payload"]
+            if not isinstance(payload, dict) or payload.get("stage_id") != stage_id:
+                continue
+            if event["kind"] == "stage_started":
+                break
+            if event["kind"] == "stage_start_failed" and payload.get("released") is True:
+                attempts += 1
+        return attempts
 
     async def _launch(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> StageLaunch:
         """Start one already-reserved stage, or raise without having started it."""
@@ -1749,7 +1788,7 @@ class ExecutionController:
             stage.stage_id,
             dispatch_id,
             worktree_id,
-            payload,
+            {**payload, "stage_id": stage.stage_id},
             terminal_handle,
             start_head_sha,
         )
@@ -2717,6 +2756,7 @@ _SETTLED_STAGES = frozenset({StagePhase.COMPLETED, StagePhase.FAILED, StagePhase
 # guesswork that goes stale. Counting them needs no taxonomy: the transient case
 # clears itself on the next tick, and the real one does not.
 _PUBLICATION_ATTEMPTS = 3
+_STAGE_START_ATTEMPTS = 3
 _PYTEST_SUMMARY_DURATION = re.compile(
     r"^(?P<prefix>(?:\d+ (?:failed|passed|errors?|skipped|warnings?|xfailed|xpassed|"
     r"deselected|subtests passed)\b|no tests ran\b)[^\n]*?)"
