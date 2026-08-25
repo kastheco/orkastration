@@ -1469,7 +1469,9 @@ class ExecutionController:
             recoverable = [
                 task
                 for task in remote_tasks
-                if task.get("spec") == spec and _task_id(task) not in locally_bound
+                if task.get("spec") == spec
+                and _task_id(task) not in locally_bound
+                and _task_phase(task) is StagePhase.READY
             ]
             if len(recoverable) > 1:
                 raise ValueError(f"multiple unbound Orca Tasks match stage {stage.stage_key}")
@@ -1868,19 +1870,23 @@ class ExecutionController:
         for lane in self._store.lanes(run_id):
             lane_stages = [stage for stage in stages if stage.lane_id == lane.lane_id]
             lane_findings = by_lane_findings.get(lane.lane_id, [])
-            # Only a failure nothing has answered condemns the lane. A rejected
-            # stage is marked processed by the rejection that routed it onward,
-            # and its finding then runs another round; counting that stage
-            # forever left a lane permanently failed while its own findings were
-            # resolving, which is a status no later event could clear.
-            if lane.phase is LanePhase.FAILED or any(
-                stage.phase is StagePhase.FAILED and not stage.processed for stage in lane_stages
-            ):
-                phase = LanePhase.FAILED
-            elif lane.phase is LanePhase.BLOCKED or any(
+            # A lane phase is derived state, not another failure witness. In
+            # particular, carrying FAILED forward here made it impossible for a
+            # later round to recover the lane even after the stage that caused
+            # it stopped governing any live work.
+            if lane.phase is LanePhase.BLOCKED or any(
                 finding.phase is FindingPhase.BLOCKED for finding in lane_findings
             ):
                 phase = LanePhase.BLOCKED
+            elif self._live_failed_stages(lane_stages, lane_findings):
+                phase = LanePhase.FAILED
+            elif lane.phase is LanePhase.FAILED and not any(
+                stage.phase is StagePhase.FAILED for stage in lane_stages
+            ):
+                # A FAILED lane without a failed stage was set by a rejected
+                # lane-level contract or an explicit supervisor action. There
+                # is no superseded attempt proving it is safe to lift.
+                phase = LanePhase.FAILED
             else:
                 reviewed = any(
                     stage.role is StageKind.INITIAL_REVIEWER and stage.processed
@@ -1938,7 +1944,7 @@ class ExecutionController:
 
         self._require_authorization(run_id)
         for lane in self._store.lanes(run_id):
-            if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}:
+            if lane.phase in {LanePhase.BLOCKED, LanePhase.COMPLETE}:
                 # A complete lane is finished: its head is published, its pull
                 # request is out of draft and its required checks passed for that
                 # exact head. Coming back to it every tick re-edits the pull
@@ -1949,6 +1955,33 @@ class ExecutionController:
                 # blocks the lane and takes the whole run terminal. Merging is the
                 # outcome this lane was working toward, so stop here.
                 continue
+            failed = self._live_failed_stages(
+                [stage for stage in self._store.stages(run_id) if stage.lane_id == lane.lane_id],
+                self._store.findings(run_id, lane.lane_id),
+            )
+            if failed:
+                stage = failed[0]
+                self._store.block_lane(
+                    run_id,
+                    lane.lane_id,
+                    f"live failed stage {stage.stage_key} ({stage.stage_id}) "
+                    "requires supervisor recovery before publication",
+                )
+                continue
+            if lane.phase is LanePhase.FAILED:
+                if any(
+                    stage.phase is StagePhase.FAILED
+                    for stage in self._store.stages(run_id)
+                    if stage.lane_id == lane.lane_id
+                ):
+                    # FAILED was persisted by an attempt that no longer governs
+                    # the lane. Clear the stale derived value before publication
+                    # so a fully resolved lane can finish on this reconciliation.
+                    self._store.set_lane_phase(run_id, lane.lane_id, LanePhase.ACTIVE)
+                else:
+                    # No superseded stage explains this failure, so it remains
+                    # an explicit lane-level failure and must not be published.
+                    continue
             if not self._local_lane_settled(run_id, lane):
                 continue
             unintegrated = self._unintegrated_resolved(run_id, lane)
@@ -1967,6 +2000,7 @@ class ExecutionController:
                     + " has no integrated fix",
                 )
                 continue
+
             if lane.integration_head_sha is None:
                 self._store.block_lane(run_id, lane.lane_id, "lane has no integrated head")
                 continue
@@ -2051,6 +2085,38 @@ class ExecutionController:
                         lane.lane_id,
                         f"{exc} (unchanged over {attempts} publication passes)",
                     )
+
+    @staticmethod
+    def _live_failed_stages(
+        stages: list[StageRecord], findings: list[FindingRecord]
+    ) -> list[StageRecord]:
+        """Return failed attempts that still govern unfinished lane work.
+
+        Reopen preserves attempt rows by renaming their keys, so the marker is
+        the durable retirement boundary. Finding stages also stop governing
+        once rejection routed them onward, their finding advanced to another
+        round, or the finding settled. Lane-level worker and initial-review
+        failures remain live because no finding transition can replace them.
+        """
+
+        by_id = {finding.finding_id: finding for finding in findings}
+        live: list[StageRecord] = []
+        for stage in stages:
+            if stage.phase is not StagePhase.FAILED or ":reopened" in stage.stage_key:
+                continue
+            if stage.finding_id is None:
+                live.append(stage)
+                continue
+            finding = by_id.get(stage.finding_id)
+            if finding is None:
+                live.append(stage)
+                continue
+            if finding.phase in {FindingPhase.RESOLVED, FindingPhase.DEFERRED}:
+                continue
+            if stage.round != finding.round or stage.processed:
+                continue
+            live.append(stage)
+        return live
 
     async def _record_publication_conflict(
         self, run_id: str, lane: LaneRecord, detail: str

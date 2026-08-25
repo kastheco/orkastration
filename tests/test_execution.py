@@ -21,6 +21,7 @@ from orkastrator.models import (
     FindingPhase,
     FindingReason,
     GraphResult,
+    InitialReviewReport,
     LanePhase,
     LaneRecord,
     PublicationReceipt,
@@ -377,6 +378,12 @@ class FakeOrca:
             }
         )
         self._refresh_ready()
+
+    def fail_dispatched(self) -> None:
+        for task in self.tasks_by_id.values():
+            if task["status"] == "dispatched":
+                task["status"] = "failed"
+                task["result"] = None
 
     def _refresh_ready(self) -> None:
         for task_id, dependencies in self.dependencies.items():
@@ -2236,6 +2243,28 @@ async def test_restart_recovers_task_created_before_local_binding(tmp_path: Path
     assert len(result.started) == 1
 
 
+async def test_restart_refuses_a_failed_unbound_task_and_mints_a_ready_one(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    orca.fail_after_task_create = True
+
+    with pytest.raises(RuntimeError, match="remote task creation"):
+        await value.accept(run_id)
+    orca.tasks_by_id["task-1"]["status"] = "failed"
+
+    restarted = ExecutionController(
+        config=config(), orca=orca, store=store, git=FakeGit(), publisher=FakePublisher()
+    )
+    result = await restarted.accept(run_id)
+
+    assert len(orca.tasks_by_id) == 2
+    assert result.stages[0].orca_task_id == "task-2"
+    assert [launch.task_id for launch in result.started] == ["task-2"]
+
+
 async def test_restart_recovers_run_created_before_local_binding(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, store = controller(tmp_path, orca)
@@ -2667,6 +2696,70 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     assert publisher.publish_calls == [("b" * 40, None)]
     assert store.publications(run_id)[0].draft
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
+
+
+async def test_failed_round_one_reviewer_does_not_stop_resolved_round_two_publication(
+    tmp_path: Path,
+) -> None:
+    """Reproduce run 3a900761: old stage wreckage is not current lane state."""
+
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.fail_dispatched()
+    failed = await value.monitor(run_id)
+    assert failed.findings[0].phase is FindingPhase.ESCALATING
+
+    orca.complete_dispatched(escalation("ambiguous_result", "approve_unchanged"))
+    retried = await value.monitor(run_id)
+    assert retried.findings[0].round == 2
+    assert retried.findings[0].phase is FindingPhase.FIXING
+
+    orca.complete_dispatched(fix_attempt(round=2))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", round=2))
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert result.lanes[0].phase is LanePhase.COMPLETE
+    assert publisher.publish_calls
+    failed_stage = next(
+        stage
+        for stage in store.stages(run_id)
+        if stage.role is StageKind.RE_REVIEWER and stage.round == 1
+    )
+    assert failed_stage.phase is StagePhase.FAILED
+
+
+async def test_live_failed_worker_blocks_publication_with_the_stage_identity(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    worker = store.stages(run_id)[0]
+
+    orca.fail_dispatched()
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    payload = blocked[-1]["payload"]
+    assert isinstance(payload, dict)
+    reason = payload["reason"]
+    assert isinstance(reason, str)
+    assert worker.stage_key in reason
+    assert worker.stage_id in reason
 
 
 async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(
@@ -3718,6 +3811,44 @@ def test_a_reopened_stage_no_longer_counts_toward_its_family() -> None:
     # escalation ceiling then read as a loop and blocked on the next tick.
     assert _next_key(settled, base) == base
     assert _next_key(settled | {base}, base) == f"{base}:retry1"
+
+
+def test_a_retired_reopened_failure_no_longer_latches_its_lane(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    stage = store.ensure_stage(
+        run_id,
+        lane.lane_id,
+        stage_key=f"{lane.lane_id}:{finding.finding_id}:re-review:1",
+        role=StageKind.RE_REVIEWER,
+        finding_key=finding.finding_key,
+        finding_id=finding.finding_id,
+        round=1,
+    )
+    store.bind_stage_task(run_id, stage.stage_id, "failed-task")
+    store.sync_stage(run_id, stage.stage_id, StagePhase.FAILED, None)
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+
+    store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_RE_REVIEW,
+        note="replace the failed attempt",
+    )
+
+    retired = next(item for item in store.stages(run_id) if item.stage_id == stage.stage_id)
+    assert retired.phase is StagePhase.FAILED
+    assert ":reopened" in retired.stage_key
+    assert value._derive_status(run_id) == "active"
+    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
 
 
 async def test_a_conflict_retry_is_rebuilt_on_the_lane_head_it_has_to_land_on(
