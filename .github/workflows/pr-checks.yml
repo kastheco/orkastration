@@ -19,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # test_an_absence_check_passes_on_its_own_expected_exit runs a real
+      # `rg` and asserts on its exit status. ripgrep is not on the runner
+      # image, so without this the command exits 127 and the test reads a
+      # missing binary as a failing absence check.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - uses: astral-sh/setup-uv@v5
         with:
           version: "0.12.5"
