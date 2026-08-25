@@ -21,7 +21,6 @@ from orkastrator.models import (
     FindingPhase,
     FindingReason,
     GraphResult,
-    InitialReviewReport,
     LanePhase,
     LaneRecord,
     PublicationReceipt,
@@ -2784,7 +2783,9 @@ async def test_resuming_live_failed_worker_retries_without_reblocking(
     assert resumed_result.status == "active"
     assert resumed_result.lanes[0].phase is LanePhase.ACTIVE
     assert failed_worker.stage_id in {stage.stage_id for stage in resumed_result.stages}
-    retired = next(stage for stage in resumed_result.stages if stage.stage_id == failed_worker.stage_id)
+    retired = next(
+        stage for stage in resumed_result.stages if stage.stage_id == failed_worker.stage_id
+    )
     assert retired.phase is StagePhase.FAILED
     assert ":resumed" in retired.stage_key
     assert len([event for event in store.events(run_id) if event["kind"] == "lane_blocked"]) == 1
