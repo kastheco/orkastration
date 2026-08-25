@@ -10,6 +10,16 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 GitObjectId = Annotated[str, StringConstraints(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
+TranscribedGitObjectId = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+"""A sha as an agent wrote it down, on a field the supervisor resolves from Git anyway.
+
+An agent is not the authority on any sha here: the supervisor chose the base and Git
+holds the head, and both are overwritten before anything reads them. Enforcing the exact
+object-id shape at parse therefore buys nothing and costs the whole report, because a
+report that fails to parse takes the commit it was describing with it. Run 40c115ec lost
+a correct, scoped, fully green fix over the seven characters `56f39ff`. Accept what was
+written and let Git settle what it meant.
+"""
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 FindingId = Annotated[
     str,
@@ -393,8 +403,8 @@ class FixAttempt(WorkflowContract):
     finding_id: FindingId
     round: int = Field(ge=1, le=2)
     status: Literal["fixed", "blocked_scope", "capability_mismatch"]
-    base_sha: GitObjectId
-    commit_sha: GitObjectId | None
+    base_sha: TranscribedGitObjectId
+    commit_sha: TranscribedGitObjectId | None
     changed_paths: list[str] = Field(default_factory=list, max_length=128)
     validation_results: list[ValidationResult] = Field(default_factory=list, max_length=64)
     scope_expansion_required: ScopeExpansionRequest | None
