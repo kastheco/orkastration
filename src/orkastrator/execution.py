@@ -235,7 +235,11 @@ class ExecutionController:
                     stage.stage_id,
                     dispatch_id,
                     worktree_id,
-                    {"recovered": True, "dispatchId": dispatch_id},
+                    {
+                        "recovered": True,
+                        "dispatchId": dispatch_id,
+                        "stage_id": stage.stage_id,
+                    },
                 )
                 stage = stage.model_copy(update={"orca_dispatch_id": dispatch_id})
                 phase = StagePhase.DISPATCHED
@@ -265,7 +269,11 @@ class ExecutionController:
                     stage.stage_id,
                     dispatch_id,
                     worktree_id,
-                    {"recovered": True, "dispatchId": dispatch_id},
+                    {
+                        "recovered": True,
+                        "dispatchId": dispatch_id,
+                        "stage_id": stage.stage_id,
+                    },
                 )
             result_json = _task_result_json(task)
             self._store.sync_stage(
