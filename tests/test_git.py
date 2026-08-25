@@ -6,7 +6,9 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-from orkastrator.git import LocalGit, worktree_path
+import pytest
+
+from orkastrator.git import GitError, LocalGit, worktree_path
 from orkastrator.models import ValidationRequirement
 
 
@@ -43,6 +45,161 @@ def repository(tmp_path: Path) -> tuple[Path, str]:
 def add_worktree(repo: Path, path: Path, branch: str, base: str) -> str:
     run(repo, "git", "worktree", "add", "-b", branch, str(path), base)
     return f"repo::{path}"
+
+
+async def test_base_resolution_fetches_and_reports_a_stale_tracking_branch(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, local_base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_base)
+    run(source, "git", "branch", "--set-upstream-to", "origin/main", "main")
+
+    other = tmp_path / "other"
+    run(tmp_path, "git", "clone", str(remote), str(other))
+    run(other, "git", "config", "user.name", "orkastrator test")
+    run(other, "git", "config", "user.email", "orkastrator@example.test")
+    run(other, "git", "checkout", "main")
+    remote_head = commit(other, "src/remote.py", "remote\n", "remote change")
+    run(other, "git", "push", "origin", "main")
+
+    git = LocalGit()
+    resolution = await git.resolve_base(lane_id, "main")
+    await git.pin_base(lane_id, resolution.base_sha)
+
+    assert resolution.requested_sha == local_base
+    assert resolution.resolved_ref == "origin/main"
+    assert resolution.base_sha == remote_head
+    assert resolution.tracking_sha == remote_head
+    assert resolution.behind_by == 1
+    assert await git.head(lane_id) == remote_head
+
+
+async def test_base_resolution_ignores_an_unrelated_unreachable_remote(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, local_base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_base)
+    run(source, "git", "branch", "--set-upstream-to", "origin/main", "main")
+
+    other = tmp_path / "other"
+    run(tmp_path, "git", "clone", str(remote), str(other))
+    run(other, "git", "config", "user.name", "orkastrator test")
+    run(other, "git", "config", "user.email", "orkastrator@example.test")
+    run(other, "git", "checkout", "main")
+    remote_head = commit(other, "src/remote.py", "remote\n", "remote change")
+    run(other, "git", "push", "origin", "main")
+    run(source, "git", "remote", "add", "upstream", str(tmp_path / "missing.git"))
+
+    resolution = await LocalGit().resolve_base(lane_id, "main")
+
+    assert resolution.requested_sha == local_base
+    assert resolution.resolved_ref == "origin/main"
+    assert resolution.base_sha == remote_head
+    assert resolution.tracking_sha == remote_head
+    assert resolution.behind_by == 1
+
+
+async def test_base_resolution_falls_back_when_tracking_branch_was_pruned(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, local_base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    run(source, "git", "checkout", "-b", "feature")
+    run(source, "git", "push", "-u", "origin", "feature")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_base)
+
+    other = tmp_path / "other"
+    run(tmp_path, "git", "clone", str(remote), str(other))
+    run(other, "git", "fetch", "origin", "feature")
+    run(other, "git", "checkout", "-b", "feature", "FETCH_HEAD")
+    run(other, "git", "push", "origin", "--delete", "feature")
+
+    resolution = await LocalGit().resolve_base(lane_id, "feature")
+
+    assert resolution.requested_sha == local_base
+    assert resolution.resolved_ref == "feature"
+    assert resolution.base_sha == local_base
+    assert resolution.tracking_ref is None
+    assert resolution.tracking_sha is None
+    assert resolution.behind_by == 0
+
+
+async def test_base_resolution_does_not_rewind_an_ahead_local_branch(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, _base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    local_head = commit(source, "src/local.py", "local\n", "local change")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_head)
+
+    git = LocalGit()
+    resolution = await git.resolve_base(lane_id, "main")
+    await git.pin_base(lane_id, resolution.base_sha)
+
+    assert resolution.requested_sha == local_head
+    assert resolution.resolved_ref == "main"
+    assert resolution.base_sha == local_head
+    assert resolution.tracking_ref == "origin/main"
+    assert resolution.tracking_sha == _base
+    assert resolution.behind_by == 0
+    assert await git.head(lane_id) == local_head
+    assert await git.is_ancestor(lane_id, resolution.base_sha, local_head)
+
+
+async def test_divergent_tracking_base_refuses_with_both_shas_and_distance(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    run(tmp_path, "git", "init", "--bare", str(remote))
+    source, _base = repository(tmp_path)
+    run(source, "git", "remote", "add", "origin", str(remote))
+    run(source, "git", "push", "-u", "origin", "main")
+    local_head = commit(source, "src/local.py", "local\n", "local change")
+    lane_id = add_worktree(source, tmp_path / "lane", "lane", local_head)
+
+    other = tmp_path / "other"
+    run(tmp_path, "git", "clone", str(remote), str(other))
+    run(other, "git", "config", "user.name", "orkastrator test")
+    run(other, "git", "config", "user.email", "orkastrator@example.test")
+    run(other, "git", "checkout", "main")
+    remote_head = commit(other, "src/remote.py", "remote\n", "remote change")
+    run(other, "git", "push", "origin", "main")
+
+    with pytest.raises(GitError) as failure:
+        await LocalGit().resolve_base(lane_id, "main")
+
+    message = str(failure.value)
+    assert local_head in message
+    assert remote_head in message
+    assert "1 commit(s) behind" in message
+
+
+async def test_explicit_older_commit_remains_the_requested_base(tmp_path: Path) -> None:
+    repo, older = repository(tmp_path)
+    newer = commit(repo, "src/newer.py", "newer\n", "newer")
+    lane_id = add_worktree(repo, tmp_path / "lane", "lane", newer)
+
+    resolution = await LocalGit().resolve_base(lane_id, older)
+
+    assert resolution.requested_ref == older
+    assert resolution.resolved_ref == older
+    assert resolution.base_sha == older
+    assert resolution.tracking_ref is None
+    assert resolution.behind_by == 0
 
 
 async def test_disjoint_fixer_commits_integrate_serially(tmp_path: Path) -> None:

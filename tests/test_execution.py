@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
 from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
 from orkastrator.execution import ExecutionController, _format_frozen_diff, _next_key
-from orkastrator.git import GitCommandResult, GitError, LocalGit
+from orkastrator.git import BaseResolution, GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
     CiReceipt,
@@ -98,10 +98,12 @@ def proposal(*, lane_count: int = 1, next_action: str = "propose_lanes") -> Supe
     )
 
 
-def worker_result() -> str:
+def worker_result(*, base_sha: str = "a" * 40) -> str:
+    revision = review_finding_data()["review_revision"]
+    assert isinstance(revision, dict)
     return json.dumps(
         {
-            "review_revision": review_finding_data()["review_revision"],
+            "review_revision": {**revision, "base_sha": base_sha},
             "commit_sha": "b" * 40,
             "changed_paths": ["src/file1.py"],
             "validation_results": [{"command": "pytest", "status": "passed", "output": "passed"}],
@@ -401,6 +403,16 @@ class FakeGit(LocalGit):
         self.heads: dict[str, str] = {"repo::/tmp/issue": "b" * 40}
         self.resolved_refs = {"HEAD": "a" * 40, "main": "a" * 40}
         self.resolve_calls: list[tuple[str, str]] = []
+        self.base_resolution = BaseResolution(
+            requested_ref="main",
+            requested_sha="a" * 40,
+            resolved_ref="origin/main",
+            base_sha="a" * 40,
+            tracking_ref="origin/main",
+            tracking_sha="a" * 40,
+        )
+        self.fetch_calls: list[str] = []
+        self.pin_calls: list[tuple[str, str]] = []
         self.integrated: dict[str, str] = {}
         self.changed_override: list[str] | None = None
         self.head_override: str | None = None
@@ -488,6 +500,14 @@ class FakeGit(LocalGit):
     async def resolve_ref(self, worktree_id: str, ref: str) -> str:
         self.resolve_calls.append((worktree_id, ref))
         return self.resolved_refs.get(ref, "a" * 40)
+
+    async def resolve_base(self, worktree_id: str, ref: str) -> BaseResolution:
+        self.fetch_calls.append(worktree_id)
+        self.resolve_calls.append((worktree_id, ref))
+        return self.base_resolution
+
+    async def pin_base(self, worktree_id: str, base_sha: str) -> None:
+        self.pin_calls.append((worktree_id, base_sha))
 
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
         if self.diff_sha256_override is not None and worktree_id == "repo::/tmp/issue":
@@ -665,24 +685,39 @@ async def test_worker_validation_uses_the_base_frozen_when_its_lane_started(
 ) -> None:
     git = FakeGit()
 
-    class MovingRefOrca(FakeOrca):
-        async def create_worktree(self, **kwargs: object) -> tuple[str, JsonObject]:
-            created = await super().create_worktree(**kwargs)
-            git.resolved_refs["main"] = "d" * 40
-            return created
-
-    orca = MovingRefOrca()
+    git.base_resolution = BaseResolution(
+        requested_ref="main",
+        requested_sha="a" * 40,
+        resolved_ref="origin/main",
+        base_sha="d" * 40,
+        tracking_ref="origin/main",
+        tracking_sha="d" * 40,
+        behind_by=3,
+    )
+    orca = FakeOrca()
     value, store = controller(tmp_path, orca, git=git)
     run_id = value.propose(proposal()).run_id
 
     await value.accept(run_id)
-    orca.complete_dispatched(worker_result())
+    orca.complete_dispatched(worker_result(base_sha="d" * 40))
     result = await value.monitor(run_id)
 
     lane = store.lanes(run_id)[0]
     assert lane.base_ref == "main"
-    assert lane.base_sha == "a" * 40
-    assert git.resolve_calls == [("repo::/tmp/issue", "HEAD")]
+    assert lane.base_sha == "d" * 40
+    assert git.fetch_calls == ["repo::/tmp/issue"]
+    assert git.resolve_calls == [("repo::/tmp/issue", "main")]
+    assert git.pin_calls == [("repo::/tmp/issue", "d" * 40)]
+    started = next(event for event in store.events(run_id) if event["kind"] == "stage_started")
+    assert started["payload"]["base_resolution"] == {
+        "requested_ref": "main",
+        "requested_sha": "a" * 40,
+        "resolved_ref": "origin/main",
+        "base_sha": "d" * 40,
+        "tracking_ref": "origin/main",
+        "tracking_sha": "d" * 40,
+        "behind_by": 3,
+    }
     assert result.status == "active"
     assert [stage.role for stage in result.stages] == [
         StageKind.WORKER,
@@ -2234,7 +2269,7 @@ async def test_a_stage_whose_worker_died_is_dispatched_again(tmp_path: Path) -> 
     assert [launch.role for launch in result.started] == [StageKind.WORKER]
     restarted = [stage for stage in store.stages(run_id) if stage.orca_dispatch_id is not None]
     assert restarted
-    assert git.resolve_calls == [("repo::/tmp/issue", "HEAD")]
+    assert git.resolve_calls == [("repo::/tmp/issue", "main")]
 
 
 async def test_a_stage_that_committed_before_dying_is_not_dispatched_again(

@@ -14,7 +14,7 @@ from typing import Literal, Protocol, cast
 from pydantic import ValidationError
 
 from orkastrator.config import AgentProfile, GraphConfig, config_changes
-from orkastrator.git import GitError, LocalGit
+from orkastrator.git import BaseResolution, GitError, LocalGit
 from orkastrator.models import (
     SHELL_OPERATORS,
     AcceptanceAuthorization,
@@ -1847,6 +1847,7 @@ class ExecutionController:
         if stage.orca_task_id is None:  # already checked before the slot was reserved
             raise ValueError(f"stage {stage.stage_id} has no Orca task")
         placement = self._placement(run_id, lane, stage)
+        base_resolution: BaseResolution | None = None
         if stage.role is StageKind.WORKER:
             worker_worktree = placement.worktree_id
             created_worktree: str | None = None
@@ -1858,7 +1859,7 @@ class ExecutionController:
                 )
                 created_worktree = worker_worktree
             try:
-                await self._prepare_worker_checkout(
+                base_resolution = await self._prepare_worker_checkout(
                     run_id, lane, stage, worker_worktree, before_dispatch=True
                 )
             except BaseException:
@@ -1900,12 +1901,23 @@ class ExecutionController:
             start_head_sha = await self._git.head(worktree_id)
         except GitError:
             start_head_sha = None
+        start_payload = {**payload, "stage_id": stage.stage_id}
+        if base_resolution is not None:
+            start_payload["base_resolution"] = {
+                "requested_ref": base_resolution.requested_ref,
+                "requested_sha": base_resolution.requested_sha,
+                "resolved_ref": base_resolution.resolved_ref,
+                "base_sha": base_resolution.base_sha,
+                "tracking_ref": base_resolution.tracking_ref,
+                "tracking_sha": base_resolution.tracking_sha,
+                "behind_by": base_resolution.behind_by,
+            }
         self._store.mark_stage_started(
             run_id,
             stage.stage_id,
             dispatch_id,
             worktree_id,
-            {**payload, "stage_id": stage.stage_id},
+            start_payload,
             terminal_handle,
             start_head_sha,
         )
@@ -1938,23 +1950,24 @@ class ExecutionController:
         worktree_id: str,
         *,
         before_dispatch: bool = False,
-    ) -> None:
+    ) -> BaseResolution | None:
         """Persist a worker checkout and freeze its base before dispatch."""
 
         if stage.role is not StageKind.WORKER:
-            return
+            return None
         self._store.record_worker_checkout(run_id, stage.stage_id, worktree_id)
         if lane.base_sha is not None:
-            return
+            return None
         if before_dispatch:
-            # Worktree creation already resolved the requested ref. HEAD is that
-            # exact result and cannot move with the shared branch ref.
-            base_sha = await self._git.resolve_ref(worktree_id, "HEAD")
+            resolution = await self._git.resolve_base(worktree_id, lane.base_ref)
+            await self._git.pin_base(worktree_id, resolution.base_sha)
+            base_sha = resolution.base_sha
         else:
             base_sha = stage.start_head_sha or await self._git.resolve_ref(
                 worktree_id, lane.base_ref
             )
         self._store.record_worker_checkout(run_id, stage.stage_id, worktree_id, base_sha)
+        return resolution if before_dispatch else None
 
     def _placement(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> WorkerPlacement:
         """Resolve the exact existing or isolated checkout for one role."""
