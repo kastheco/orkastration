@@ -303,7 +303,7 @@ class GitHubPublisher:
         path = Path.cwd()
         fields = "headRefOid,state,isDraft,mergeable,mergeStateStatus,mergeCommit"
         state = await self._gh_json(path, "pr", "view", receipt.pull_request_url, "--json", fields)
-        landed = _landed_receipt(state, receipt)
+        landed = _landed_receipt(state, receipt, require_merge_commit=True)
         if landed is not None:
             return landed
         _raise_if_integration_conflict(state, receipt)
@@ -331,7 +331,7 @@ class GitHubPublisher:
             raise PublicationError(f"GitHub merge failed: {detail}")
 
         state = await self._gh_json(path, "pr", "view", receipt.pull_request_url, "--json", fields)
-        landed = _landed_receipt(state, receipt)
+        landed = _landed_receipt(state, receipt, require_merge_commit=True)
         if landed is None:
             raise PublicationError("GitHub did not report the pull request merged")
         return landed
@@ -461,8 +461,7 @@ def _verify_pull_request(payload: object, receipt: PublicationReceipt) -> None:
         raise PublicationError("GitHub returned invalid pull-request state")
     if _pull_request_state(payload) == "MERGED":
         landed = _landed_receipt(payload, receipt)
-        if landed is None:
-            raise PublicationError("GitHub did not report the pull request merged")
+        assert landed is not None
         raise PullRequestLanded(landed)
     if payload.get("headRefOid") != receipt.head_sha:
         raise PublicationError("pull request head does not match the published revision")
@@ -481,7 +480,12 @@ def _raise_if_integration_conflict(payload: object, receipt: PublicationReceipt)
         )
 
 
-def _landed_receipt(payload: object, receipt: PublicationReceipt) -> PublicationReceipt | None:
+def _landed_receipt(
+    payload: object,
+    receipt: PublicationReceipt,
+    *,
+    require_merge_commit: bool = False,
+) -> PublicationReceipt | None:
     if not isinstance(payload, dict):
         raise PublicationError("GitHub returned invalid pull-request state")
     state = _pull_request_state(payload)
@@ -494,10 +498,12 @@ def _landed_receipt(payload: object, receipt: PublicationReceipt) -> Publication
         raise PublicationError("GitHub did not report the merged pull-request head")
     merge_commit = payload.get("mergeCommit")
     merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
-    if not isinstance(merge_sha, str) or not merge_sha:
+    if require_merge_commit and (not isinstance(merge_sha, str) or not merge_sha):
         raise PublicationError("GitHub did not report the resulting merge commit")
-    if merge_sha == receipt.head_sha:
+    if require_merge_commit and merge_sha == receipt.head_sha:
         raise PublicationError("GitHub did not create a merge commit")
+    if not isinstance(merge_sha, str) or not merge_sha or merge_sha == receipt.head_sha:
+        merge_sha = None
     return receipt.model_copy(
         update={
             "draft": False,

@@ -881,6 +881,38 @@ async def test_a_moved_head_is_recorded_when_the_pull_request_is_merged() -> Non
     assert landed.merge_sha == merge_sha
 
 
+async def test_an_external_merge_without_a_merge_commit_is_still_recorded() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": "c" * 40,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "mergeCommit": None,
+                }
+            )
+        )
+    )
+
+    landed = await GitHubPublisher(runner=runner).record_external_merge(receipt)
+
+    assert landed.landed is True
+    assert landed.head_sha == receipt.head_sha
+    assert landed.merged_head_sha == "c" * 40
+    assert landed.merge_sha is None
+
+
 async def test_checks_report_a_moved_merged_head_as_landed() -> None:
     receipt = PublicationReceipt(
         run_id="run-1234567890",
@@ -911,6 +943,39 @@ async def test_checks_report_a_moved_merged_head_as_landed() -> None:
     assert landed.value.receipt.head_sha == "b" * 40
     assert landed.value.receipt.merged_head_sha == "c" * 40
     assert landed.value.receipt.merge_sha == "d" * 40
+
+
+async def test_checks_record_a_merged_pull_request_without_a_merge_commit() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": "c" * 40,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "mergeCommit": None,
+                }
+            )
+        )
+    )
+
+    with pytest.raises(PullRequestLanded) as landed:
+        await GitHubPublisher(runner=runner).checks(receipt)
+
+    assert landed.value.receipt.landed is True
+    assert landed.value.receipt.head_sha == receipt.head_sha
+    assert landed.value.receipt.merged_head_sha == "c" * 40
+    assert landed.value.receipt.merge_sha is None
 
 
 async def test_a_moved_head_is_still_refused_while_the_pull_request_is_open() -> None:
