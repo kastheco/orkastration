@@ -480,6 +480,52 @@ def test_settling_a_finding_records_the_decision_and_retires_its_live_stage(
     }
 
 
+def test_recording_reap_actions_persists_terminal_and_run_outcomes(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "hand-actions.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane_id = store.lanes(run_id)[0].lane_id
+
+    store.record_hand_action(
+        run_id,
+        lane_id,
+        command="reap",
+        target="term-1",
+        phase="closed",
+        note="cleanup after recovery",
+    )
+    store.record_hand_action(
+        run_id,
+        None,
+        command="reap",
+        target=run_id,
+        phase="nothing_to_close",
+        note="nothing left behind",
+    )
+
+    actions = [
+        item["payload"]
+        for item in store.events(run_id)
+        if item["kind"] == "supervisor_hand_action"
+    ]
+    assert actions == [
+        {
+            "command": "reap",
+            "target": "term-1",
+            "phase": "closed",
+            "outcome": "closed",
+            "note": "cleanup after recovery",
+        },
+        {
+            "command": "reap",
+            "target": run_id,
+            "phase": "nothing_to_close",
+            "outcome": "nothing_to_close",
+            "note": "nothing left behind",
+        },
+    ]
+
+
 def test_an_owner_settle_survives_reconciliation_until_reopened(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "sticky-settle.sqlite3")
     store.setup()
