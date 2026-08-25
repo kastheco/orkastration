@@ -408,6 +408,7 @@ class FakeGit(LocalGit):
         self.conflict_commits: set[str] = set()
         self.crash_after_cherry_pick = False
         self.integration_count = 0
+        self.cherry_pick_calls: list[tuple[str, list[str]]] = []
         self.commit_count_override: int | None = None
         self.commit_chain_override: list[str] | None = None
         self.validation_calls: list[list[str]] = []
@@ -504,6 +505,7 @@ class FakeGit(LocalGit):
         return await self.cherry_pick_many(worktree_id, [commit_sha])
 
     async def cherry_pick_many(self, worktree_id: str, commit_shas: list[str]) -> GitCommandResult:
+        self.cherry_pick_calls.append((worktree_id, list(commit_shas)))
         self.pre_sequence_head = self.heads[worktree_id]
         if self.conflict or self.conflict_commits.intersection(commit_shas):
             self.in_progress = True
@@ -4117,6 +4119,50 @@ async def test_a_fix_stacked_on_another_fix_is_never_rebased_off_it(tmp_path: Pa
     # And not because there was nothing to move to: the lane head really has
     # advanced past the commit this fix is stacked on.
     assert store.lanes(run_id)[0].integration_head_sha not in {None, original_commit}
+
+
+async def test_accepting_a_conflicted_composite_fix_retries_integration(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    original_commit = fixer_sha("finding-1", 1)
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    introduced = review_finding_data(2)
+    revision = introduced["review_revision"]
+    assert isinstance(revision, dict)
+    revision["head_sha"] = original_commit
+    git.conflict_commits = {fixer_sha("finding-2", 1)}
+    orca.complete_dispatched(
+        re_review(
+            "regression_introduced_by_fix",
+            new_findings=[{"origin": "introduced_by_fix", "finding": introduced}],
+        )
+    )
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt("finding-2", base_sha=original_commit))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
+    result = await value.monitor(run_id)
+    finding = next(item for item in result.findings if item.finding_id == "finding-2")
+    assert finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    calls_before = len(git.cherry_pick_calls)
+
+    orca.complete_dispatched(
+        escalation("integration_conflict", "accept_fix", finding_id="finding-2")
+    )
+    result = await value.monitor(run_id)
+
+    retried = next(item for item in result.findings if item.finding_id == "finding-2")
+    assert len(git.cherry_pick_calls) == calls_before + 1
+    assert retried.dispatch_base_sha is None
+    assert retried.phase is FindingPhase.ESCALATING
+    assert all(stage.role is not StageKind.FIXER for stage in result.started)
 
 
 def budgeted(*, soft: int | None, hard: int | None, max_timeouts: int = 2) -> GraphConfig:

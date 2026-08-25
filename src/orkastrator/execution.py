@@ -869,14 +869,14 @@ class ExecutionController:
                 self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
                 return
             if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
-                self._rebase_conflicted_fix(run_id, finding)
-                self._store.set_finding_state(
-                    run_id,
-                    finding.finding_key,
-                    phase=FindingPhase.PENDING_FIX,
-                    round=finding.round,
-                )
-                return
+                if self._rebase_conflicted_fix(run_id, finding):
+                    self._store.set_finding_state(
+                        run_id,
+                        finding.finding_key,
+                        phase=FindingPhase.PENDING_FIX,
+                        round=finding.round,
+                    )
+                    return
             await self._integrate_fix(run_id, finding, attempt, readjudicated=True)
         elif decision.action in {"approve_unchanged", "approve_scope_revision"}:
             limit = self._config.review_cycle.max_fix_rounds_per_finding
@@ -1318,7 +1318,7 @@ class ExecutionController:
             raise ValueError(f"finding {finding.finding_id} was persisted without a revision")
         return revision.head_sha
 
-    def _rebase_conflicted_fix(self, run_id: str, finding: FindingRecord) -> None:
+    def _rebase_conflicted_fix(self, run_id: str, finding: FindingRecord) -> bool:
         """Point the next attempt at the head it has to land on, when that is safe.
 
         A conflict retry rebuilt on the base that just conflicted produces a
@@ -1338,10 +1338,11 @@ class ExecutionController:
         lane = next(item for item in self._store.lanes(run_id) if item.lane_id == finding.lane_id)
         head = lane.integration_head_sha
         if head is None or head == self._fix_base_sha(finding):
-            return
+            return False
         if self._composite_predecessor(run_id, finding) is not None:
-            return
+            return False
         self._store.advance_fix_base(run_id, finding.finding_key, head)
+        return True
 
     def _conflict_block_contract(self, finding: FindingRecord) -> ReviewFinding:
         """Leave the paths from the stranded fix on a ceiling-blocked finding."""
