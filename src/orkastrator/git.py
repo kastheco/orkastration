@@ -197,6 +197,35 @@ class LocalGit:
             return None
         return result.stdout.split("\x00", maxsplit=1)[0].strip() or None
 
+    async def pytest_coverage_configured(self, worktree_id: str | None) -> bool:
+        """Report whether a checkout's own pytest configuration turns coverage on.
+
+        `--no-cov` is a pytest-cov flag, so it exists only where pytest-cov loads.
+        A repository that configures no coverage does not quietly ignore it: pytest
+        exits on `unrecognized arguments: --no-cov` before collecting a test, and
+        a check governed that way fails identically on every head forever. Read as
+        text rather than parsed, because the question is only whether a coverage
+        flag appears in this repository's pytest section, and answering it must
+        never fail on a config shape no parser here anticipated. No checkout to
+        read keeps the flag, leaving that refusal to the caller that owns it.
+        """
+
+        if worktree_id is None:
+            return True
+        root = worktree_path(worktree_id)
+        for name, section in _PYTEST_CONFIG_SECTIONS:
+            try:
+                text = (root / name).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            _, marker, tail = text.partition(section)
+            if not marker:
+                continue
+            body, separator, _ = tail.partition("\n[")
+            if "--cov" in (body if separator else tail):
+                return True
+        return False
+
     async def validate(
         self, worktree_id: str, requirements: list[ValidationRequirement]
     ) -> list[ValidationResult]:
@@ -294,6 +323,15 @@ class LocalGit:
             detail = result.stderr.strip()[:2_000]
             raise GitError(f"git {' '.join(arguments)} failed: {detail}")
         return result
+
+
+_PYTEST_CONFIG_SECTIONS = (
+    ("pyproject.toml", "[tool.pytest.ini_options]"),
+    ("pytest.ini", "[pytest]"),
+    ("tox.ini", "[pytest]"),
+    ("setup.cfg", "[tool:pytest]"),
+)
+"""Where a repository declares pytest options, and the section that holds them."""
 
 
 def worktree_path(worktree_id: str) -> Path:

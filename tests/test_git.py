@@ -6,7 +6,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-from orkastrator.git import LocalGit
+from orkastrator.git import LocalGit, worktree_path
 from orkastrator.models import ValidationRequirement
 
 
@@ -229,3 +229,37 @@ async def test_an_absence_check_passes_on_its_own_expected_exit(tmp_path: Path) 
 
     assert [item.status for item in gone] == ["passed"]
     assert [item.status for item in still_there] == ["failed"]
+
+
+async def test_coverage_is_read_from_the_checkout_that_will_run_the_command(
+    tmp_path: Path,
+) -> None:
+    """Ask the repository whether `--no-cov` is a flag it has.
+
+    pytest-cov defines that option, so a repository configuring no coverage
+    exits on `unrecognized arguments: --no-cov` rather than ignoring it. The
+    answer therefore has to come from the checkout the command will run in, not
+    from the supervisor's own repository.
+    """
+
+    repo, base = repository(tmp_path)
+    worktree = add_worktree(repo, tmp_path / "wt", "coverage", base)
+    git = LocalGit()
+
+    assert await git.pytest_coverage_configured(worktree) is False
+
+    (worktree_path(worktree) / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\naddopts = '--cov=pkg'\ntestpaths = ['tests']\n"
+    )
+    assert await git.pytest_coverage_configured(worktree) is True
+
+    # A coverage flag in a neighbouring section is not this repository asking
+    # pytest for coverage, and reading it as one puts the fatal flag back.
+    (worktree_path(worktree) / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n\n[tool.coverage.run]\n"
+        "source = ['--cov']\n"
+    )
+    assert await git.pytest_coverage_configured(worktree) is False
+
+    # No checkout to read is the caller's refusal to make, not this one's.
+    assert await git.pytest_coverage_configured(None) is True
