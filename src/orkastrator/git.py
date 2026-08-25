@@ -26,6 +26,19 @@ class GitCommandResult:
     stderr: str
 
 
+@dataclass(frozen=True, slots=True)
+class BaseResolution:
+    """Fetched source identity used to freeze one lane base."""
+
+    requested_ref: str
+    requested_sha: str
+    resolved_ref: str
+    base_sha: str
+    tracking_ref: str | None = None
+    tracking_sha: str | None = None
+    behind_by: int = 0
+
+
 class LocalGit:
     """Operate only on explicit local Orca worktree identities."""
 
@@ -38,6 +51,71 @@ class LocalGit:
         """Resolve a configured lane base ref to one commit."""
 
         return (await self._git(worktree_id, "rev-parse", f"{ref}^{{commit}}")).stdout.strip()
+
+    async def resolve_base(self, worktree_id: str, ref: str) -> BaseResolution:
+        """Fetch, then resolve a lane base and its remote tracking source."""
+
+        await self._git(worktree_id, "fetch", "--all", "--prune")
+        requested_sha = await self.resolve_ref(worktree_id, ref)
+        symbolic = await self._git(
+            worktree_id, "rev-parse", "--symbolic-full-name", ref, check=False
+        )
+        full_ref = symbolic.stdout.strip() if symbolic.returncode == 0 else ""
+        tracking_ref: str | None = None
+        if full_ref.startswith("refs/heads/"):
+            upstream = await self._git(
+                worktree_id,
+                "for-each-ref",
+                "--format=%(upstream:short)",
+                full_ref,
+            )
+            tracking_ref = upstream.stdout.strip() or None
+        if tracking_ref is None:
+            return BaseResolution(
+                requested_ref=ref,
+                requested_sha=requested_sha,
+                resolved_ref=ref,
+                base_sha=requested_sha,
+            )
+
+        tracking_sha = await self.resolve_ref(worktree_id, tracking_ref)
+        counts = await self._git(
+            worktree_id,
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"{requested_sha}...{tracking_sha}",
+        )
+        try:
+            ahead_by, behind_by = (int(value) for value in counts.stdout.split())
+        except ValueError as exc:
+            raise GitError(
+                f"git rev-list returned invalid ahead/behind counts: {counts.stdout!r}"
+            ) from exc
+        if ahead_by and behind_by:
+            raise GitError(
+                f"base ref {ref} resolved to {requested_sha}, which is {behind_by} commit(s) "
+                f"behind its remote tracking branch {tracking_ref} at {tracking_sha} and "
+                f"{ahead_by} commit(s) ahead; refusing to discard the divergent local commits"
+            )
+        return BaseResolution(
+            requested_ref=ref,
+            requested_sha=requested_sha,
+            resolved_ref=tracking_ref,
+            base_sha=tracking_sha,
+            tracking_ref=tracking_ref,
+            tracking_sha=tracking_sha,
+            behind_by=behind_by,
+        )
+
+    async def pin_base(self, worktree_id: str, base_sha: str) -> None:
+        """Move a clean, newly accepted lane checkout to its fetched base."""
+
+        if await self.head(worktree_id) == base_sha:
+            return
+        if not await self.is_clean(worktree_id):
+            raise GitError(f"cannot move dirty lane checkout to fetched base {base_sha}")
+        await self._git(worktree_id, "reset", "--hard", base_sha)
 
     async def changed_paths(
         self,
