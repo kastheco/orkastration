@@ -2016,8 +2016,56 @@ class StateStore:
             self._event(session, run_id, lane_id, "lane_transitioned", {"phase": phase.value})
 
     def block_lane(self, run_id: str, lane_id: str, reason: str) -> None:
-        self.set_lane_phase(run_id, lane_id, LanePhase.BLOCKED)
-        self._append_event(run_id, lane_id, "lane_blocked", {"reason": reason[:4_000]})
+        """Record that this lane is blocked, once per thing that blocks it.
+
+        A block is not an event that keeps happening. Every monitor tick
+        re-derives the same block from the same unchanged stage and asked for it
+        to be recorded again, so run 88360089 carries 214 `lane_blocked` rows
+        describing three situations. The log is where the run is reconstructed
+        afterwards, and at that ratio the reconstruction is mostly noise.
+
+        Write when the lane enters the phase, and again whenever the reason
+        changes, because a lane blocked for a new cause has genuinely had
+        something happen to it. Repeating an unchanged reason has not.
+        """
+
+        reason = reason[:4_000]
+        with self._session() as session:
+            row = session.get(LaneRow, lane_id)
+            if row is None:
+                raise KeyError(f"unknown lane {lane_id}")
+            entering = row.phase != LanePhase.BLOCKED.value
+            if entering:
+                row.phase = LanePhase.BLOCKED.value
+                row.updated_at = _now()
+                self._event(
+                    session,
+                    run_id,
+                    lane_id,
+                    "lane_transitioned",
+                    {"phase": LanePhase.BLOCKED.value},
+                )
+            elif self._latest_block_reason(session, run_id, lane_id) == reason:
+                return
+            self._event(session, run_id, lane_id, "lane_blocked", {"reason": reason})
+
+    @staticmethod
+    def _latest_block_reason(session: Session, run_id: str, lane_id: str) -> str | None:
+        """Return the reason on this lane's most recent block, if it has one."""
+
+        row = session.exec(
+            select(EventRow)
+            .where(
+                EventRow.run_id == run_id,
+                EventRow.lane_id == lane_id,
+                EventRow.kind == "lane_blocked",
+            )
+            .order_by(col(EventRow.created_at).desc(), col(EventRow.event_id).desc())
+        ).first()
+        if row is None:
+            return None
+        payload = json.loads(row.payload_json)
+        return payload.get("reason") if isinstance(payload, dict) else None
 
     def note_publication_error(self, run_id: str, lane_id: str, detail: str) -> int:
         """Record one failed publication pass, and return how many in a row that is.
