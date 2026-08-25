@@ -252,6 +252,30 @@ def resume(
     )
 
 
+@app.command("record-external-merge")
+def record_external_merge(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    lane: Annotated[str, typer.Option("--lane", help="Lane whose pull request was merged.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Record a lane pull request merged outside orkastrator."""
+
+    async def record() -> BaseModel:
+        settings, store, _ = _components()
+        matches = [item for item in store.lanes(run_id) if item.name == lane]
+        if len(matches) != 1:
+            raise ValueError(f"run {run_id} has no lane {lane}")
+        receipts = store.publications(run_id, matches[0].lane_id)
+        if not receipts:
+            raise ValueError(f"lane {lane} has no published pull request")
+        publisher = GitHubPublisher(gh_command=settings.github_command)
+        landed = await publisher.record_external_merge(receipts[-1])
+        store.record_publication(run_id, matches[0].lane_id, landed)
+        return landed
+
+    _drive(run_id, record(), json_output=json_output)
+
+
 @app.command()
 def reauthorize(
     run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],

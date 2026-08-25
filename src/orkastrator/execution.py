@@ -2112,16 +2112,10 @@ class ExecutionController:
                 elif ci.status == "failed":
                     await self._record_ci_failure(run_id, lane, publications, ci)
                 self._store.note_publication_progress(run_id, lane.lane_id)
-            except PullRequestLanded:
-                # Merged between publishing this head and observing it. The head
-                # is the one this lane published, so the merge is this lane
-                # succeeding; record it and stop publishing the lane.
-                if receipt is not None:
-                    self._store.record_publication(
-                        run_id,
-                        lane.lane_id,
-                        receipt.model_copy(update={"draft": False, "landed": True}),
-                    )
+            except PullRequestLanded as exc:
+                # Merged between publishing and observing. Preserve the frozen
+                # published head alongside the head and merge commit GitHub landed.
+                self._store.record_publication(run_id, lane.lane_id, exc.receipt)
                 self._store.note_publication_progress(run_id, lane.lane_id)
             except IntegrationConflict as exc:
                 await self._record_publication_conflict(run_id, lane, str(exc))

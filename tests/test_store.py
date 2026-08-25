@@ -854,7 +854,14 @@ def test_a_published_head_may_land_but_never_un_land(tmp_path: Path) -> None:
     )
 
     store.record_publication(run_id, lane.lane_id, receipt)
-    landed = receipt.model_copy(update={"draft": False, "landed": True, "merge_sha": "c" * 40})
+    landed = receipt.model_copy(
+        update={
+            "draft": False,
+            "landed": True,
+            "merged_head_sha": "c" * 40,
+            "merge_sha": "d" * 40,
+        }
+    )
     store.record_publication(run_id, lane.lane_id, landed)
 
     assert store.publications(run_id) == [landed]
@@ -868,7 +875,13 @@ def test_a_published_head_may_land_but_never_un_land(tmp_path: Path) -> None:
         store.record_publication(
             run_id,
             lane.lane_id,
-            landed.model_copy(update={"merge_sha": "d" * 40}),
+            landed.model_copy(update={"merge_sha": "e" * 40}),
+        )
+    with pytest.raises(ValueError, match="merged head cannot change"):
+        store.record_publication(
+            run_id,
+            lane.lane_id,
+            landed.model_copy(update={"merged_head_sha": "e" * 40}),
         )
     with pytest.raises(ValueError, match="publication identity changed"):
         store.record_publication(

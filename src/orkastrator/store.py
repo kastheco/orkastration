@@ -434,15 +434,16 @@ class StateStore:
                 kind = "lane_published"
             else:
                 previous = PublicationReceipt.model_validate_json(row.payload_json)
-                # Draft, landed, and the merge sha are the facts about a
-                # published head that may move. The first two move in one
-                # direction; the merge sha may be filled once on landing.
+                # Draft, landed, the merged head, and the merge sha are the facts
+                # about a published head that may move. The first two move in one
+                # direction; the two merge identities may be filled once on landing.
                 # Everything else identifies the publication and must not change.
                 if (
                     previous.model_copy(
                         update={
                             "draft": receipt.draft,
                             "landed": receipt.landed,
+                            "merged_head_sha": receipt.merged_head_sha,
                             "merge_sha": receipt.merge_sha,
                         }
                     )
@@ -453,6 +454,11 @@ class StateStore:
                     raise ValueError("a landed publication cannot be un-landed")
                 if previous.merge_sha is not None and previous.merge_sha != receipt.merge_sha:
                     raise ValueError("a publication merge sha cannot change")
+                if (
+                    previous.merged_head_sha is not None
+                    and previous.merged_head_sha != receipt.merged_head_sha
+                ):
+                    raise ValueError("a publication merged head cannot change")
                 row.payload_json = payload
                 row.updated_at = now
                 if receipt.landed and not previous.landed:
