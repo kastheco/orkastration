@@ -229,9 +229,10 @@ def settle(
     """Record an owner decision on a finding no further agent round can settle."""
 
     try:
-        _, store, _ = _components()
-        record = store.settle_finding(run_id, finding, phase=phase, note=note)
-    except (ConfigError, KeyError, ValueError) as exc:
+        settings, store, _ = _components()
+        with run_lock(settings.database_path, run_id):
+            record = store.settle_finding(run_id, finding, phase=phase, note=note)
+    except (ConfigError, RunLockedError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(record.model_dump(mode="json"), json_output=json_output)
 
@@ -336,6 +337,9 @@ def reap(
         bool,
         typer.Option("--confirm", help="Close the panes shown by a previous run of this command."),
     ] = False,
+    note: Annotated[
+        str, typer.Option("--note", help="Why these settled agent panes are being reaped.")
+    ] = "reaped by the supervisor",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
     """Close agent terminals a previous supervisor left behind.
@@ -367,17 +371,36 @@ def reap(
         record = store.run(run_id)
         if record.orca_run_id is None:
             raise ValueError(f"run {run_id} has no accepted Orca Run to sweep")
+        lanes = store.lanes(run_id)
         plan = build_reap_plan(
             run_id=run_id,
-            lanes=store.lanes(run_id),
+            lanes=lanes,
             stages=store.stages(run_id),
             attached=await orca.worker_terminals(record.orca_run_id),
             terminals=await orca.open_terminals(),
         )
         if not confirm:
             return plan
+        lane_ids = {lane.name: lane.lane_id for lane in lanes}
         for target in plan.close:
             await orca.close_terminal(target.terminal_handle)
+            store.record_hand_action(
+                run_id,
+                lane_ids.get(target.lane),
+                command="reap",
+                target=target.terminal_handle,
+                phase="closed",
+                note=note,
+            )
+        if not plan.close:
+            store.record_hand_action(
+                run_id,
+                None,
+                command="reap",
+                target=run_id,
+                phase="nothing_to_close",
+                note=note,
+            )
         return replace(plan, closed=tuple(target.terminal_handle for target in plan.close))
 
     try:

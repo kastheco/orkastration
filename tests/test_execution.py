@@ -2706,6 +2706,20 @@ async def test_resuming_a_blocked_lane_clears_the_block_and_the_run_status(
         if event["kind"] == "supervisor_resumed_lane"
     ]
     assert notes == [{"lane": lane.name, "note": "owner merged it on purpose"}]
+    actions = [
+        event["payload"]
+        for event in store.events(run_id)
+        if event["kind"] == "supervisor_hand_action"
+    ]
+    assert actions == [
+        {
+            "command": "resume",
+            "target": lane.name,
+            "phase": "active",
+            "outcome": "active",
+            "note": "owner merged it on purpose",
+        }
+    ]
 
 
 async def test_resuming_names_the_lane_when_that_lane_is_not_blocked(tmp_path: Path) -> None:
@@ -3248,6 +3262,54 @@ async def test_publication_conflict_routes_to_lane_escalation_without_failing_ru
     assert conflict.escalation_reason is FindingReason.INTEGRATION_CONFLICT
     assert conflict.lane_id == result.lanes[0].lane_id
     assert [item.role for item in result.started] == [StageKind.ESCALATION]
+
+
+async def test_owner_settled_publication_conflict_survives_the_next_monitor_tick(
+    tmp_path: Path,
+) -> None:
+    class ConflictingPublisher(FakePublisher):
+        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            self.land_calls.append(receipt.head_sha)
+            raise IntegrationConflict("lane issue-100 conflicts with current main")
+
+    orca = FakeOrca()
+    publisher = ConflictingPublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+    first = await value.monitor(run_id)
+    conflict = next(item for item in first.findings if item.origin == "publication_conflict")
+    store.settle_finding(
+        run_id,
+        conflict.finding_id,
+        phase=FindingPhase.DEFERRED,
+        note="the owner resolved the conflict outside the lane",
+    )
+
+    monitored = await value.monitor(run_id)
+    for _ in range(3):
+        monitored = await value.monitor(run_id)
+
+    settled = next(item for item in monitored.findings if item.finding_id == conflict.finding_id)
+    assert settled.phase is FindingPhase.DEFERRED
+    assert settled.escalation_reason is None
+    assert monitored.status == "blocked"
+    assert monitored.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.land_calls == ["b" * 40, "b" * 40]
+    escalation_stages = [
+        stage
+        for stage in store.stages(run_id)
+        if stage.finding_id == conflict.finding_id and stage.role is StageKind.ESCALATION
+    ]
+    assert len(escalation_stages) == 1
+    assert escalation_stages[0].processed is True
 
 
 async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(

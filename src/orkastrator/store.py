@@ -1237,6 +1237,15 @@ class StateStore:
                     "note": note[:4_000],
                 },
             )
+            self._hand_action(
+                session,
+                run_id,
+                row.lane_id,
+                command="reopen",
+                target=finding_id,
+                phase=phase.value,
+                note=note,
+            )
             return _finding(row)
 
     def _finding_lane_id(self, run_id: str, finding_id: str) -> str:
@@ -1328,6 +1337,15 @@ class StateStore:
                     "note": note[:4_000],
                 },
             )
+            self._hand_action(
+                session,
+                run_id,
+                row.lane_id,
+                command="settle",
+                target=finding_id,
+                phase=phase.value,
+                note=note,
+            )
             return _finding(row)
 
     @staticmethod
@@ -1394,6 +1412,43 @@ class StateStore:
                 and row.effective_contract_json == contract_json
             ):
                 return
+            if self._owner_settle_is_sticky(session, run_id, row):
+                self._event(
+                    session,
+                    run_id,
+                    row.lane_id,
+                    "finding_transition_refused",
+                    {
+                        "finding_id": row.finding_id,
+                        "phase": phase.value,
+                        "owner_decision": "settle",
+                        "owner_phase": row.phase,
+                    },
+                )
+                lane = session.get(LaneRow, row.lane_id)
+                if lane is not None and lane.phase != LanePhase.BLOCKED.value:
+                    lane.phase = LanePhase.BLOCKED.value
+                    lane.updated_at = _now()
+                    self._event(
+                        session,
+                        run_id,
+                        row.lane_id,
+                        "lane_transitioned",
+                        {"phase": LanePhase.BLOCKED.value},
+                    )
+                    self._event(
+                        session,
+                        run_id,
+                        row.lane_id,
+                        "lane_blocked",
+                        {
+                            "reason": (
+                                f"owner-settled finding {row.finding_id} refused graph "
+                                f"transition to {phase.value}"
+                            )[:4_000]
+                        },
+                    )
+                return
             row.phase = phase.value
             row.round = next_round
             row.escalation_reason = reason
@@ -1411,6 +1466,32 @@ class StateStore:
                     "reason": reason,
                 },
             )
+
+    @staticmethod
+    def _owner_settle_is_sticky(
+        session: Session, run_id: str, finding: FindingRow
+    ) -> bool:
+        """Keep the latest owner decision authoritative until an explicit reopen."""
+
+        actions = session.exec(
+            select(EventRow)
+            .where(
+                EventRow.run_id == run_id,
+                EventRow.lane_id == finding.lane_id,
+                EventRow.kind == "supervisor_hand_action",
+            )
+            .order_by(col(EventRow.created_at).desc(), col(EventRow.event_id).desc())
+        ).all()
+        for action in actions:
+            payload = json.loads(action.payload_json)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("target") != finding.finding_id:
+                continue
+            command = payload.get("command")
+            if isinstance(command, str) and command in {"reopen", "settle"}:
+                return command == "settle"
+        return False
 
     def advance_fix_base(self, run_id: str, finding_key: str, base_sha: str) -> None:
         """Move the commit the next fixer for this finding is dispatched from.
@@ -2178,6 +2259,38 @@ class StateStore:
                 "supervisor_resumed_lane",
                 {"lane": lane.name, "note": note[:4_000]},
             )
+            self._hand_action(
+                session,
+                run_id,
+                lane_id,
+                command="resume",
+                target=lane.name,
+                phase=LanePhase.ACTIVE.value,
+                note=note,
+            )
+
+    def record_hand_action(
+        self,
+        run_id: str,
+        lane_id: str | None,
+        *,
+        command: str,
+        target: str,
+        phase: str,
+        note: str,
+    ) -> None:
+        """Write one owner-operated command outcome to the run ledger."""
+
+        with self._session() as session:
+            self._hand_action(
+                session,
+                run_id,
+                lane_id,
+                command=command,
+                target=target,
+                phase=phase,
+                note=note,
+            )
 
     def set_terminal_status(self, run_id: str, status: str) -> None:
         if status not in {"complete", "failed", "blocked"}:
@@ -2434,6 +2547,33 @@ class StateStore:
                 ),
                 created_at=_now(),
             )
+        )
+
+    def _hand_action(
+        self,
+        session: Session,
+        run_id: str,
+        lane_id: str | None,
+        *,
+        command: str,
+        target: str,
+        phase: str,
+        note: str,
+    ) -> None:
+        """Record the command, exact target, written phase, and operator note."""
+
+        self._event(
+            session,
+            run_id,
+            lane_id,
+            "supervisor_hand_action",
+            {
+                "command": command,
+                "target": target,
+                "phase": phase,
+                "outcome": phase,
+                "note": note[:4_000],
+            },
         )
 
 

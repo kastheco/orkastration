@@ -468,6 +468,122 @@ def test_settling_a_finding_records_the_decision_and_retires_its_live_stage(
     assert not store.reserve_stage_start(
         run_id, retired, max_workers=4, max_lanes=4, max_lane_fixers=2
     )
+    action = [
+        item for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"
+    ][-1]
+    assert action["payload"] == {
+        "command": "settle",
+        "target": finding.finding_id,
+        "phase": "deferred",
+        "outcome": "deferred",
+        "note": "tracked elsewhere",
+    }
+
+
+def test_recording_reap_actions_persists_terminal_and_run_outcomes(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "hand-actions.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane_id = store.lanes(run_id)[0].lane_id
+
+    store.record_hand_action(
+        run_id,
+        lane_id,
+        command="reap",
+        target="term-1",
+        phase="closed",
+        note="cleanup after recovery",
+    )
+    store.record_hand_action(
+        run_id,
+        None,
+        command="reap",
+        target=run_id,
+        phase="nothing_to_close",
+        note="nothing left behind",
+    )
+
+    actions = [
+        item["payload"]
+        for item in store.events(run_id)
+        if item["kind"] == "supervisor_hand_action"
+    ]
+    assert actions == [
+        {
+            "command": "reap",
+            "target": "term-1",
+            "phase": "closed",
+            "outcome": "closed",
+            "note": "cleanup after recovery",
+        },
+        {
+            "command": "reap",
+            "target": run_id,
+            "phase": "nothing_to_close",
+            "outcome": "nothing_to_close",
+            "note": "nothing left behind",
+        },
+    ]
+
+
+def test_an_owner_settle_survives_reconciliation_until_reopened(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "sticky-settle.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    store.record_initial_review(
+        run_id,
+        lane.lane_id,
+        InitialReviewReport.model_validate_json(initial_review_report_json(review_finding_data())),
+    )
+    finding = store.findings(run_id)[0]
+    store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
+    store.settle_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.DEFERRED,
+        note="the conflict was resolved outside the lane",
+    )
+
+    # This is the write a later monitor reconciliation attempted in KAS-671.
+    store.set_finding_state(
+        run_id,
+        finding.finding_key,
+        phase=FindingPhase.ESCALATING,
+        escalation_reason=FindingReason.INTEGRATION_CONFLICT,
+    )
+
+    held = store.findings(run_id)[0]
+    assert held.phase is FindingPhase.DEFERRED
+    assert held.escalation_reason is None
+    assert store.lanes(run_id)[0].phase is LanePhase.BLOCKED
+    refusal = [
+        item for item in store.events(run_id) if item["kind"] == "finding_transition_refused"
+    ][-1]
+    assert refusal["payload"] == {
+        "finding_id": finding.finding_id,
+        "phase": "escalating",
+        "owner_decision": "settle",
+        "owner_phase": "deferred",
+    }
+
+    store.reopen_finding(
+        run_id,
+        finding.finding_id,
+        phase=FindingPhase.PENDING_ESCALATION,
+        escalation_reason=FindingReason.INTEGRATION_CONFLICT,
+        force=True,
+        note="the external resolution regressed",
+    )
+    store.set_finding_state(
+        run_id,
+        finding.finding_key,
+        phase=FindingPhase.ESCALATING,
+        escalation_reason=FindingReason.INTEGRATION_CONFLICT,
+    )
+    reopened = store.findings(run_id)[0]
+    assert reopened.phase is FindingPhase.ESCALATING
+    assert reopened.escalation_reason is FindingReason.INTEGRATION_CONFLICT
 
 
 def test_a_finding_cannot_be_settled_into_a_phase_that_is_not_a_decision(
@@ -806,6 +922,16 @@ def test_reopening_a_finding_that_settled_on_the_merits_needs_force(tmp_path: Pa
     assert isinstance(payload, dict)
     assert payload["from_phase"] == "resolved"
     assert payload["forced"] is True
+    action = [
+        item for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"
+    ][-1]
+    assert action["payload"] == {
+        "command": "reopen",
+        "target": finding.finding_id,
+        "phase": "pending_fix",
+        "outcome": "pending_fix",
+        "note": "the fix regressed something the review missed",
+    }
 
 
 def test_reopening_a_blocked_finding_still_needs_no_force(tmp_path: Path) -> None:
