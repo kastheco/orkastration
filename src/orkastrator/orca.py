@@ -505,6 +505,11 @@ class OrcaClient:
         except (OrcaError, OrcaTimeout):
             return
 
+    async def discard_worktree(self, worktree_id: str) -> None:
+        """Best-effort cleanup for a checkout rejected before stage ownership."""
+
+        await self._discard_worktree(worktree_id)
+
     async def worker_turns(self, dispatch_id: str, limit: int = 50) -> list[str]:
         """Signatures of the recent assistant tool calls on one dispatched worker.
 
