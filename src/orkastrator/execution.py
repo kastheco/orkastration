@@ -1724,8 +1724,13 @@ class ExecutionController:
                 )
             except BaseException:
                 recorded = next(
-                    item for item in self._store.stages(run_id) if item.stage_id == stage.stage_id
-                ).worktree_id
+                    (
+                        item.worktree_id
+                        for item in self._store.stages(run_id)
+                        if item.stage_id == stage.stage_id
+                    ),
+                    None,
+                )
                 if created_worktree is not None and recorded != created_worktree:
                     await self._orca.discard_worktree(created_worktree)
                 raise
