@@ -1740,6 +1740,34 @@ class StateStore:
             },
         )
 
+    def record_unprovable_findings(
+        self,
+        run_id: str,
+        lane_id: str,
+        *,
+        origin: str,
+        dropped: list[tuple[str, str]],
+    ) -> None:
+        """Record findings set aside because this runner cannot prove them.
+
+        These were reported by a reviewer that read the changeset, so they are
+        not noise. They are just not actionable under a shell-free runner, and
+        the alternative to writing them down is discarding them silently.
+        """
+
+        self._append_event(
+            run_id,
+            lane_id,
+            "findings_unprovable",
+            {
+                "origin": origin,
+                "dropped": [
+                    {"finding_id": finding_id, "reason": reason}
+                    for finding_id, reason in dropped
+                ],
+            },
+        )
+
     def integration(self, finding_key: str, round: int) -> IntegrationRecord | None:
         with self._session() as session:
             row = session.exec(

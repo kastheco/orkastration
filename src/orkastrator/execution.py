@@ -450,7 +450,9 @@ class ExecutionController:
             if verified is None:
                 report = InitialReviewReport.model_validate_json(lifecycle.body)
                 worker = self._store.worker_result(stage.lane_id)
-                verified = await self._verified_review(stage, report, worker.review_revision)
+                verified = await self._verified_review(
+                    run_id, stage, report, worker.review_revision
+                )
             self._store.record_initial_review(run_id, stage.lane_id, verified)
             return
         finding = self._finding_for_stage(run_id, stage)
@@ -473,6 +475,7 @@ class ExecutionController:
 
     async def _verified_review(
         self,
+        run_id: str,
         stage: StageRecord,
         report: InitialReviewReport,
         frozen: ReviewRevision,
@@ -514,7 +517,16 @@ class ExecutionController:
                 ],
             }
         )
-        _reject_unrunnable_validation(governed)
+        kept, dropped = _partition_runnable_findings(governed.findings)
+        _require_a_provable_finding(kept, dropped)
+        if dropped:
+            self._store.record_unprovable_findings(
+                run_id,
+                stage.lane_id,
+                origin="initial_review",
+                dropped=[(finding.id, reason) for finding, reason in dropped],
+            )
+            governed = governed.model_copy(update={"findings": kept})
         if stage.worktree_id is None or not await self._git.is_clean(stage.worktree_id):
             raise ValueError("initial review checkout contains uncommitted changes")
         if await self._git.head(stage.worktree_id) != frozen.head_sha:
@@ -761,7 +773,41 @@ class ExecutionController:
                 )
                 for item in result.new_findings
             ]
-            _reject_unrunnable_findings(governed_discovery_findings)
+            # Partition by position rather than by value: two discoveries can
+            # carry identical contracts, and the discovery each governed finding
+            # came from has to be dropped alongside it.
+            unprovable = {
+                index: reason
+                for index, reason in (
+                    (index, _unrunnable_finding_reason(governed))
+                    for index, governed in enumerate(governed_discovery_findings)
+                )
+                if reason is not None
+            }
+            if unprovable:
+                self._store.record_unprovable_findings(
+                    run_id,
+                    stage.lane_id,
+                    origin="re_review_discovery",
+                    dropped=[
+                        (governed_discovery_findings[index].id, reason)
+                        for index, reason in sorted(unprovable.items())
+                    ],
+                )
+                result = result.model_copy(
+                    update={
+                        "new_findings": [
+                            item
+                            for index, item in enumerate(result.new_findings)
+                            if index not in unprovable
+                        ]
+                    }
+                )
+                governed_discovery_findings = [
+                    governed
+                    for index, governed in enumerate(governed_discovery_findings)
+                    if index not in unprovable
+                ]
             governed_discoveries = await self._freeze_validation_baselines(
                 stage.worktree_id, governed_discovery_findings
             )
@@ -2871,31 +2917,65 @@ def _retry_ordinal(stage_key: str) -> int:
     return int(tail)
 
 
-def _reject_unrunnable_validation(report: InitialReviewReport) -> None:
-    """Refuse a review whose validation a shell-free runner can never execute.
+def _unrunnable_finding_reason(finding: ReviewFinding) -> str | None:
+    """Say why a shell-free runner can never execute this finding's validation.
 
-    A command carrying an operator is not a check that fails, it is a check
-    that cannot run, and the fix loop cannot tell those apart: run 1f13dd37
-    spent five adjudications on a fix that was already correct because its
-    finding required `cd app/ui && npx tsc -b`. Catch it while the reviewer is
-    still dispatched and can restate the requirement.
+    A command carrying an operator is not a check that fails, it is a check that
+    cannot run, and the fix loop cannot tell those apart: run 1f13dd37 spent five
+    adjudications on a fix that was already correct because its finding required
+    `cd app/ui && npx tsc -b`.
     """
 
-    _reject_unrunnable_findings(report.findings)
+    for requirement in finding.validation:
+        found = sorted({token for token in SHELL_OPERATORS if token in requirement.command})
+        if found:
+            return (
+                f"finding {finding.id} requires a validation command using shell syntax "
+                f"({', '.join(found)}), but validation runs without a shell: give one "
+                "executable per requirement and set workdir instead of `cd`"
+            )
+    return None
 
 
-def _reject_unrunnable_findings(findings: list[ReviewFinding]) -> None:
-    """Reject finding commands whose syntax the shell-free runner cannot honor."""
+def _partition_runnable_findings(
+    findings: list[ReviewFinding],
+) -> tuple[list[ReviewFinding], list[tuple[ReviewFinding, str]]]:
+    """Separate the findings this runner can prove from the ones it cannot.
 
+    An unprovable finding used to raise, which discarded the whole report. That
+    cost run 40c115ec a twenty-minute review of thirty-odd files over a semicolon
+    in one finding's validation string, and cost run ab96e92e a lane over a pipe
+    in another - and in both the discarded review had found something real. One
+    finding's contract is not evidence about any other finding in the report, so
+    keep the report and set that finding aside.
+    """
+
+    kept: list[ReviewFinding] = []
+    dropped: list[tuple[ReviewFinding, str]] = []
     for finding in findings:
-        for requirement in finding.validation:
-            found = sorted({token for token in SHELL_OPERATORS if token in requirement.command})
-            if found:
-                raise ValueError(
-                    f"finding {finding.id} requires a validation command using shell syntax "
-                    f"({', '.join(found)}), but validation runs without a shell: give one "
-                    "executable per requirement and set workdir instead of `cd`"
-                )
+        reason = _unrunnable_finding_reason(finding)
+        if reason is None:
+            kept.append(finding)
+        else:
+            dropped.append((finding, reason))
+    return kept, dropped
+
+
+def _require_a_provable_finding(
+    kept: list[ReviewFinding], dropped: list[tuple[ReviewFinding, str]]
+) -> None:
+    """Refuse a report where nothing survived, rather than reading it as clean.
+
+    A report with no usable finding left is not a report that found nothing. It
+    is one this runner cannot act on at all, and letting it through would publish
+    a changeset whose review said something and was never read.
+    """
+
+    if dropped and not kept:
+        raise ValueError(
+            "no finding in this review carries runnable validation: "
+            + "; ".join(reason for _, reason in dropped)
+        )
 
 
 def _govern_validation_requirement(
