@@ -2047,6 +2047,42 @@ class StateStore:
                 raise KeyError(f"unknown lane {lane_id}")
             if lane.phase != LanePhase.BLOCKED.value:
                 raise ValueError(f"lane {lane.name} is {lane.phase}, not blocked")
+            failed_lane_stages = session.exec(
+                select(WorkflowStageRow).where(
+                    WorkflowStageRow.lane_id == lane_id,
+                    WorkflowStageRow.finding_id.is_(None),
+                    WorkflowStageRow.phase == StagePhase.FAILED.value,
+                )
+            ).all()
+            for stage in failed_lane_stages:
+                # Keep the failed attempt as evidence, but move its key out of
+                # the scheduler's live namespace. `resume` is the explicit
+                # supervisor recovery action for a lane-level stage failure.
+                stage_key = stage.stage_key
+                stage.stage_key = f"{stage_key}:resumed{_now():%Y%m%d%H%M%S%f}"
+                stage.updated_at = _now()
+                self._insert_stage(
+                    session,
+                    lane_id=lane_id,
+                    stage_key=stage_key,
+                    role=StageKind(stage.role),
+                    attempt_kind=(
+                        None if stage.attempt_kind is None else AttemptKind(stage.attempt_kind)
+                    ),
+                )
+                session.flush()
+                replacement = session.exec(
+                    select(WorkflowStageRow).where(WorkflowStageRow.stage_key == stage_key)
+                ).one()
+                replacement.phase = StagePhase.READY.value
+                replacement.updated_at = _now()
+                self._event(
+                    session,
+                    run_id,
+                    lane_id,
+                    "stage_created",
+                    {"stage_key": stage_key, "role": stage.role},
+                )
             lane.phase = LanePhase.ACTIVE.value
             lane.updated_at = _now()
             run = session.get(SupervisorRunRow, run_id)
