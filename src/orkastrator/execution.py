@@ -868,6 +868,15 @@ class ExecutionController:
                 )
                 self._settle_predecessors(run_id, finding, FindingPhase.BLOCKED)
                 return
+            if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
+                self._rebase_conflicted_fix(run_id, finding)
+                self._store.set_finding_state(
+                    run_id,
+                    finding.finding_key,
+                    phase=FindingPhase.PENDING_FIX,
+                    round=finding.round,
+                )
+                return
             await self._integrate_fix(run_id, finding, attempt, readjudicated=True)
         elif decision.action in {"approve_unchanged", "approve_scope_revision"}:
             limit = self._config.review_cycle.max_fix_rounds_per_finding
@@ -892,13 +901,20 @@ class ExecutionController:
                 # having verified work thrown away under it. One grant per
                 # finding: a second would make the ceiling mean nothing.
                 retry_round = finding.round
+            if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
+                self._rebase_conflicted_fix(run_id, finding)
             if retry_round > limit:
                 self._store.set_finding_state(
-                    run_id, finding.finding_key, phase=FindingPhase.BLOCKED
+                    run_id,
+                    finding.finding_key,
+                    phase=FindingPhase.BLOCKED,
+                    effective_contract=(
+                        self._conflict_block_contract(finding)
+                        if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+                        else finding.effective_contract
+                    ),
                 )
             else:
-                if finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT:
-                    self._rebase_conflicted_fix(run_id, finding)
                 self._store.set_finding_state(
                     run_id,
                     finding.finding_key,
@@ -1326,6 +1342,21 @@ class ExecutionController:
         if self._composite_predecessor(run_id, finding) is not None:
             return
         self._store.advance_fix_base(run_id, finding.finding_key, head)
+
+    def _conflict_block_contract(self, finding: FindingRecord) -> ReviewFinding:
+        """Leave the paths from the stranded fix on a ceiling-blocked finding."""
+
+        attempt = self._store.latest_fix_attempt(finding.finding_key)
+        paths = sorted(set(attempt.changed_paths if attempt is not None else []))
+        evidence = list(finding.effective_contract.evidence)
+        evidence.extend(
+            FindingEvidence(
+                location=FindingLocation(path=path, start_line=1, end_line=1),
+                claim="The accepted fix still conflicts with the current lane head after rebasing.",
+            )
+            for path in paths[: max(0, 64 - len(evidence))]
+        )
+        return finding.effective_contract.model_copy(update={"evidence": evidence})
 
     def _composite_predecessor(self, run_id: str, finding: FindingRecord) -> FindingRecord | None:
         """The finding whose fix commit this one was built on, if it was built on one."""

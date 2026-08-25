@@ -1890,6 +1890,91 @@ async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(
     assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
 
 
+async def test_accepting_a_conflicted_fix_rebuilds_it_on_the_lane_head(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(), review_finding_data(2))
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    git.conflict_commits = {fixer_sha("finding-2", 1)}
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+    conflicted = next(
+        item
+        for item in result.findings
+        if item.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    )
+    lane_head = store.lanes(run_id)[0].integration_head_sha
+    assert lane_head is not None
+    integrations_before = git.integration_count
+
+    orca.complete_dispatched(
+        escalation("integration_conflict", "accept_fix", finding_id=conflicted.finding_id)
+    )
+    result = await value.monitor(run_id)
+
+    retried = next(item for item in result.findings if item.finding_id == conflicted.finding_id)
+    assert retried.dispatch_base_sha == lane_head
+    assert retried.phase is FindingPhase.FIXING
+    assert retried.round == conflicted.round
+    assert git.integration_count == integrations_before
+
+
+async def test_a_conflict_at_the_round_ceiling_rebases_before_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("still_open"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt(round=2))
+    await value.monitor(run_id)
+    git.conflict = True
+    orca.complete_dispatched(re_review("resolved", round=2))
+    result = await value.monitor(run_id)
+    finding = result.findings[0]
+    assert finding.round == 2
+    assert finding.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+
+    # Model a repeated conflict after another finding advanced the lane. Both
+    # bounds are already spent, so this adjudication must block, but only after
+    # recording the head and scoped paths the stranded fix needs to be rebuilt on.
+    advanced_head = "d" * 40
+    with Session(store._engine) as session:
+        lane = session.get(LaneRow, finding.lane_id)
+        assert lane is not None
+        lane.integration_head_sha = advanced_head
+        session.add(lane)
+        session.commit()
+    monkeypatch.setattr(store, "integration_conflicts", lambda _finding_key: 2)
+    monkeypatch.setattr(store, "fix_attempt_count", lambda _finding_key, _round: 2)
+
+    orca.complete_dispatched(escalation("integration_conflict", "approve_unchanged", round=2))
+    result = await value.monitor(run_id)
+
+    blocked = result.findings[0]
+    assert blocked.phase is FindingPhase.BLOCKED
+    assert blocked.dispatch_base_sha == advanced_head
+    assert blocked.effective_contract.allowed_write_scope.paths == ["src/file1.py"]
+    conflict_evidence = [
+        item
+        for item in blocked.effective_contract.evidence
+        if "still conflicts" in item.claim
+    ]
+    assert [item.location.path for item in conflict_evidence] == ["src/file1.py"]
+
+
 async def test_an_adjudicator_that_never_settles_a_finding_is_bounded(
     tmp_path: Path,
 ) -> None:
