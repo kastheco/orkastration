@@ -845,6 +845,7 @@ class GraphResult(BaseModel):
     run_id: str
     orca_run_id: str
     status: str
+    exit_reason: Literal["single_tick", "unanswered_question", "terminal_graph"] | None = None
     started: list[StageLaunch] = Field(default_factory=list)
     lanes: list[LaneRecord]
     stages: list[StageRecord]

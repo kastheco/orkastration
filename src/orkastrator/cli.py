@@ -21,7 +21,9 @@ from orkastrator.locks import RunLockedError, held_runs, run_lock
 from orkastrator.models import (
     FindingPhase,
     FindingReason,
+    LanePhase,
     PolicyReauthorization,
+    StagePhase,
     SupervisorPlan,
     workflow_contract_schemas,
 )
@@ -150,10 +152,22 @@ def monitor(
         controller = _controller()
         while True:
             result = await controller.monitor(run_id)
+            if not watch:
+                return result.model_copy(update={"exit_reason": "single_tick"})
             # An unanswered question means an agent is parked waiting on a decision
             # the graph cannot make for it, so watching past it just burns ticks.
-            if not watch or result.questions or result.status in {"complete", "failed", "blocked"}:
-                return result
+            if result.questions:
+                return result.model_copy(update={"exit_reason": "unanswered_question"})
+            terminal_lanes = bool(result.lanes) and all(
+                lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}
+                for lane in result.lanes
+            )
+            in_flight = any(
+                stage.phase in {StagePhase.STARTING, StagePhase.DISPATCHED}
+                for stage in result.stages
+            )
+            if terminal_lanes and not in_flight:
+                return result.model_copy(update={"exit_reason": "terminal_graph"})
             await asyncio.sleep(interval)
 
     _drive(run_id, advance(), json_output=json_output)

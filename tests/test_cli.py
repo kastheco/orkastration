@@ -18,10 +18,12 @@ from orkastrator.locks import run_lock
 from orkastrator.models import (
     AcceptanceAuthorization,
     ConfigChange,
+    LanePhase,
     OrcaSnapshot,
     PolicyReauthorization,
     ProposalReceipt,
     PublicationReceipt,
+    StagePhase,
     SupervisorPlan,
 )
 from orkastrator.orca import OrcaError
@@ -70,9 +72,27 @@ class FakeOrca:
         return OrcaSnapshot(worktrees=[])
 
 
+class StatusLane(BaseModel):
+    phase: LanePhase
+
+
+class StatusStage(BaseModel):
+    phase: StagePhase
+
+
+class StatusResult(BaseModel):
+    run_id: str
+    status: str
+    exit_reason: str | None = None
+    questions: list[str] = []
+    lanes: list[StatusLane] = []
+    stages: list[StatusStage] = []
+
+
 class FakeController:
     parked_question: ClassVar[list[str]] = []
     monitor_status: ClassVar[str] = "complete"
+    monitor_results: ClassVar[list[StatusResult]] = []
 
     def propose(self, value: SupervisorPlan) -> ProposalReceipt:
         return ProposalReceipt(run_id="run-1", proposal=value)
@@ -91,10 +111,13 @@ class FakeController:
         return SimpleNamespace(lane="issue-123", role="worker")
 
     async def monitor(self, run_id: str) -> StatusResult:
+        if type(self).monitor_results:
+            return type(self).monitor_results.pop(0)
         return StatusResult(
             run_id=run_id,
             status=type(self).monitor_status,
             questions=list(type(self).parked_question),
+            lanes=[StatusLane(phase=LanePhase(type(self).monitor_status))],
         )
 
 
@@ -114,12 +137,6 @@ class FakeReauthorizingController(FakeController):
             ],
             applied=apply,
         )
-
-
-class StatusResult(BaseModel):
-    run_id: str
-    status: str
-    questions: list[str] = []
 
 
 @pytest.fixture
@@ -181,6 +198,7 @@ lanes:
     assert json.loads(proposed.stdout)["status"] == "proposed"
     assert json.loads(accepted.stdout)["status"] == "active"
     assert json.loads(monitored.stdout)["status"] == "complete"
+    assert json.loads(monitored.stdout)["exit_reason"] == "terminal_graph"
 
 
 def test_a_second_driver_on_one_run_is_refused_by_name(fake_wiring: None, tmp_path: Path) -> None:
@@ -263,7 +281,44 @@ def test_watch_stops_on_a_parked_question(fake_wiring: None) -> None:
         FakeController.parked_question = []
 
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["questions"] == ["msg-1"]
+    payload = json.loads(result.stdout)
+    assert payload["questions"] == ["msg-1"]
+    assert payload["exit_reason"] == "unanswered_question"
+
+
+@pytest.mark.parametrize("terminal_phase", [LanePhase.BLOCKED, LanePhase.FAILED])
+def test_watch_survives_a_terminal_lane_while_another_stage_is_dispatched(
+    fake_wiring: None, terminal_phase: LanePhase
+) -> None:
+    FakeController.monitor_results = [
+        StatusResult(
+            run_id="run-1",
+            status=terminal_phase.value,
+            lanes=[
+                StatusLane(phase=terminal_phase),
+                StatusLane(phase=LanePhase.ACTIVE),
+            ],
+            stages=[StatusStage(phase=StagePhase.DISPATCHED)],
+        ),
+        StatusResult(
+            run_id="run-1",
+            status=terminal_phase.value,
+            lanes=[
+                StatusLane(phase=terminal_phase),
+                StatusLane(phase=LanePhase.COMPLETE),
+            ],
+        ),
+    ]
+
+    result = runner.invoke(
+        cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"]
+    )
+
+    assert result.exit_code == 0
+    assert FakeController.monitor_results == []
+    payload = json.loads(result.stdout)
+    assert payload["status"] == terminal_phase.value
+    assert payload["exit_reason"] == "terminal_graph"
 
 
 def test_answer_reads_the_body_from_a_file(fake_wiring: None, tmp_path: Path) -> None:
