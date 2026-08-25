@@ -2312,6 +2312,33 @@ async def test_one_stage_that_cannot_start_does_not_park_the_rest_of_the_wave(
     assert "task_not_startable" in str(failures[0]["detail"])
 
 
+async def test_repeated_start_failures_block_the_lane_instead_of_redispatching(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    orca.refuse_starts.add("task-1")
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+
+    await value.accept(run_id)
+    result = await value.monitor(run_id)
+
+    stage = store.stages(run_id)[0]
+    assert stage.phase is StagePhase.FAILED
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert result.status == "blocked"
+    failures = [
+        event for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ]
+    assert len(failures) == 3
+
+    await value.monitor(run_id)
+
+    assert [
+        event for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+    ] == failures
+
+
 async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
     tmp_path: Path,
 ) -> None:

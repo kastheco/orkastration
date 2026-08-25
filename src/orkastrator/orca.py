@@ -357,6 +357,7 @@ class OrcaClient:
             )
         )
         response = await self._ok(*arguments)
+        _require_start_succeeded(response)
         dispatch_id = _required_recursive_string(response, "dispatchId")
         resolved_worktree = worktree_id or _required_recursive_string(
             response, "worktreeId", "workspaceId"
@@ -416,6 +417,7 @@ class OrcaClient:
         # against, so nothing else will ever reclaim it. The caller retries the
         # stage every reconcile, which turns one unstartable stage into one
         # abandoned worktree per tick until somebody notices the disk.
+        terminal_handle: str | None = None
         try:
             terminal_response = await self._ok(
                 "terminal",
@@ -477,10 +479,14 @@ class OrcaClient:
                 # place a genuine stall stays visible. Discarding here is what
                 # turned one slow paste into a dead lane and a deleted checkout.
                 response = exc.payload
+                _require_start_succeeded(response)
                 if _optional_recursive_string(response, "dispatchId") is None:
                     raise
+            _require_start_succeeded(response)
             dispatch_id = _required_recursive_string(response, "dispatchId")
         except BaseException:
+            if terminal_handle is not None:
+                await self.close_terminal(terminal_handle)
             if created_worktree is not None:
                 await self._discard_worktree(created_worktree)
             raise
@@ -683,6 +689,16 @@ def _require_idle(response: JsonObject, terminal_handle: str) -> None:
         f"agent terminal {terminal_handle} never became idle before its task was "
         f"dispatched: {reason}"
     )
+
+
+def _require_start_succeeded(response: JsonObject) -> None:
+    """Refuse a worker start only when Orca states that it failed."""
+
+    result = response.get("result")
+    if not isinstance(result, dict) or result.get("state") != "failed":
+        return
+    detail = _outcome_detail(response)
+    raise OrcaError(f"Orca worker start reported failure: {detail}")
 
 
 def _error_detail(error: object) -> str:
