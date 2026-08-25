@@ -698,12 +698,23 @@ class ExecutionController:
         resulting head. Rejecting an otherwise sound fix because an agent mistyped
         one of them threw away real work, so overwrite them and spend the rigour
         on `_validate_fixer_commit`, where Git can actually settle the question.
+
+        Every status is bound, not only `fixed`. The base is the supervisor's
+        regardless of how the attempt ended, and an attempt that reports anything
+        else has no commit under review: nothing downstream reads one without
+        first checking for `fixed`, so a sha left standing there is a transcription
+        no reader wants and every reader could still trip over.
         """
 
-        bound: dict[str, object] = {"finding_id": finding.finding_id, "round": finding.round}
-        if attempt.status == "fixed" and stage.worktree_id is not None:
+        bound: dict[str, object] = {
+            "finding_id": finding.finding_id,
+            "round": finding.round,
+            "commit_sha": None,
+        }
+        if stage.worktree_id is not None:
             bound["base_sha"] = self._fix_base_sha(finding)
-            bound["commit_sha"] = await self._git.head(stage.worktree_id)
+            if attempt.status == "fixed":
+                bound["commit_sha"] = await self._git.head(stage.worktree_id)
         return attempt.model_copy(update=bound)
 
     async def _apply_re_review(

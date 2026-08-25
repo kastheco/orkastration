@@ -1470,6 +1470,48 @@ async def test_fixer_identity_is_taken_from_the_record_not_from_the_report(
     assert attempt.commit_sha == fixer_sha("finding-1", 1)
 
 
+async def test_an_abbreviated_fixer_sha_does_not_discard_the_commit_it_names(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    abbreviated = json.loads(fix_attempt())
+    abbreviated["base_sha"] = "b" * 7
+    abbreviated["commit_sha"] = fixer_sha("finding-1", 1)[:7]
+    orca.complete_dispatched(json.dumps(abbreviated))
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.RE_REVIEWER
+    attempt = store.latest_fix_attempt(store.findings(run_id)[0].finding_key)
+    assert attempt is not None
+    assert attempt.base_sha == "b" * 40
+    assert attempt.commit_sha == fixer_sha("finding-1", 1)
+
+
+async def test_a_blocked_fixer_keeps_no_commit_it_only_transcribed(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    blocked = json.loads(fix_attempt(status="blocked_scope"))
+    blocked["commit_sha"] = "not-a-sha"
+    orca.complete_dispatched(json.dumps(blocked))
+
+    result = await value.monitor(run_id)
+
+    assert result.started[0].role is StageKind.ESCALATION
+    attempt = store.latest_fix_attempt(store.findings(run_id)[0].finding_key)
+    assert attempt is not None
+    assert attempt.commit_sha is None
+
+
 async def test_adjudicator_may_omit_the_revision_of_a_revised_contract(
     tmp_path: Path,
 ) -> None:
