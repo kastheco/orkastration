@@ -2760,6 +2760,34 @@ async def test_live_failed_worker_blocks_publication_with_the_stage_identity(
     assert isinstance(reason, str)
     assert worker.stage_key in reason
     assert worker.stage_id in reason
+    assert "resume" in reason
+
+
+async def test_resuming_live_failed_worker_retries_without_reblocking(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    failed_worker = store.stages(run_id)[0]
+
+    orca.fail_dispatched()
+    blocked_result = await value.monitor(run_id)
+    assert blocked_result.lanes[0].phase is LanePhase.BLOCKED
+    assert [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+
+    value.resume(run_id, None, "retry the failed lane worker")
+    resumed_result = await value.monitor(run_id)
+
+    assert resumed_result.status == "active"
+    assert resumed_result.lanes[0].phase is LanePhase.ACTIVE
+    assert failed_worker.stage_id in {stage.stage_id for stage in resumed_result.stages}
+    retired = next(stage for stage in resumed_result.stages if stage.stage_id == failed_worker.stage_id)
+    assert retired.phase is StagePhase.FAILED
+    assert ":resumed" in retired.stage_key
+    assert len([event for event in store.events(run_id) if event["kind"] == "lane_blocked"]) == 1
 
 
 async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(

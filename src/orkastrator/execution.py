@@ -1949,7 +1949,7 @@ class ExecutionController:
                     run_id,
                     lane.lane_id,
                     f"live failed stage {stage.stage_key} ({stage.stage_id}) "
-                    "requires supervisor recovery before publication",
+                    "requires supervisor action: resume this lane to retry the stage",
                 )
                 continue
             if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}:
@@ -2085,7 +2085,9 @@ class ExecutionController:
         by_id = {finding.finding_id: finding for finding in findings}
         live: list[StageRecord] = []
         for stage in stages:
-            if stage.phase is not StagePhase.FAILED or ":reopened" in stage.stage_key:
+            if stage.phase is not StagePhase.FAILED or any(
+                marker in stage.stage_key for marker in (":reopened", ":resumed")
+            ):
                 continue
             if stage.finding_id is None:
                 live.append(stage)
@@ -2232,6 +2234,10 @@ class ExecutionController:
 
     def resume(self, run_id: str, lane_name: str | None, note: str) -> list[LaneRecord]:
         """Clear a lane block the owner has looked at, and let the run advance again.
+
+        For a lane-level worker or initial-reviewer failure, the store retires
+        the failed attempt and stages a replacement under the original key, so
+        this action does not just clear a block that the next tick recreates.
 
         `reopen` and `settle` both act on findings. A lane that blocked after
         every one of its findings had settled - on a CI query, on a pull request
