@@ -1870,22 +1870,17 @@ class ExecutionController:
         for lane in self._store.lanes(run_id):
             lane_stages = [stage for stage in stages if stage.lane_id == lane.lane_id]
             lane_findings = by_lane_findings.get(lane.lane_id, [])
-            # A lane phase is derived state, not another failure witness. In
-            # particular, carrying FAILED forward here made it impossible for a
-            # later round to recover the lane even after the stage that caused
-            # it stopped governing any live work.
+            # Publication runs before this status pass and is the single owner
+            # of live failed-stage handling: it blocks the lane there, with the
+            # stage identity, before status is derived. This pass only preserves
+            # the explicit lane state and derives ordinary progress.
             if lane.phase is LanePhase.BLOCKED or any(
                 finding.phase is FindingPhase.BLOCKED for finding in lane_findings
             ):
                 phase = LanePhase.BLOCKED
-            elif self._live_failed_stages(lane_stages, lane_findings):
-                phase = LanePhase.FAILED
-            elif lane.phase is LanePhase.FAILED and not any(
-                stage.phase is StagePhase.FAILED for stage in lane_stages
-            ):
-                # A FAILED lane without a failed stage was set by a rejected
-                # lane-level contract or an explicit supervisor action. There
-                # is no superseded attempt proving it is safe to lift.
+            elif lane.phase is LanePhase.FAILED:
+                # Lane-level failures have no finding round that can supersede
+                # them. Keep the explicit failure until supervisor recovery.
                 phase = LanePhase.FAILED
             else:
                 reviewed = any(
@@ -1944,17 +1939,6 @@ class ExecutionController:
 
         self._require_authorization(run_id)
         for lane in self._store.lanes(run_id):
-            if lane.phase in {LanePhase.BLOCKED, LanePhase.COMPLETE}:
-                # A complete lane is finished: its head is published, its pull
-                # request is out of draft and its required checks passed for that
-                # exact head. Coming back to it every tick re-edits the pull
-                # request body and re-queries checks for no decision, and it hands
-                # the lane a way to fail after it has already succeeded - an owner
-                # who merges the pull request turns the next pass into
-                # "the authorized lane pull request is no longer open", which
-                # blocks the lane and takes the whole run terminal. Merging is the
-                # outcome this lane was working toward, so stop here.
-                continue
             failed = self._live_failed_stages(
                 [stage for stage in self._store.stages(run_id) if stage.lane_id == lane.lane_id],
                 self._store.findings(run_id, lane.lane_id),
@@ -1968,20 +1952,19 @@ class ExecutionController:
                     "requires supervisor recovery before publication",
                 )
                 continue
-            if lane.phase is LanePhase.FAILED:
-                if any(
-                    stage.phase is StagePhase.FAILED
-                    for stage in self._store.stages(run_id)
-                    if stage.lane_id == lane.lane_id
-                ):
-                    # FAILED was persisted by an attempt that no longer governs
-                    # the lane. Clear the stale derived value before publication
-                    # so a fully resolved lane can finish on this reconciliation.
-                    self._store.set_lane_phase(run_id, lane.lane_id, LanePhase.ACTIVE)
-                else:
-                    # No superseded stage explains this failure, so it remains
-                    # an explicit lane-level failure and must not be published.
-                    continue
+            if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}:
+                # A complete lane is finished: its head is published, its pull
+                # request is out of draft and its required checks passed for that
+                # exact head. Coming back to it every tick re-edits the pull
+                # request body and re-queries checks for no decision, and it hands
+                # the lane a way to fail after it has already succeeded - an owner
+                # who merges the pull request turns the next pass into
+                # "the authorized lane pull request is no longer open", which
+                # blocks the lane and takes the whole run terminal. Merging is the
+                # outcome this lane was working toward, so stop here.
+                # BLOCKED and explicit FAILED state are likewise supervisor-owned;
+                # live failed stages were handled above, before this guard.
+                continue
             if not self._local_lane_settled(run_id, lane):
                 continue
             unintegrated = self._unintegrated_resolved(run_id, lane)
