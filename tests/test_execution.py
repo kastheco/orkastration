@@ -3769,6 +3769,42 @@ async def test_an_adjudicated_retry_at_the_ceiling_is_granted_once(tmp_path: Pat
     assert result.findings[0].phase is FindingPhase.BLOCKED
 
 
+async def test_one_unprovable_finding_does_not_discard_the_rest_of_the_review(
+    tmp_path: Path,
+) -> None:
+    """A finding's own contract is not evidence about any other finding.
+
+    Run 40c115ec discarded a twenty-minute review of thirty-odd files because one
+    finding's validation string carried a semicolon, and that review had caught a
+    real data-provenance defect. Run ab96e92e lost a lane the same way over a
+    pipe. Set the unprovable finding aside, write down which one and why, and
+    keep everything the reviewer proved it could check.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    unprovable = review_finding_data(1)
+    unprovable["validation"] = [{"command": "cd app/ui && npx tsc -b", "expected": "exit 0"}]
+    provable = review_finding_data(2)
+    orca.complete_dispatched(initial_review_report_json(unprovable, provable))
+
+    result = await value.monitor(run_id)
+
+    assert [finding.finding_id for finding in result.findings] == ["finding-2"]
+    # The review survived, so the stage was never rejected.
+    assert not [
+        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
+    ]
+    dropped = [event for event in store.events(run_id) if event["kind"] == "findings_unprovable"]
+    assert len(dropped) == 1
+    assert dropped[0]["payload"]["origin"] == "initial_review"
+    assert [item["finding_id"] for item in dropped[0]["payload"]["dropped"]] == ["finding-1"]
+    assert "without a shell" in dropped[0]["payload"]["dropped"][0]["reason"]
+
+
 async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
     tmp_path: Path,
 ) -> None:
@@ -3785,7 +3821,8 @@ async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
 
     # The runner has no shell, so this contract could only ever fail, and the
     # fix loop cannot tell a broken command from a broken fix. Say so while the
-    # reviewer is still the one who can restate it.
+    # reviewer is still the one who can restate it. Nothing survived here, and a
+    # report with no provable finding left must not read as a clean review.
     assert not result.findings
     rejected = [event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"]
     assert any("without a shell" in str(event["payload"]) for event in rejected)
