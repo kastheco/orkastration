@@ -558,6 +558,7 @@ def _controller() -> ExecutionController:
         publisher=GitHubPublisher(
             gh_command=settings.github_command,
             advisory_checks=settings.graph.final_gate.advisory_checks,
+            treat_no_checks_as_passed=settings.graph.final_gate.treat_no_checks_as_passed,
         ),
     )
 
