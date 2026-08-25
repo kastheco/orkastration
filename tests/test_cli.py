@@ -27,6 +27,7 @@ from orkastrator.models import (
     SupervisorPlan,
 )
 from orkastrator.orca import OrcaError
+from orkastrator.reap import ReapPlan, ReapTarget
 from orkastrator.store import StateStore
 from tests.factories import graph_config_data
 
@@ -214,6 +215,92 @@ def test_a_second_driver_on_one_run_is_refused_by_name(fake_wiring: None, tmp_pa
 
     # And the moment it is released, the same command works.
     assert json.loads(runner.invoke(cli.app, ["monitor", "run-1", "--json"]).stdout)["status"]
+
+
+def test_settle_is_refused_while_a_monitor_holds_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class StoreThatMustNotWrite:
+        def settle_finding(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("settle wrote while the monitor held the run")
+
+    settings = SimpleNamespace(database_path=tmp_path / "state.sqlite3")
+    monkeypatch.setattr(
+        cli, "_components", lambda: (settings, StoreThatMustNotWrite(), FakeOrca())
+    )
+
+    with run_lock(settings.database_path, "run-1"):
+        refused = runner.invoke(
+            cli.app, ["settle", "run-1", "--finding", "finding-1", "--json"]
+        )
+
+    assert refused.exit_code != 0
+    assert "already being driven by" in json.loads(refused.stderr)["error"]
+
+
+def test_confirmed_reap_records_each_closed_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    actions: list[dict[str, object]] = []
+
+    class ReapStore:
+        def run(self, _run_id: str) -> object:
+            return SimpleNamespace(orca_run_id="orca-run")
+
+        def lanes(self, _run_id: str) -> list[object]:
+            return [SimpleNamespace(name="issue-123", lane_id="lane-1")]
+
+        def stages(self, _run_id: str) -> list[object]:
+            return []
+
+        def record_hand_action(self, run_id: str, lane_id: str | None, **data: object) -> None:
+            actions.append({"run_id": run_id, "lane_id": lane_id, **data})
+
+    class ReapOrca(FakeOrca):
+        closed: ClassVar[list[str]] = []
+
+        async def worker_terminals(self, _orca_run_id: str) -> dict[str, str]:
+            return {}
+
+        async def open_terminals(self) -> object:
+            return SimpleNamespace()
+
+        async def close_terminal(self, terminal_handle: str) -> None:
+            type(self).closed.append(terminal_handle)
+
+    plan = ReapPlan(
+        run_id="run-1",
+        close=(
+            ReapTarget(
+                stage_id="stage-1",
+                lane="issue-123",
+                role="worker",
+                dispatch_id="ctx-1",
+                terminal_handle="term-1",
+            ),
+        ),
+    )
+    settings = SimpleNamespace(database_path=tmp_path / "state.sqlite3")
+    monkeypatch.setattr(cli, "_components", lambda: (settings, ReapStore(), ReapOrca()))
+    monkeypatch.setattr(cli, "build_reap_plan", lambda **_kwargs: plan)
+
+    result = runner.invoke(
+        cli.app,
+        ["reap", "run-1", "--confirm", "--note", "cleanup after recovery", "--json"],
+    )
+
+    assert result.exit_code == 0
+    assert ReapOrca.closed == ["term-1"]
+    assert actions == [
+        {
+            "run_id": "run-1",
+            "lane_id": "lane-1",
+            "command": "reap",
+            "target": "term-1",
+            "phase": "closed",
+            "note": "cleanup after recovery",
+        }
+    ]
 
 
 def test_doctor_names_the_run_a_live_supervisor_is_driving(
