@@ -1003,7 +1003,7 @@ class StallingRunner:
             return {"ok": True, "result": {"wait": {"satisfied": True}}}
         if head == ("orchestration", "worker-start"):
             result: JsonObject = {
-                "state": "outcome_unknown",
+                "state": "failed",
                 "failedStage": "dispatch_input",
                 "lastError": "agent_prompt_stalled",
             }

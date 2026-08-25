@@ -479,10 +479,10 @@ class OrcaClient:
                 # place a genuine stall stays visible. Discarding here is what
                 # turned one slow paste into a dead lane and a deleted checkout.
                 response = exc.payload
-                _require_start_succeeded(response)
                 if _optional_recursive_string(response, "dispatchId") is None:
                     raise
-            _require_start_succeeded(response)
+            else:
+                _require_start_succeeded(response)
             dispatch_id = _required_recursive_string(response, "dispatchId")
         except BaseException:
             if terminal_handle is not None:
