@@ -503,9 +503,9 @@ def _landed_receipt(
     merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
     if require_merge_commit and (not isinstance(merge_sha, str) or not merge_sha):
         raise PublicationError("GitHub did not report the resulting merge commit")
-    if require_merge_commit and merge_sha == receipt.head_sha:
+    if require_merge_commit and merge_sha == merged_head_sha:
         raise PublicationError("GitHub did not create a merge commit")
-    if not isinstance(merge_sha, str) or not merge_sha or merge_sha == receipt.head_sha:
+    if not isinstance(merge_sha, str) or not merge_sha or merge_sha == merged_head_sha:
         merge_sha = None
     return receipt.model_copy(
         update={
