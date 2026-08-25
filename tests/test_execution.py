@@ -2066,6 +2066,36 @@ async def test_an_adjudicator_that_never_settles_a_finding_is_bounded(
     assert len(escalation_stages) <= 4
 
 
+async def test_a_lane_taken_down_by_its_own_finding_says_so_once(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt(validation=[]))
+    result = await value.monitor(run_id)
+
+    for _ in range(12):
+        if result.findings[0].phase is FindingPhase.BLOCKED:
+            break
+        orca.complete_dispatched(escalation("validation_failed", "approve_unchanged"))
+        result = await value.monitor(run_id)
+    assert result.findings[0].phase is FindingPhase.BLOCKED
+
+    # The lane is down and every further tick observes the same thing.
+    for _ in range(3):
+        await value.monitor(run_id)
+
+    assert store.lanes(run_id)[0].phase is LanePhase.BLOCKED
+    reasons = [
+        event["payload"]["reason"]
+        for event in store.events(run_id)
+        if event["kind"] == "lane_blocked"
+    ]
+    assert len(reasons) == 1
+    assert "finding-1" in reasons[0]
+
+
 async def test_a_second_acceptance_of_the_same_failed_validation_blocks(
     tmp_path: Path,
 ) -> None:

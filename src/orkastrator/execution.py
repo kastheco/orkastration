@@ -2032,9 +2032,11 @@ class ExecutionController:
             # of live failed-stage handling: it blocks the lane there, with the
             # stage identity, before status is derived. This pass only preserves
             # the explicit lane state and derives ordinary progress.
-            if lane.phase is LanePhase.BLOCKED or any(
-                finding.phase is FindingPhase.BLOCKED for finding in lane_findings
-            ):
+            blocking = next(
+                (finding for finding in lane_findings if finding.phase is FindingPhase.BLOCKED),
+                None,
+            )
+            if lane.phase is LanePhase.BLOCKED or blocking is not None:
                 phase = LanePhase.BLOCKED
             elif lane.phase is LanePhase.FAILED:
                 # Lane-level failures have no finding round that can supersede
@@ -2072,7 +2074,20 @@ class ExecutionController:
                     )
                 )
                 phase = LanePhase.COMPLETE if reviewed and settled and gated else LanePhase.ACTIVE
-            self._store.set_lane_phase(run_id, lane.lane_id, phase)
+            # A lane goes down two ways and only one of them used to say so. A
+            # publication block writes its reason; a lane taken down by one of
+            # its own blocked findings changed a column and left the event stream
+            # describing a healthy lane. Run 88360089 read as one lane blocked
+            # and two working, when two of the three had gone down this way.
+            if phase is LanePhase.BLOCKED and lane.phase is not LanePhase.BLOCKED and blocking:
+                self._store.block_lane(
+                    run_id,
+                    lane.lane_id,
+                    f"finding {blocking.finding_id} is blocked at round {blocking.round}: "
+                    "the lane cannot converge while it stands",
+                )
+            else:
+                self._store.set_lane_phase(run_id, lane.lane_id, phase)
             lane_phases.append(phase)
         if any(phase is LanePhase.ACTIVE for phase in lane_phases):
             # One lane blocking has no bearing on a lane that is still working,
