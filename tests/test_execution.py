@@ -3238,11 +3238,12 @@ async def test_owner_settled_publication_conflict_survives_the_next_monitor_tick
             raise IntegrationConflict("lane issue-100 conflicts with current main")
 
     orca = FakeOrca()
+    publisher = ConflictingPublisher()
     value, store = controller(
         tmp_path,
         orca,
         graph_config=config(merge=True),
-        publisher=ConflictingPublisher(),
+        publisher=publisher,
     )
     run_id = value.propose(proposal()).run_id
     await value.accept(run_id)
@@ -3258,10 +3259,15 @@ async def test_owner_settled_publication_conflict_survives_the_next_monitor_tick
     )
 
     monitored = await value.monitor(run_id)
+    for _ in range(3):
+        monitored = await value.monitor(run_id)
 
     settled = next(item for item in monitored.findings if item.finding_id == conflict.finding_id)
     assert settled.phase is FindingPhase.DEFERRED
     assert settled.escalation_reason is None
+    assert monitored.status == "blocked"
+    assert monitored.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.land_calls == ["b" * 40, "b" * 40]
     escalation_stages = [
         stage
         for stage in store.stages(run_id)

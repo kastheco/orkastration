@@ -510,6 +510,16 @@ def test_an_owner_settle_survives_reconciliation_until_reopened(tmp_path: Path) 
     held = store.findings(run_id)[0]
     assert held.phase is FindingPhase.DEFERRED
     assert held.escalation_reason is None
+    assert store.lanes(run_id)[0].phase is LanePhase.BLOCKED
+    refusal = [
+        item for item in store.events(run_id) if item["kind"] == "finding_transition_refused"
+    ][-1]
+    assert refusal["payload"] == {
+        "finding_id": finding.finding_id,
+        "phase": "escalating",
+        "owner_decision": "settle",
+        "owner_phase": "deferred",
+    }
 
     store.reopen_finding(
         run_id,

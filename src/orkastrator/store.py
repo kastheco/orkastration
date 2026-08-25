@@ -1398,8 +1398,6 @@ class StateStore:
             row = session.get(FindingRow, finding_key)
             if row is None:
                 raise KeyError(f"unknown finding {finding_key}")
-            if self._owner_settle_is_sticky(session, run_id, row):
-                return
             next_round = row.round if round is None else round
             contract_json = (
                 row.effective_contract_json
@@ -1413,6 +1411,43 @@ class StateStore:
                 and row.escalation_reason == reason
                 and row.effective_contract_json == contract_json
             ):
+                return
+            if self._owner_settle_is_sticky(session, run_id, row):
+                self._event(
+                    session,
+                    run_id,
+                    row.lane_id,
+                    "finding_transition_refused",
+                    {
+                        "finding_id": row.finding_id,
+                        "phase": phase.value,
+                        "owner_decision": "settle",
+                        "owner_phase": row.phase,
+                    },
+                )
+                lane = session.get(LaneRow, row.lane_id)
+                if lane is not None and lane.phase != LanePhase.BLOCKED.value:
+                    lane.phase = LanePhase.BLOCKED.value
+                    lane.updated_at = _now()
+                    self._event(
+                        session,
+                        run_id,
+                        row.lane_id,
+                        "lane_transitioned",
+                        {"phase": LanePhase.BLOCKED.value},
+                    )
+                    self._event(
+                        session,
+                        run_id,
+                        row.lane_id,
+                        "lane_blocked",
+                        {
+                            "reason": (
+                                f"owner-settled finding {row.finding_id} refused graph "
+                                f"transition to {phase.value}"
+                            )[:4_000]
+                        },
+                    )
                 return
             row.phase = phase.value
             row.round = next_round
