@@ -2420,8 +2420,18 @@ class ExecutionController:
         if stage.role is StageKind.WORKER:
             schema = json.dumps(WorkerResult.model_json_schema(), sort_keys=True)
             blocked = json.dumps(WorkerBlocked.model_json_schema(), sort_keys=True)
+            resumed_base = ""
+            if lane_record.base_sha is not None:
+                resumed_base = (
+                    f"The lane's frozen base is {lane_record.base_sha}. The assigned checkout "
+                    "already contains committed work from a previous worker attempt. Use "
+                    "that frozen base, not the checkout's starting HEAD, as "
+                    "review_revision.base_sha; compute changed_paths and diff_sha256 over "
+                    "the full <base>..<head> diff from that frozen base.\n"
+                )
             return (
-                "Implement the scoped issue, verify it, and commit the result. Compute "
+                resumed_base
+                + "Implement the scoped issue, verify it, and commit the result. Compute "
                 "diff_sha256 over the raw output of `git diff --binary --full-index "
                 "<base>..<head> --` and report the exact sorted changed paths. Send worker_done "
                 "with an explicit outcome and body set to only the changeset JSON matching "

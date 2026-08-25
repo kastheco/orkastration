@@ -2839,6 +2839,61 @@ async def test_resuming_live_failed_worker_retries_without_reblocking(
     assert len(orca.created_worktrees) == 1
 
 
+async def test_resumed_worker_reports_the_frozen_lane_base(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    first_worker = store.stages(run_id)[0]
+    first_spec = str(orca.tasks_by_id[str(first_worker.orca_task_id)]["spec"])
+    lane_worktree = store.lanes(run_id)[0].worktree_id
+    assert lane_worktree is not None
+
+    # The worker committed before its dispatch failed, leaving the lane ahead
+    # of its frozen base for the replacement worker to report.
+    committed_head = "c" * 40
+    git.heads[lane_worktree] = committed_head
+    orca.fail_dispatched()
+    blocked = await value.monitor(run_id)
+    assert blocked.status == "blocked"
+
+    value.resume(run_id, None, "retry the worker with its existing checkout")
+    resumed = await value.monitor(run_id)
+    replacement = next(
+        stage
+        for stage in resumed.stages
+        if stage.role is StageKind.WORKER and stage.stage_id != first_worker.stage_id
+    )
+    assert replacement.worktree_id == lane_worktree
+    assert orca.starts[-1]["worktree_id"] == lane_worktree
+    resumed_spec = str(orca.tasks_by_id[str(replacement.orca_task_id)]["spec"])
+    assert resumed_spec.endswith(first_spec)
+    assert "The lane's frozen base is aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in resumed_spec
+    assert "already contains committed work from a previous worker attempt" in resumed_spec
+
+    reported = json.loads(worker_result())
+    reported["review_revision"] = {
+        "base_sha": "a" * 40,
+        "head_sha": committed_head,
+        "diff_sha256": "c" * 64,
+    }
+    reported["commit_sha"] = committed_head
+    orca.complete_dispatched(json.dumps(reported))
+
+    accepted = await value.monitor(run_id)
+
+    assert accepted.status == "active"
+    worker = store.worker_result(store.lanes(run_id)[0].lane_id)
+    assert worker.review_revision.base_sha == "a" * 40
+    settled_replacement = next(
+        stage for stage in store.stages(run_id) if stage.stage_id == replacement.stage_id
+    )
+    assert settled_replacement.phase is StagePhase.COMPLETED
+    assert settled_replacement.processed is True
+
+
 async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(
     tmp_path: Path,
 ) -> None:
