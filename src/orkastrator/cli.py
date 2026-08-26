@@ -727,10 +727,8 @@ def _run[T](
     ) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(result, json_output=json_output)
-    if isinstance(result, BaseModel) and result.__class__.model_fields.get("status") is not None:
-        status = getattr(result, "status", None)
-        if status in failure_statuses:
-            raise typer.Exit(code=1)
+    if getattr(result, "status", None) in failure_statuses:
+        raise typer.Exit(code=1)
 
 
 def _policy_change_lines(run_id: str, result: PolicyReauthorization) -> list[str]:

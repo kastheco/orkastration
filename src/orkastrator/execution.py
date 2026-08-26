@@ -2628,14 +2628,14 @@ class ExecutionController:
         known_finding_ids = {
             item.finding_id for item in self._store.findings(run_id, lane.lane_id)
         }
+        if finding.id in finding.dependencies:
+            raise ValueError(f"finding {finding.id} cannot depend on itself")
         unknown_dependencies = set(finding.dependencies).difference(known_finding_ids)
         if unknown_dependencies:
             raise ValueError(
                 f"recovery finding {finding.id} depends on unknown findings "
                 f"{sorted(unknown_dependencies)}"
             )
-        if finding.id in finding.dependencies:
-            raise ValueError(f"finding {finding.id} cannot depend on itself")
         if not await self._git.is_clean(lane.worktree_id):
             raise ValueError(f"lane {lane.name} checkout is dirty; refusing finding recovery")
         checkout_head = await self._git.head(lane.worktree_id)
@@ -2664,7 +2664,7 @@ class ExecutionController:
                 ],
             }
         )
-        _require_a_provable_finding([governed], [])
+        _require_a_provable_finding(*_partition_runnable_findings([governed]))
         governed = (await self._freeze_validation_baselines(lane.worktree_id, [governed]))[0]
         if not await self._git.is_clean(lane.worktree_id):
             raise ValueError("recovery validation dirtied the lane checkout")

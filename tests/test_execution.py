@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -5455,6 +5455,48 @@ async def test_recovery_refuses_unproven_lane_state(
     git.lane_head_override = checkout_head
     recovery_data = review_finding_data(2)
     recovery_data.pop("review_revision")
+
+    with pytest.raises(ValueError, match=message):
+        await value.recover_finding(
+            run_id,
+            source.finding_id,
+            ReviewFinding.model_validate(recovery_data),
+            "the old finding no longer describes the defect",
+        )
+
+    assert [item.finding_id for item in store.findings(run_id)] == [source.finding_id]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda data: data.__setitem__(
+                "validation", [{"command": "cd pi && npm run typecheck", "expected": "passes"}]
+            ),
+            "no finding in this review carries runnable validation",
+        ),
+        (
+            lambda data: data.__setitem__("dependencies", ["finding-2"]),
+            "finding finding-2 cannot depend on itself",
+        ),
+    ],
+)
+async def test_recovery_refuses_a_contract_it_can_never_prove(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, object]], None],
+    message: str,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    source = store.findings(run_id)[0]
+    store.set_finding_state(run_id, source.finding_key, phase=FindingPhase.BLOCKED)
+    recovery_data = review_finding_data(2)
+    recovery_data.pop("review_revision")
+    mutate(recovery_data)
 
     with pytest.raises(ValueError, match=message):
         await value.recover_finding(
