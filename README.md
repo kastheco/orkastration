@@ -230,10 +230,11 @@ uv run --project /home/kas/dev/orkastrator orkas resume <run-id> \
   --lane <lane-name> --note "why" --json
 ```
 
-Without `--lane` it resumes every blocked lane in the run. It clears the lane block and the run status
-the block wrote, because a run row left `blocked` reads as stopped even once every lane is healthy. A
-blocked lane no longer stops the others in the first place: the run reports terminal only when nothing
-is left that could still move, and the per-lane phases carry the block until then.
+Without `--lane` it resumes every blocked lane and every lane whose stage report could not be read. For
+an unreadable report it preserves the rejected attempt, retires its scheduler key, and dispatches a
+replacement in the lane checkout so a commit already on disk can be reported into the ledger. A worker
+that explicitly failed, or whose result failed repository validation, remains `failed`; `resume` refuses
+to turn that work failure into a report retry.
 
 Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
 so it is a separate command from `reopen` and it records the note as evidence:

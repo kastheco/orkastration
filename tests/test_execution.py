@@ -335,7 +335,9 @@ class FakeOrca:
                 return str(start["dispatch_id"]), str(start["worktree_id"])
         return None
 
-    def complete_dispatched(self, body: str | None = None) -> None:
+    def complete_dispatched(
+        self, body: str | None = None, *, outcome: str = "succeeded"
+    ) -> None:
         resolved_body = worker_result() if body is None else body
         for task_id, task in self.tasks_by_id.items():
             if task["status"] != "dispatched":
@@ -344,7 +346,7 @@ class FakeOrca:
             task["result"] = json.dumps(
                 {
                     "provenance": "worker_report",
-                    "outcome": "succeeded",
+                    "outcome": outcome,
                     "messageId": f"message-{task_id}",
                     "reportedBy": "terminal-1",
                     "subject": "done",
@@ -3142,6 +3144,101 @@ async def test_resuming_live_failed_worker_retries_without_reblocking(
     assert resumed.worktree_id == lane_worktree
     assert orca.starts[-1]["worktree_id"] == lane_worktree
     assert len(orca.created_worktrees) == 1
+
+
+async def test_unreadable_worker_report_can_be_resumed_and_reconciled(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    rejected_worker = store.stages(run_id)[0]
+    lane_worktree = store.lanes(run_id)[0].worktree_id
+    assert lane_worktree is not None
+
+    orca.complete_dispatched("not-json")
+    rejected = await value.monitor(run_id)
+
+    assert rejected.status == "report_failed"
+    assert rejected.lanes[0].phase is LanePhase.REPORT_FAILED
+    rejection = next(
+        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
+    )
+    rejection_payload = rejection["payload"]
+    assert isinstance(rejection_payload, dict)
+    assert rejection_payload["rejection_kind"] == "report_unreadable"
+
+    value.resume(run_id, None, "re-report the committed worker result")
+    resumed = await value.monitor(run_id)
+
+    retired = next(
+        stage for stage in resumed.stages if stage.stage_id == rejected_worker.stage_id
+    )
+    replacement = next(
+        stage
+        for stage in resumed.stages
+        if stage.role is StageKind.WORKER and stage.stage_id != rejected_worker.stage_id
+    )
+    assert resumed.status == "active"
+    assert resumed.lanes[0].phase is LanePhase.ACTIVE
+    assert retired.phase is StagePhase.COMPLETED
+    assert ":resumed" in retired.stage_key
+    assert replacement.worktree_id == lane_worktree
+    assert orca.starts[-1]["worktree_id"] == lane_worktree
+
+    orca.complete_dispatched(worker_result())
+    reconciled = await value.monitor(run_id)
+
+    assert store.worker_result(reconciled.lanes[0].lane_id).commit_sha == "b" * 40
+    assert any(
+        stage.role is StageKind.INITIAL_REVIEWER and stage.phase is StagePhase.DISPATCHED
+        for stage in reconciled.stages
+    )
+
+
+async def test_failed_worker_outcome_is_not_resumed_as_a_report_failure(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_result(), outcome="failed")
+    failed = await value.monitor(run_id)
+
+    assert failed.status == "failed"
+    assert failed.lanes[0].phase is LanePhase.FAILED
+    rejection = next(
+        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
+    )
+    rejection_payload = rejection["payload"]
+    assert isinstance(rejection_payload, dict)
+    assert rejection_payload["rejection_kind"] == "work_failed"
+    with pytest.raises(ValueError, match="no blocked lane to resume"):
+        value.resume(run_id, None, "do not retry genuine failed work")
+
+
+async def test_legacy_failed_lane_with_unreadable_report_can_be_resumed(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched("not-json")
+    rejected = await value.monitor(run_id)
+    lane = rejected.lanes[0]
+    store.set_lane_phase(run_id, lane.lane_id, LanePhase.FAILED)
+    store.set_terminal_status(run_id, "failed")
+
+    value.resume(run_id, lane.name, "recover the legacy failed report")
+    resumed = await value.monitor(run_id)
+
+    assert resumed.status == "active"
+    assert resumed.lanes[0].phase is LanePhase.ACTIVE
+    assert any(
+        stage.role is StageKind.WORKER and stage.phase is StagePhase.DISPATCHED
+        for stage in resumed.stages
+    )
 
 
 async def test_resumed_worker_reports_the_frozen_lane_base(tmp_path: Path) -> None:

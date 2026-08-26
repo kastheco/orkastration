@@ -373,7 +373,9 @@ def test_watch_stops_on_a_parked_question(fake_wiring: None) -> None:
     assert payload["exit_reason"] == "unanswered_question"
 
 
-@pytest.mark.parametrize("terminal_phase", [LanePhase.BLOCKED, LanePhase.FAILED])
+@pytest.mark.parametrize(
+    "terminal_phase", [LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.REPORT_FAILED]
+)
 def test_watch_survives_a_terminal_lane_while_another_stage_is_dispatched(
     fake_wiring: None, terminal_phase: LanePhase
 ) -> None:
@@ -408,7 +410,9 @@ def test_watch_survives_a_terminal_lane_while_another_stage_is_dispatched(
     assert payload["exit_reason"] == "terminal_graph"
 
 
-@pytest.mark.parametrize("terminal_phase", [LanePhase.BLOCKED, LanePhase.FAILED])
+@pytest.mark.parametrize(
+    "terminal_phase", [LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.REPORT_FAILED]
+)
 def test_watch_survives_every_lane_terminal_while_a_stage_is_still_dispatched(
     fake_wiring: None, terminal_phase: LanePhase
 ) -> None:
