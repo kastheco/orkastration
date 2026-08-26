@@ -1892,6 +1892,7 @@ async def test_integrated_receipt_replay_settles_every_composite_finding(
         integrated_sha="f" * 40,
         validation_results=[],
     )
+    git.heads["repo::/tmp/issue"] = "f" * 40
 
     result = await value.monitor(run_id)
 
@@ -3037,6 +3038,80 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     assert publisher.publish_calls == [("b" * 40, None)]
     assert store.publications(run_id)[0].draft
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
+
+
+async def test_publication_refuses_and_records_a_checkout_ahead_of_the_ledger(
+    tmp_path: Path,
+) -> None:
+    checkout_head_sha = "d" * 40
+
+    class CheckoutAdvancesAfterReviewGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self._review_started = False
+            self._review_head_pending = False
+
+        async def pytest_coverage_configured(self, worktree_id: str | None) -> bool:
+            self._review_started = True
+            self._review_head_pending = True
+            return await super().pytest_coverage_configured(worktree_id)
+
+        async def head(self, worktree_id: str) -> str:
+            if worktree_id == "repo::/tmp/issue" and self._review_head_pending:
+                self._review_head_pending = False
+                return await super().head(worktree_id)
+            if worktree_id == "repo::/tmp/issue" and self._review_started:
+                return checkout_head_sha
+            return await super().head(worktree_id)
+
+    orca = FakeOrca()
+    git = CheckoutAdvancesAfterReviewGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    recorded_head_sha = "b" * 40
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    divergence = next(
+        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
+    )
+    assert divergence["payload"] == {
+        "recorded_head_sha": recorded_head_sha,
+        "checkout_head_sha": checkout_head_sha,
+    }
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    assert blocked[-1]["payload"]["reason"] == (
+        f"lane checkout HEAD {checkout_head_sha} does not match recorded integration head "
+        f"{recorded_head_sha}; refusing publication"
+    )
+
+
+async def test_publication_with_an_agreeing_checkout_uses_the_recorded_head(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert publisher.publish_calls == [("b" * 40, None)]
+    assert not [
+        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
+    ]
 
 
 async def test_failed_round_one_reviewer_does_not_stop_resolved_round_two_publication(
