@@ -3218,6 +3218,46 @@ async def test_failed_worker_outcome_is_not_resumed_as_a_report_failure(tmp_path
         value.resume(run_id, None, "do not retry genuine failed work")
 
 
+async def test_legacy_work_failure_is_not_resumed_as_a_report_failure(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    orca.complete_dispatched(worker_result(), outcome="failed")
+    failed = await value.monitor(run_id)
+    lane = failed.lanes[0]
+    rejection = next(
+        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
+    )
+    with Session(store._engine) as session:
+        rows = session.exec(
+            select(EventRow).where(
+                EventRow.run_id == run_id,
+                EventRow.kind == "stage_result_rejected",
+            )
+        ).all()
+        row = next(
+            row
+            for row in rows
+            if json.loads(row.payload_json).get("stage_id") == rejection["payload"]["stage_id"]
+        )
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        assert isinstance(payload, dict)
+        payload.pop("rejection_kind")
+        payload["reason"] = "invalid structured result: worker reported a failed outcome"
+        row.payload_json = json.dumps(payload)
+        session.commit()
+
+    assert store.lane_has_recoverable_report_failure(run_id, lane.lane_id) is False
+    with pytest.raises(ValueError, match="no blocked lane to resume"):
+        value.resume(run_id, lane.name, "do not retry legacy failed work")
+    assert len(store.stages(run_id)) == 1
+
+
 async def test_legacy_failed_lane_with_unreadable_report_can_be_resumed(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, store = controller(tmp_path, orca)

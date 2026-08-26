@@ -2307,8 +2307,8 @@ class StateStore:
         """Return live lane-level attempts rejected because their report was unreadable.
 
         The reason-prefix fallback recognizes rows written before KAS-686 added
-        the explicit rejection kind, so existing failed runs gain the recovery
-        route too.
+        the explicit rejection kind, but excludes the old work-failure messages
+        that used the same prefix.
         """
 
         events = session.exec(
@@ -2327,12 +2327,40 @@ class StateStore:
                 continue
             kind = payload.get("rejection_kind")
             reason = payload.get("reason")
-            if kind != "report_unreadable" and not (
-                kind is None
-                and isinstance(reason, str)
-                and reason.startswith("invalid structured result:")
+            if kind == "report_unreadable":
+                pass
+            elif kind is not None or not (
+                isinstance(reason, str) and reason.startswith("invalid structured result:")
             ):
                 continue
+            elif kind is None:
+                detail = reason.removeprefix("invalid structured result:").strip()
+                legacy_work_failure_markers = (
+                    "worker reported a failed outcome",
+                    "worker ",
+                    "blocked worker ",
+                    "initial review ",
+                    "validation runner ",
+                    "fixed attempt ",
+                    "ci fixer ",
+                    "fixer ",
+                    "re-review ",
+                    "escalation ",
+                    "stage ",
+                    "finding ",
+                    "integration ",
+                    "accepted integration ",
+                    "approved fixer ",
+                    "lane ",
+                    "git ",
+                    "worktree ",
+                    "cannot move dirty lane checkout ",
+                    "failed to abort cherry-pick ",
+                    "not a local orca identity",
+                    "bad object ",
+                )
+                if detail.casefold().startswith(legacy_work_failure_markers):
+                    continue
             stage_id = payload.get("stage_id")
             if not isinstance(stage_id, str):
                 continue

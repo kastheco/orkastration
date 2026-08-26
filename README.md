@@ -234,7 +234,8 @@ Without `--lane` it resumes every blocked lane and every lane whose stage report
 an unreadable report it preserves the rejected attempt, retires its scheduler key, and dispatches a
 replacement in the lane checkout so a commit already on disk can be reported into the ledger. A worker
 that explicitly failed, or whose result failed repository validation, remains `failed`; `resume` refuses
-to turn that work failure into a report retry.
+to turn that work failure into a report retry. For pre-KAS-686 rows without a rejection kind, resume
+recognizes the legacy unreadable-report reason only when it does not match a known work-failure message.
 
 Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
 so it is a separate command from `reopen` and it records the note as evidence:
