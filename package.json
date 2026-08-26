@@ -1,0 +1,30 @@
+{
+  "name": "orkastrator-pi-monitors",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi footer status for live orkastrator monitor tasks",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "orkastrator"
+  ],
+  "files": [
+    "extensions/orkastrator-monitors",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/orkastrator-monitors/index.ts"
+    ]
+  },
+  "scripts": {
+    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts"
+  }
+}

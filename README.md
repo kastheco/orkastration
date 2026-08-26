@@ -105,6 +105,10 @@ publication receipt. A merge conflict raises a lane-scoped `integration_conflict
 than failing the run.
 orkastrator does not deploy.
 
+Pi users can install the optional [orkastrator monitor extension](extensions/orkastrator-monitors/README.md)
+to show live `orkas monitor --watch` background tasks in Pi's footer and inspect their recorded
+details with `/orkastrator-monitors`.
+
 A finding can settle wrongly - most often because the supervisor lacked a word for what an
 adjudicator meant. `orkas reopen` sends it back to an earlier phase, retires the settled stages at
 and after that round, and drops the frozen contracts the reopened phase supersedes. It keeps a
