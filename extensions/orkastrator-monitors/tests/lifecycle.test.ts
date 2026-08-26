@@ -156,3 +156,45 @@ test("reload starts one replacement timer and untrusted sessions never read task
   assert.equal(discoveryCalls, 2);
   assert.deepEqual(untrusted.statuses.at(-1), [STATUS_KEY, undefined]);
 });
+
+test("throwing host UI during a poll does not emit an unhandled rejection", async () => {
+  const handlers = new Map<string, (...args: never[]) => unknown>();
+  const callbacks = new Map<number, () => void>();
+  let nextTimer = 1;
+  let statusCalls = 0;
+  const api = {
+    on: (event: string, handler: (...args: never[]) => unknown) => handlers.set(event, handler),
+    registerCommand: () => undefined,
+  };
+  const timers = {
+    setInterval: (callback: () => void) => {
+      const id = nextTimer++;
+      callbacks.set(id, callback);
+      return id as unknown as ReturnType<typeof setInterval>;
+    },
+    clearInterval: (handle: ReturnType<typeof setInterval>) => callbacks.delete(handle as unknown as number),
+  };
+  installOrkastratorMonitors(api as never, {
+    discover: async () => [task()],
+    timers,
+  });
+
+  const ctx = context();
+  ctx.ui.setStatus = (key, value) => {
+    statusCalls += 1;
+    if (statusCalls === 2) throw new Error("ui gone");
+    ctx.statuses.push([key, value]);
+  };
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx as never);
+    assert.equal(callbacks.size, 1);
+    [...callbacks.values()][0]!();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});

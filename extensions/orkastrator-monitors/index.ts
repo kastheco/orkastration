@@ -40,11 +40,23 @@ export function installOrkastratorMonitors(
 
   const stop = (ctx?: ExtensionContext): void => {
     generation += 1;
-    if (timer !== undefined) timers.clearInterval(timer);
+    const activeTimer = timer;
     timer = undefined;
-    (ctx ?? currentContext)?.ui.setStatus(STATUS_KEY, undefined);
+    if (activeTimer !== undefined) {
+      try {
+        timers.clearInterval(activeTimer);
+      } catch {
+        // A host timer failure must not escape the lifecycle callback.
+      }
+    }
+    const statusContext = ctx ?? currentContext;
     currentContext = undefined;
     currentTasks = [];
+    try {
+      statusContext?.ui.setStatus(STATUS_KEY, undefined);
+    } catch {
+      // The host may tear down the status pane before the extension does.
+    }
   };
 
   const refresh = (ctx: ExtensionContext): Promise<void> => {
@@ -53,39 +65,50 @@ export function installOrkastratorMonitors(
     }
     const refreshGeneration = generation;
     const promise = (async () => {
-      if (!ctx.isProjectTrusted()) {
-        currentTasks = [];
-        ctx.ui.setStatus(STATUS_KEY, undefined);
-        return;
+      try {
+        if (!ctx.isProjectTrusted()) {
+          currentTasks = [];
+          ctx.ui.setStatus(STATUS_KEY, undefined);
+          return;
+        }
+        const tasks = await discover(ctx.cwd);
+        if (generation !== refreshGeneration) return;
+        currentContext = ctx;
+        currentTasks = tasks;
+        ctx.ui.setStatus(STATUS_KEY, renderMonitorFooter(tasks));
+      } catch {
+        // Discovery and host UI calls are best-effort for each refresh tick.
       }
-      const tasks = await discover(ctx.cwd).catch(() => []);
-      if (generation !== refreshGeneration) return;
-      currentContext = ctx;
-      currentTasks = tasks;
-      ctx.ui.setStatus(STATUS_KEY, renderMonitorFooter(tasks));
     })();
     inFlight = promise;
     inFlightGeneration = refreshGeneration;
-    void promise.finally(() => {
+    const clearInFlight = (): void => {
       if (inFlight === promise) {
         inFlight = undefined;
         inFlightGeneration = undefined;
       }
-    });
+    };
+    void promise.then(clearInFlight, clearInFlight);
     return promise;
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    stop();
-    currentContext = ctx;
-    if (!ctx.isProjectTrusted()) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-      return;
+    try {
+      stop();
+      currentContext = ctx;
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+      const sessionGeneration = generation;
+      await refresh(ctx);
+      if (generation !== sessionGeneration) return;
+      timer = timers.setInterval(() => {
+        void refresh(ctx).catch(() => undefined);
+      }, POLL_INTERVAL_MS);
+    } catch {
+      stop(ctx);
     }
-    const sessionGeneration = generation;
-    await refresh(ctx);
-    if (generation !== sessionGeneration) return;
-    timer = timers.setInterval(() => void refresh(ctx), POLL_INTERVAL_MS);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -95,13 +118,17 @@ export function installOrkastratorMonitors(
   pi.registerCommand("orkastrator-monitors", {
     description: "Show recorded orkastrator monitor task details",
     handler: async (_args, ctx) => {
-      if (!ctx.isProjectTrusted()) {
-        ctx.ui.notify("Project trust is required to inspect .pi/tasks.", "warning");
-        return;
+      try {
+        if (!ctx.isProjectTrusted()) {
+          ctx.ui.notify("Project trust is required to inspect .pi/tasks.", "warning");
+          return;
+        }
+        currentContext = ctx;
+        await refresh(ctx);
+        ctx.ui.notify(renderMonitorDetails(currentTasks, now()), "info");
+      } catch {
+        // Command output is best-effort when the host UI is being torn down.
       }
-      currentContext = ctx;
-      await refresh(ctx);
-      ctx.ui.notify(renderMonitorDetails(currentTasks, now()), "info");
     },
   });
 }
