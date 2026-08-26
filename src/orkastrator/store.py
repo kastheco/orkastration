@@ -2035,6 +2035,16 @@ class StateStore:
             ).first()
             if active is not None:
                 raise IntegrationBusyError(f"lane {finding.lane_id} is integrating another finding")
+            if (
+                attempt is not None
+                and row.status == "validation_failed"
+                and row.integrated_sha is not None
+                and row.integrated_sha != attempt.base_sha
+            ):
+                # The applied commit is already behind the lane head. Keep its
+                # failed verdict settled instead of reopening it and replaying an
+                # ancestor, which would move the checkout back to a stale base.
+                return _integration(row)
             superseded: dict[str, object] = {"previous_status": row.status}
             if attempt is not None and attempt.fixer_commit_sha != row.fixer_commit_sha:
                 superseded["previous_commit_sha"] = row.fixer_commit_sha

@@ -1228,7 +1228,9 @@ class ExecutionController:
             # same frozen output until it blocked. Only an integrated receipt above
             # is terminal; these two are facts about one attempt.
             if readjudicated:
-                receipt = self._store.reopen_integration(run_id, finding) or receipt
+                receipt = self._store.reopen_integration(
+                    run_id, finding, attempt=identity
+                ) or receipt
             if receipt.status != "starting":
                 self._escalate(
                     run_id,

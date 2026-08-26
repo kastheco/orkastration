@@ -1899,6 +1899,75 @@ async def test_two_failed_validations_keep_the_lane_head_on_the_checkout_and_pub
     assert publisher.publish_calls == [(receipts[-1].integrated_sha, None)]
 
 
+async def test_readjudicating_an_earlier_failed_integration_keeps_the_advanced_head(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(max_workers=2, max_fixers=2),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(1), review_finding_data(2))
+    for start in [item for item in orca.starts if "fixer" in str(item["lane_name"])]:
+        finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
+        orca.complete_task(str(start["task_id"]), fix_attempt(finding_id))
+    result = await value.monitor(run_id)
+    for started in result.started:
+        stage = next(item for item in store.stages(run_id) if item.orca_task_id == started.task_id)
+        assert stage.finding_id is not None
+        orca.complete_task(started.task_id, re_review("resolved", finding_id=stage.finding_id))
+
+    await value.monitor(run_id)
+    result = await value.monitor(run_id)
+    receipts = store.integrations(run_id)
+    first, second = receipts
+    assert first.status == "validation_failed"
+    assert second.status == "validation_failed"
+    assert first.integrated_sha is not None
+    assert second.integrated_sha is not None
+    assert first.integrated_sha != second.integrated_sha
+
+    escalation_stage = next(
+        stage
+        for stage in store.stages(run_id)
+        if stage.role is StageKind.ESCALATION and stage.finding_id == "finding-1"
+    )
+    assert escalation_stage.orca_task_id is not None
+    orca.complete_task(
+        escalation_stage.orca_task_id,
+        escalation("validation_failed", "accept_fix", finding_id="finding-1"),
+    )
+    result = await value.monitor(run_id)
+
+    assert git.restore_calls == []
+    assert git.heads["repo::/tmp/issue"] == second.integrated_sha
+    assert store.lanes(run_id)[0].integration_head_sha == second.integrated_sha
+    assert store.integrations(run_id)[0].status == "validation_failed"
+    assert (
+        next(item for item in result.findings if item.finding_id == "finding-1").escalation_reason
+        is FindingReason.VALIDATION_FAILED
+    )
+
+    for finding in result.findings:
+        store.settle_finding(
+            run_id,
+            finding.finding_id,
+            phase=FindingPhase.DEFERRED,
+            note="validation failure independently adjudicated",
+        )
+    result = await value.monitor(run_id)
+    assert result.status == "complete"
+    assert publisher.publish_calls == [(second.integrated_sha, None)]
+
+
 async def test_integration_rolls_back_when_the_applied_head_cannot_be_recorded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
