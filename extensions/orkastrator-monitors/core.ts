@@ -61,7 +61,9 @@ export function tokenizeCommand(command: string): string[] | undefined {
   let escaped = false;
   let started = false;
 
-  for (const char of command.trim()) {
+  const chars = [...command.trim()];
+  for (let index = 0; index < chars.length; index += 1) {
+    const char = chars[index]!;
     if (escaped) {
       token += char;
       escaped = false;
@@ -87,6 +89,15 @@ export function tokenizeCommand(command: string): string[] | undefined {
       started = true;
       continue;
     }
+    if (char === "&") {
+      if (chars[index + 1] !== "&") return undefined;
+      if (started) tokens.push(token);
+      tokens.push("&&");
+      token = "";
+      started = false;
+      index += 1;
+      continue;
+    }
     if (/\s/u.test(char)) {
       if (char === "\n" || char === "\r") return undefined;
       if (started) tokens.push(token);
@@ -94,7 +105,7 @@ export function tokenizeCommand(command: string): string[] | undefined {
       started = false;
       continue;
     }
-    if (";&|<>$`".includes(char)) return undefined;
+    if (";|<>$`".includes(char)) return undefined;
     token += char;
     started = true;
   }
@@ -104,12 +115,19 @@ export function tokenizeCommand(command: string): string[] | undefined {
   return tokens.length > 0 ? tokens : undefined;
 }
 
-function orkastratorCommandIndex(tokens: readonly string[]): number | undefined {
-  const direct = basename(tokens[0] ?? "");
-  if (direct === "orkas" || direct === "orkastrator") return 0;
-  if (basename(tokens[0] ?? "") !== "uv" || tokens[1] !== "run") return undefined;
+function isEnvironmentAssignment(token: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*$/u.test(token);
+}
 
-  let index = 2;
+function orkastratorCommandIndex(tokens: readonly string[], startIndex = 0): number | undefined {
+  let index = startIndex;
+  while (index < tokens.length && isEnvironmentAssignment(tokens[index] ?? "")) index += 1;
+
+  const direct = basename(tokens[index] ?? "");
+  if (direct === "orkas" || direct === "orkastrator") return index;
+  if (direct !== "uv" || tokens[index + 1] !== "run") return undefined;
+
+  index += 2;
   while (index < tokens.length) {
     const token = tokens[index] ?? "";
     const executable = basename(token);
@@ -139,7 +157,12 @@ function orkastratorCommandIndex(tokens: readonly string[]): number | undefined 
 export function parseMonitorCommand(command: string): ParsedMonitorCommand | undefined {
   const tokens = tokenizeCommand(command);
   if (!tokens) return undefined;
-  const commandIndex = orkastratorCommandIndex(tokens);
+  let commandStart = 0;
+  if (tokens[0] === "cd") {
+    if (tokens.length < 4 || tokens[2] === undefined || tokens[2] !== "&&") return undefined;
+    commandStart = 3;
+  }
+  const commandIndex = orkastratorCommandIndex(tokens, commandStart);
   if (commandIndex === undefined) return undefined;
 
   const args = tokens.slice(commandIndex + 1);

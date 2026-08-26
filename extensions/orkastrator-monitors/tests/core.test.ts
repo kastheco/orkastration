@@ -10,12 +10,14 @@ import {
 } from "../core.ts";
 
 const RUN_ID = "bb9a9b29-bd4e-4a34-91a0-d471eb4b0a28";
+const RECORDED_COMMAND =
+  "cd /home/kas/dev/orkastrator-supervisor && ORKASTRATOR_CONFIG=/home/kas/dev/orkastrator-supervisor/orkastrator.yaml uv run --project /home/kas/dev/orkastrator-supervisor orkas monitor 0bb455e2-3bd4-4bbc-ae5c-aa7617f53a46 --watch --interval 5 --json";
 
 function fixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: "b1234abcd",
     name: "KAS-706 monitor",
-    command: `uv run --project /repo orkas monitor ${RUN_ID} --watch --interval 5 --json`,
+    command: RECORDED_COMMAND,
     description: "watch the run",
     status: "running",
     outputPath: ".pi/tasks/session-abc-123/b1234abcd.output",
@@ -57,6 +59,9 @@ test("parses direct and uv-wrapped monitor commands narrowly", () => {
     ),
     { runId: RUN_ID },
   );
+  assert.deepEqual(parseMonitorCommand(RECORDED_COMMAND), {
+    runId: "0bb455e2-3bd4-4bbc-ae5c-aa7617f53a46",
+  });
 
   for (const command of [
     `orkas monitor ${RUN_ID}`,
@@ -67,6 +72,13 @@ test("parses direct and uv-wrapped monitor commands narrowly", () => {
     `orkas monitor ${RUN_ID} --watch && echo done`,
     `orkas monitor ${RUN_ID} --watch --unknown`,
     `orkas monitor ${RUN_ID} --watch $(touch nope)`,
+    `orkas monitor ${RUN_ID} --watch | cat`,
+    `orkas monitor ${RUN_ID} --watch > /tmp/monitor`,
+    `cd /repo && orkas monitor ${RUN_ID} --watch && echo done`,
+    `cd /repo && FOO=bar orkas monitor ${RUN_ID} --watch && echo done`,
+    `cd /repo && FOO=bar orkas monitor ${RUN_ID} --watch $(touch nope)`,
+    `cd /repo /other && orkas monitor ${RUN_ID} --watch`,
+    `cd /repo && FOO orkas monitor ${RUN_ID} --watch`,
   ]) {
     assert.equal(parseMonitorCommand(command), undefined, command);
   }
@@ -77,7 +89,8 @@ test("parses a current bg_run JSON fixture and marks dead running tasks stale", 
   assert.deepEqual(
     live,
     task({
-      command: `uv run --project /repo orkas monitor ${RUN_ID} --watch --interval 5 --json`,
+      command: RECORDED_COMMAND,
+      runId: "0bb455e2-3bd4-4bbc-ae5c-aa7617f53a46",
       outputPath: ".pi/tasks/session-abc-123/b1234abcd.output",
       sourcePath: "/fixture.json",
     }),

@@ -48,10 +48,12 @@ permissions.
 
 ## usage
 
-The footer includes only records whose command is a narrow `orkas monitor <uuid> --watch`
-invocation, whose recorded status is `running`, and whose recorded PID is alive. Multiple monitors
-are summarized to stay within a 72-column status budget. Terminal and stale records do not remain in
-the footer.
+The footer includes only records whose command matches the narrow supported shell prefix: an optional
+single leading `cd <dir> &&`, optional plain `NAME=value` environment assignments, then direct
+`orkas`/`orkastrator` or the supported `uv run` wrapper, followed by `monitor <uuid> --watch` and its
+supported options. The recorded status must be `running` and the recorded PID must be alive. Multiple
+monitors are summarized to stay within a 72-column status budget. Terminal and stale records do not
+remain in the footer.
 
 `/orkastrator-monitors` reads the current metadata and reports each recognized task's exact task ID,
 run ID, PID, recorded status, elapsed time when it can be computed, and output path. It does not
