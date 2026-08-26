@@ -2639,11 +2639,11 @@ class ExecutionController:
         if stage.role is StageKind.FIXER:
             schema = json.dumps(FixAttempt.model_json_schema(), sort_keys=True)
             prior = self._store.fix_attempt(finding.finding_key, finding.round - 1)
-            conflict_context = self._fixer_conflict_context(finding)
-            prefix = (
+            prefix_head = (
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
-                f"{conflict_context}"
+            )
+            prefix_tail = (
                 "Start from the assigned frozen review head and produce exactly one commit that "
                 "fully resolves the finding. Do not widen scope. Run exactly the validation "
                 "commands this finding names and report each one; they are the whole obligation, "
@@ -2652,6 +2652,19 @@ class ExecutionController:
                 "and spend your effort on status, changed_paths and validation_results. Send "
                 f"worker_done with body set to only the JSON matching this schema: {schema}"
             )
+            conflict_context = self._fixer_conflict_context(finding, max_hunk_bytes=0)
+            prefix = prefix_head + conflict_context + prefix_tail
+            hunk_budget = (
+                MAX_TASK_SPEC_BYTES
+                - len(f"{prefix}\n\n\n\n{context}".encode())
+                - self._config.frozen_diff_budget_bytes
+                + len(_CONFLICT_HUNK_TRUNCATION_MARKER.encode())
+            )
+            if hunk_budget > 0:
+                conflict_context = self._fixer_conflict_context(
+                    finding, max_hunk_bytes=hunk_budget
+                )
+                prefix = prefix_head + conflict_context + prefix_tail
             return await self._stage_spec_with_frozen_diff(
                 prefix, context, lane_record, stage, run_id
             )
@@ -2686,7 +2699,9 @@ class ExecutionController:
             f"{context}"
         )
 
-    def _fixer_conflict_context(self, finding: FindingRecord) -> str:
+    def _fixer_conflict_context(
+        self, finding: FindingRecord, *, max_hunk_bytes: int | None = None
+    ) -> str:
         """Render the last failed cherry-pick as retry-only fixer evidence."""
 
         receipt = self._store.integration(finding.finding_key, finding.round)
@@ -2695,12 +2710,15 @@ class ExecutionController:
         conflict = receipt.conflict_context
         conflicted = "\n".join(f"- {path}" for path in conflict.conflicted_paths)
         clean = "\n".join(f"- {path}" for path in conflict.cleanly_applied_paths) or "(none)"
+        hunks = conflict.conflicted_hunks
+        if max_hunk_bytes is not None:
+            hunks = _truncate_conflict_hunks(hunks, max_hunk_bytes)
         return (
             "Prior integration conflict (supervisor-captured before abort):\n"
             f"Conflicted paths:\n{conflicted}\n"
             f"Cleanly-applied paths:\n{clean}\n"
             "Conflicted hunks:\n"
-            f"<integration_conflict_hunks>\n{conflict.conflicted_hunks}"
+            f"<integration_conflict_hunks>\n{hunks}"
             "</integration_conflict_hunks>\n"
             "The failed cherry-pick was fully aborted; no partial application was retained. "
             "Use this evidence instead of re-deriving why the prior commit failed, while still "
@@ -2778,6 +2796,26 @@ class ExecutionController:
             budget_bytes=self._config.frozen_diff_budget_bytes,
             max_spec_bytes=max_spec_bytes,
         )
+
+
+def _truncate_conflict_hunks(hunks: str, max_bytes: int) -> str:
+    """Bound conflict hunk evidence while preserving an explicit omission marker."""
+
+    encoded = hunks.encode()
+    if len(encoded) <= max_bytes:
+        return hunks
+    marker = _CONFLICT_HUNK_TRUNCATION_MARKER
+    marker_bytes = len(marker.encode())
+    if max_bytes <= marker_bytes:
+        return marker[:max_bytes].encode().decode("utf-8", errors="ignore")
+    kept = encoded[: max_bytes - marker_bytes].decode("utf-8", errors="ignore")
+    return kept + marker
+
+
+_CONFLICT_HUNK_TRUNCATION_MARKER = (
+    "\n[Conflicted hunk evidence was truncated to fit the task spec; omitted hunk content "
+    "is not included.]"
+)
 
 
 def _format_frozen_diff(

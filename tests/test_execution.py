@@ -33,7 +33,7 @@ from orkastrator.models import (
     ValidationRequirement,
     ValidationResult,
 )
-from orkastrator.orca import JsonObject, OrcaError, OrcaTimeout
+from orkastrator.orca import MAX_TASK_SPEC_BYTES, JsonObject, OrcaError, OrcaTimeout
 from orkastrator.publication import IntegrationConflict, PublicationError, PullRequestLanded
 from orkastrator.store import StateStore
 from tests.factories import (
@@ -2066,6 +2066,29 @@ async def test_conflict_retry_receives_paths_and_conflicted_hunks(tmp_path: Path
     assert "Cleanly-applied paths:\n- src/actions.py\n- src/data.py" in retry_spec
     assert git.conflicted_hunks in retry_spec
     assert "no partial application was retained" in retry_spec
+
+
+async def test_conflict_retry_truncates_oversized_conflicted_hunks(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    git.conflicted_hunks = "diff --cc src/file.py\n" + ("+oversized conflict hunk\n" * 20_000)
+    value, _ = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(escalation("integration_conflict", "approve_unchanged"))
+    result = await value.monitor(run_id)
+
+    retry_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
+    assert len(retry_spec.encode()) <= MAX_TASK_SPEC_BYTES
+    assert "Conflicted hunk evidence was truncated" in retry_spec
+    assert git.conflicted_hunks not in retry_spec
 
 
 async def test_accepting_a_conflicted_fix_rebuilds_it_on_the_lane_head(
