@@ -13,6 +13,7 @@ from orkastrator.publication import (
     CommandResult,
     GitHubPublisher,
     IntegrationConflict,
+    MergeCandidate,
     PublicationError,
     PullRequestLanded,
     _github_repository,
@@ -138,6 +139,120 @@ async def test_land_uses_a_merge_commit_and_records_its_sha() -> None:
     assert "--no-verify" not in merge_call
     subject = merge_call[merge_call.index("--subject") + 1]
     assert subject.startswith("feat(publication): ")
+
+
+async def test_prepare_merge_materializes_and_discards_one_exact_candidate() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    target_sha = "a" * 40
+    tree_sha = "c" * 40
+    merge_sha = "d" * 40
+    runner = QueueRunner(
+        result(),
+        result(target_sha + "\n"),
+        result(),
+        result(),
+        result(tree_sha + "\n"),
+        result(merge_sha + "\n"),
+        result(),
+        result(),
+        result(),
+    )
+    publisher = GitHubPublisher(runner=runner)
+
+    candidate = await publisher.prepare_merge(receipt, worktree_id=f"repo::{Path.cwd()}")
+    await publisher.discard_merge(candidate)
+
+    assert candidate.target_sha == target_sha
+    assert candidate.merge_sha == merge_sha
+    assert runner.calls[0] == (
+        "git",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "refs/heads/main",
+    )
+    assert runner.calls[2][:4] == ("git", "worktree", "add", "--detach")
+    assert runner.calls[3] == ("git", "merge", "--no-commit", "--no-ff", receipt.head_sha)
+    assert runner.calls[4] == ("git", "write-tree")
+    assert runner.calls[5][-6:] == (
+        "-p",
+        target_sha,
+        "-p",
+        receipt.head_sha,
+        "-m",
+        "feat(publication): land issue-123",
+    )
+    assert runner.calls[6] == ("git", "update-ref", candidate.revision_ref, merge_sha)
+    assert runner.calls[7][:4] == ("git", "worktree", "remove", "--force")
+    assert runner.calls[8] == (
+        "git",
+        "update-ref",
+        "-d",
+        candidate.revision_ref,
+        candidate.merge_sha,
+    )
+
+
+async def test_prepare_merge_uses_the_same_candidate_to_report_a_conflict() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    runner = QueueRunner(
+        result(),
+        result("a" * 40 + "\n"),
+        result(),
+        result(stderr="CONFLICT (content): Merge conflict", returncode=1),
+        result(),
+    )
+
+    with pytest.raises(IntegrationConflict, match=r"CONFLICT \(content\)"):
+        await GitHubPublisher(runner=runner).prepare_merge(
+            receipt, worktree_id=f"repo::{Path.cwd()}"
+        )
+
+    assert runner.calls[-1][:4] == ("git", "worktree", "remove", "--force")
+
+
+async def test_land_refuses_a_target_that_moved_after_merge_validation() -> None:
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+    )
+    candidate = MergeCandidate(
+        worktree_id="merge::/tmp/candidate",
+        repository_path=Path.cwd(),
+        revision_ref="refs/orkastrator/merge-candidates/run-1234567890/issue-123",
+        target_sha="a" * 40,
+        merge_sha="c" * 40,
+    )
+    runner = QueueRunner(result(), result("d" * 40 + "\n"))
+
+    with pytest.raises(PublicationError, match="target branch moved"):
+        await GitHubPublisher(runner=runner).land(receipt, candidate=candidate)
+
+    assert len(runner.calls) == 2
 
 
 async def test_land_reports_a_lane_integration_conflict() -> None:

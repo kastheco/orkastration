@@ -39,7 +39,12 @@ from orkastrator.models import (
     ValidationResult,
 )
 from orkastrator.orca import MAX_TASK_SPEC_BYTES, JsonObject, OrcaError, OrcaTimeout
-from orkastrator.publication import IntegrationConflict, PublicationError, PullRequestLanded
+from orkastrator.publication import (
+    IntegrationConflict,
+    MergeCandidate,
+    PublicationError,
+    PullRequestLanded,
+)
 from orkastrator.store import StateStore
 from tests.factories import (
     graph_config_data,
@@ -459,6 +464,7 @@ class FakeGit(LocalGit):
         self.render_diff_calls: list[tuple[str, str, str, tuple[str, ...]]] = []
         self.lane_validation_fails = False
         self.fixer_validation_fails = False
+        self.merge_validation_failures: set[str] = set()
 
     async def pytest_coverage_configured(self, worktree_id: str | None) -> bool:
         return self.coverage_configured
@@ -614,6 +620,7 @@ class FakeGit(LocalGit):
             "failed"
             if (self.lane_validation_fails and worktree_id == "repo::/tmp/issue")
             or (self.fixer_validation_fails and "finding-" in worktree_id)
+            or worktree_id in self.merge_validation_failures
             else "passed"
         )
         return [
@@ -628,6 +635,8 @@ class FakePublisher:
         self.publish_calls: list[tuple[str, str | None]] = []
         self.ready_calls: list[str] = []
         self.land_calls: list[str] = []
+        self.merge_candidates: list[MergeCandidate] = []
+        self.discarded_candidates: list[str] = []
 
     async def publish(
         self,
@@ -662,7 +671,29 @@ class FakePublisher:
         self.ready_calls.append(receipt.head_sha)
         return receipt.model_copy(update={"draft": False})
 
-    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+    async def prepare_merge(
+        self, receipt: PublicationReceipt, *, worktree_id: str
+    ) -> MergeCandidate:
+        number = len(self.merge_candidates) + 1
+        candidate = MergeCandidate(
+            worktree_id=f"merge::/tmp/merge-{number}",
+            repository_path=Path("/tmp/issue"),
+            revision_ref=f"refs/orkastrator/merge-candidates/run/lane-{number}",
+            target_sha="a" * 40 if not self.land_calls else "e" * 40,
+            merge_sha=f"{200 + number:040x}",
+        )
+        self.merge_candidates.append(candidate)
+        return candidate
+
+    async def discard_merge(
+        self, candidate: MergeCandidate, *, retain_revision: bool = False
+    ) -> None:
+        suffix = ":retained" if retain_revision else ""
+        self.discarded_candidates.append(candidate.worktree_id + suffix)
+
+    async def land(
+        self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+    ) -> PublicationReceipt:
         self.land_calls.append(receipt.head_sha)
         return receipt.model_copy(update={"landed": True, "merge_sha": "e" * 40})
 
@@ -3664,13 +3695,227 @@ async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sh
     receipt = store.publications(run_id)[-1]
     assert receipt.landed is True
     assert receipt.merge_sha == "e" * 40
+    assert publisher.discarded_candidates == ["merge::/tmp/merge-1"]
+
+
+async def test_merge_without_runnable_passed_worker_validation_does_not_land(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+
+    worker = json.loads(worker_result())
+    worker["validation_results"] = [
+        {
+            "command": "uv run --extra dev ruff check . && uv run --extra dev pytest",
+            "status": "passed",
+            "output": "passed",
+        }
+    ]
+    orca.complete_dispatched(json.dumps(worker))
+    review = await value.monitor(run_id)
+    assert [item.role for item in review.started] == [StageKind.INITIAL_REVIEWER]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "blocked", store.events(run_id)
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.land_calls == []
+    assert publisher.discarded_candidates == ["merge::/tmp/merge-1"]
+    assert git.validation_calls == []
+    assert any(
+        event["kind"] == "lane_blocked"
+        and "no runnable passed worker validation evidence" in str(event["payload"])
+        for event in store.events(run_id)
+    )
+
+
+async def test_merge_failure_is_a_merge_origin_not_a_lane_regression(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.merge_validation_failures.add("merge::/tmp/merge-1")
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "active", store.events(run_id)
+    assert publisher.land_calls == []
+    assert publisher.discarded_candidates == ["merge::/tmp/merge-1:retained"]
+    finding = next(
+        item
+        for item in result.findings
+        if item.finding_id.startswith("publication-conflict-merge-validation")
+    )
+    assert finding.origin == "publication_conflict"
+    assert finding.contract.review_revision is not None
+    assert finding.contract.review_revision.base_sha == publisher.merge_candidates[0].target_sha
+    assert finding.contract.review_revision.head_sha == publisher.merge_candidates[0].merge_sha
+    assert "passed at lane head" in finding.contract.evidence[0].claim
+    assert [item.role for item in result.started] == [StageKind.FIXER]
+
+
+async def test_merge_validation_governs_worker_commands_and_drops_shell_syntax(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    worker = json.loads(worker_result())
+    worker["validation_results"] = [
+        {
+            "command": "uv run --extra dev ruff check . && uv run --extra dev pytest",
+            "status": "passed",
+            "output": "passed",
+        },
+        {"command": "pytest", "status": "passed", "output": "passed"},
+        {
+            "command": "pytest tests/test_execution.py -q",
+            "status": "passed",
+            "output": "passed",
+        },
+    ]
+    orca.complete_dispatched(json.dumps(worker))
+    review = await value.monitor(run_id)
+    assert [launch.role for launch in review.started] == [StageKind.INITIAL_REVIEWER]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert git.validation_calls[-2:] == [
+        ["uv run --extra dev pytest"],
+        ["uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_execution.py -q"],
+    ]
+    assert publisher.land_calls == ["b" * 40]
+
+
+async def test_merge_failure_git_error_blocks_lane_without_failing_run(tmp_path: Path) -> None:
+    class UnhashableMergeGit(FakeGit):
+        async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
+            if worktree_id == "merge::/tmp/merge-2":
+                raise GitError("bad object merge HEAD")
+            return await super().diff_sha256(worktree_id, base_sha, head_sha)
+
+    orca = FakeOrca()
+    git = UnhashableMergeGit()
+    git.merge_validation_failures.add("merge::/tmp/merge-2")
+    publisher = FakePublisher(["passed", "passed", "pending"])
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(max_parallel_lanes=3, merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal(lane_count=3)).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_result())
+    review = await value.monitor(run_id)
+    assert [item.role for item in review.started] == [
+        StageKind.INITIAL_REVIEWER,
+        StageKind.INITIAL_REVIEWER,
+        StageKind.INITIAL_REVIEWER,
+    ]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "active", store.events(run_id)
+    assert [lane.phase for lane in result.lanes] == [
+        LanePhase.COMPLETE,
+        LanePhase.BLOCKED,
+        LanePhase.ACTIVE,
+    ]
+    assert publisher.land_calls == ["b" * 40]
+    assert publisher.discarded_candidates == [
+        "merge::/tmp/merge-1",
+        "merge::/tmp/merge-2:retained",
+    ]
+    assert not any(
+        item.finding_id.startswith("publication-conflict-merge-validation")
+        for item in result.findings
+    )
+    blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
+    assert blocked
+    assert blocked[-1]["payload"]["reason"] == (
+        "merge validation scope unavailable: bad object merge HEAD"
+    )
+
+
+async def test_last_lane_is_gated_on_the_tree_the_wave_produced(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.merge_validation_failures.add("merge::/tmp/merge-2")
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(max_parallel_lanes=2, merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal(lane_count=2)).run_id
+    await value.accept(run_id)
+    orca.complete_dispatched(worker_result())
+    review = await value.monitor(run_id)
+    assert [item.role for item in review.started] == [
+        StageKind.INITIAL_REVIEWER,
+        StageKind.INITIAL_REVIEWER,
+    ]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert [item.target_sha for item in publisher.merge_candidates] == ["a" * 40, "e" * 40]
+    assert len(publisher.land_calls) == 1
+    assert [lane.phase for lane in result.lanes] == [LanePhase.COMPLETE, LanePhase.ACTIVE]
+    merge_finding = next(
+        item
+        for item in result.findings
+        if item.finding_id.startswith("publication-conflict-merge-validation")
+    )
+    assert merge_finding.lane_id == result.lanes[-1].lane_id
+    assert result.status == "active", store.events(run_id)
 
 
 async def test_publication_conflict_routes_to_lane_escalation_without_failing_run(
     tmp_path: Path,
 ) -> None:
     class ConflictingPublisher(FakePublisher):
-        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        async def land(
+            self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+        ) -> PublicationReceipt:
             self.land_calls.append(receipt.head_sha)
             raise IntegrationConflict("lane issue-100 conflicts with current main")
 
@@ -3696,7 +3941,9 @@ async def test_owner_settled_publication_conflict_survives_the_next_monitor_tick
     tmp_path: Path,
 ) -> None:
     class ConflictingPublisher(FakePublisher):
-        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        async def land(
+            self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+        ) -> PublicationReceipt:
             self.land_calls.append(receipt.head_sha)
             raise IntegrationConflict("lane issue-100 conflicts with current main")
 
@@ -3754,7 +4001,9 @@ async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
             return []
 
     class ConflictingPublisher(FakePublisher):
-        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+        async def land(
+            self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+        ) -> PublicationReceipt:
             self.land_calls.append(receipt.head_sha)
             raise IntegrationConflict("lane issue-100 conflicts with current main")
 
@@ -3803,7 +4052,9 @@ class ConflictOnLand(FakePublisher):
         super().__init__()
         self.git = git
 
-    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+    async def land(
+        self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+    ) -> PublicationReceipt:
         self.land_calls.append(receipt.head_sha)
         # Arm here, not earlier: the conflict recorder is the only caller whose
         # Git failures this test is about, and the review phase ahead of it

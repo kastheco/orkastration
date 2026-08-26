@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +55,17 @@ class LanePublisher(Protocol):
 
     async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt: ...
 
-    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt: ...
+    async def prepare_merge(
+        self, receipt: PublicationReceipt, *, worktree_id: str
+    ) -> MergeCandidate: ...
+
+    async def discard_merge(
+        self, candidate: MergeCandidate, *, retain_revision: bool = False
+    ) -> None: ...
+
+    async def land(
+        self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+    ) -> PublicationReceipt: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +75,17 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True, slots=True)
+class MergeCandidate:
+    """One exact local merge of a lane head and the current target tip."""
+
+    worktree_id: str
+    repository_path: Path
+    revision_ref: str
+    target_sha: str
+    merge_sha: str
 
 
 class CommandRunner(Protocol):
@@ -295,12 +318,122 @@ class GitHubPublisher:
         await self._required(Path.cwd(), *self._gh, "pr", "ready", receipt.pull_request_url)
         return receipt.model_copy(update={"draft": False})
 
-    async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+    async def prepare_merge(
+        self, receipt: PublicationReceipt, *, worktree_id: str
+    ) -> MergeCandidate:
+        """Materialize the exact merge candidate used for conflict and stop checks."""
+
+        try:
+            path = worktree_path(worktree_id)
+        except GitError as exc:
+            raise PublicationError(str(exc)) from exc
+        temporary = Path(tempfile.mkdtemp(prefix="orkastrator-merge-"))
+        added = False
+        try:
+            target_sha = await self._fetch_target(path, receipt.base_branch)
+            await self._required(
+                path, "git", "worktree", "add", "--detach", str(temporary), target_sha
+            )
+            added = True
+            merged = await self._runner.run(
+                temporary,
+                "git",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                receipt.head_sha,
+            )
+            if merged.returncode != 0:
+                detail = (merged.stderr or merged.stdout).strip()[:2_000]
+                raise IntegrationConflict(
+                    f"lane {receipt.lane} conflicts with current {receipt.base_branch}: {detail}"
+                )
+            tree_sha = (await self._required(temporary, "git", "write-tree")).strip()
+            merge_sha = (
+                await self._required(
+                    temporary,
+                    "git",
+                    "-c",
+                    "user.name=orkastrator",
+                    "-c",
+                    "user.email=orkastrator@localhost",
+                    "commit-tree",
+                    tree_sha,
+                    "-p",
+                    target_sha,
+                    "-p",
+                    receipt.head_sha,
+                    "-m",
+                    _merge_subject(receipt),
+                )
+            ).strip()
+            revision_ref = f"refs/orkastrator/merge-candidates/{receipt.run_id}/{receipt.lane}"
+            await self._required(path, "git", "update-ref", revision_ref, merge_sha)
+            return MergeCandidate(
+                worktree_id=f"merge::{temporary}",
+                repository_path=path,
+                revision_ref=revision_ref,
+                target_sha=target_sha,
+                merge_sha=merge_sha,
+            )
+        except Exception:
+            if added:
+                await self._discard_merge_path(path, temporary)
+            else:
+                shutil.rmtree(temporary, ignore_errors=True)
+            raise
+
+    async def discard_merge(
+        self, candidate: MergeCandidate, *, retain_revision: bool = False
+    ) -> None:
+        """Remove only the temporary worktree created by ``prepare_merge``."""
+
+        _, separator, raw_path = candidate.worktree_id.partition("::")
+        if not separator:
+            raise PublicationError("merge candidate has no local worktree path")
+        await self._discard_merge_path(candidate.repository_path, Path(raw_path))
+        if not retain_revision:
+            await self._required(
+                candidate.repository_path,
+                "git",
+                "update-ref",
+                "-d",
+                candidate.revision_ref,
+                candidate.merge_sha,
+            )
+
+    async def _discard_merge_path(self, path: Path, temporary: Path) -> None:
+        result = await self._runner.run(
+            path, "git", "worktree", "remove", "--force", str(temporary)
+        )
+        shutil.rmtree(temporary, ignore_errors=True)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[:2_000]
+            raise PublicationError(f"could not discard merge candidate: {detail}")
+
+    async def _fetch_target(self, path: Path, branch: str) -> str:
+        await self._required(
+            path,
+            "git",
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"refs/heads/{branch}",
+        )
+        return (await self._required(path, "git", "rev-parse", "FETCH_HEAD^{commit}")).strip()
+
+    async def land(
+        self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+    ) -> PublicationReceipt:
         """Merge the checked lane into the current base with a real merge commit."""
 
         if receipt.landed:
             return receipt
-        path = Path.cwd()
+        path = candidate.repository_path if candidate is not None else Path.cwd()
+        if candidate is not None:
+            target_sha = await self._fetch_target(path, receipt.base_branch)
+            if target_sha != candidate.target_sha:
+                raise PublicationError("target branch moved after merge validation")
         fields = "headRefOid,state,isDraft,mergeable,mergeStateStatus,mergeCommit"
         state = await self._gh_json(path, "pr", "view", receipt.pull_request_url, "--json", fields)
         landed = _landed_receipt(state, receipt, require_merge_commit=True)
