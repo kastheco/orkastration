@@ -416,6 +416,7 @@ class FakeGit(LocalGit):
         self.pin_calls: list[tuple[str, str]] = []
         self.integrated: dict[str, str] = {}
         self.changed_override: list[str] | None = None
+        self.changed_by_head: dict[str, list[str]] = {}
         self.head_override: str | None = None
         self.ancestor_override: bool | None = None
         self.lane_head_override: str | None = None
@@ -425,7 +426,7 @@ class FakeGit(LocalGit):
         self.conflict_commits: set[str] = set()
         self.conflicted_paths: list[str] | None = None
         self.conflict_context_capture_error = False
-        self.conflicted_hunks = (
+        self.conflicted_hunks: str | None = (
             "diff --cc src/file1.py\n@@@ -1,1 -1,1 +1,5 @@@\n"
             "++<<<<<<< HEAD\n++lane\n++=======\n++fix\n++>>>>>>> fixer\n"
         )
@@ -480,6 +481,8 @@ class FakeGit(LocalGit):
         head_sha: str,
         paths: Sequence[str] = (),
     ) -> list[str]:
+        if "finding-" in worktree_id and head_sha in self.changed_by_head:
+            return self.changed_by_head[head_sha]
         if self.changed_override is not None and "finding-" in worktree_id:
             return self.changed_override
         if paths:
@@ -572,16 +575,21 @@ class FakeGit(LocalGit):
             self.heads[worktree_id] = self.pre_sequence_head
 
     async def integration_conflict_context(
-        self, worktree_id: str, expected_paths: Sequence[str]
+        self,
+        worktree_id: str,
+        expected_paths: Sequence[str],
+        *,
+        attempted_paths: Sequence[str] | None = None,
     ) -> IntegrationConflictContext | None:
         if not self.in_progress:
             return None
         if self.conflict_context_capture_error:
             raise RuntimeError("conflict context capture failed")
         conflicted_paths = self.conflicted_paths or list(expected_paths[:1])
+        applied_paths = expected_paths if attempted_paths is None else attempted_paths
         return IntegrationConflictContext(
             conflicted_paths=conflicted_paths,
-            cleanly_applied_paths=sorted(set(expected_paths) - set(conflicted_paths)),
+            cleanly_applied_paths=sorted(set(applied_paths) - set(conflicted_paths)),
             conflicted_hunks=self.conflicted_hunks,
         )
 
@@ -2066,6 +2074,52 @@ async def test_conflict_retry_receives_paths_and_conflicted_hunks(tmp_path: Path
     assert "Cleanly-applied paths:\n- src/actions.py\n- src/data.py" in retry_spec
     assert git.conflicted_hunks in retry_spec
     assert "no partial application was retained" in retry_spec
+
+
+async def test_conflict_retry_excludes_unattempted_source_paths(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    first_commit, second_commit = (f"{number}" * 40 for number in (1, 2))
+    third_commit = fixer_sha("finding-1", 1)
+    git.commit_chain_override = [first_commit, second_commit, third_commit]
+    git.changed_by_head = {
+        fixer_sha("finding-1", 1): [
+            "src/actions.py",
+            "src/data.py",
+            "tests/test_overview.py",
+        ],
+        first_commit: ["tests/test_overview.py"],
+    }
+    git.conflicted_paths = ["tests/test_overview.py"]
+    git.conflicted_hunks = None
+    finding = review_finding_data()
+    finding["allowed_write_scope"] = {
+        "paths": ["src/actions.py", "src/data.py", "tests/test_overview.py"],
+        "symbols": [],
+    }
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, finding)
+
+    orca.complete_dispatched(fix_attempt(changed_path="src/actions.py"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    await value.monitor(run_id)
+    receipt = store.integrations(run_id)[0]
+    assert receipt.conflict_context is not None
+    assert receipt.conflict_context.cleanly_applied_paths == []
+
+    orca.complete_dispatched(escalation("integration_conflict", "approve_unchanged"))
+    result = await value.monitor(run_id)
+    retry_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
+    assert "Cleanly-applied paths:\n(none)" in retry_spec
+    assert "src/actions.py" not in retry_spec.split("Cleanly-applied paths:\n", 1)[1].split(
+        "Conflicted", 1
+    )[0]
+    assert "Conflicted hunk content: none captured" in retry_spec
+    assert "Conflicted hunks:" not in retry_spec
 
 
 async def test_conflict_retry_truncates_oversized_conflicted_hunks(tmp_path: Path) -> None:

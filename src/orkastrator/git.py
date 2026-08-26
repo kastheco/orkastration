@@ -257,7 +257,11 @@ class LocalGit:
             raise GitError(f"failed to abort cherry-pick: {result.stderr.strip()[:2_000]}")
 
     async def integration_conflict_context(
-        self, worktree_id: str, expected_paths: Sequence[str]
+        self,
+        worktree_id: str,
+        expected_paths: Sequence[str],
+        *,
+        attempted_paths: Sequence[str] | None = None,
     ) -> IntegrationConflictContext | None:
         """Capture the conflicted paths, clean paths, and hunks before aborting."""
 
@@ -282,12 +286,12 @@ class LocalGit:
             "--",
             *conflicted_paths,
         )
-        if not rendered.stdout:
-            raise GitError("conflicted integration produced no conflicted hunk diff")
+        conflicted_hunks = rendered.stdout if _contains_diff_hunk(rendered.stdout) else None
+        applied_paths = expected_paths if attempted_paths is None else attempted_paths
         return IntegrationConflictContext(
             conflicted_paths=conflicted_paths,
-            cleanly_applied_paths=sorted(set(expected_paths) - set(conflicted_paths)),
-            conflicted_hunks=rendered.stdout,
+            cleanly_applied_paths=sorted(set(applied_paths) - set(conflicted_paths)),
+            conflicted_hunks=conflicted_hunks,
         )
 
     async def cherry_pick_in_progress_commits(self, worktree_id: str) -> list[str] | None:
@@ -469,6 +473,12 @@ _PYTEST_CONFIG_SECTIONS = (
     ("setup.cfg", "[tool:pytest]"),
 )
 """Where a repository declares pytest options, and the section that holds them."""
+
+
+def _contains_diff_hunk(diff: str) -> bool:
+    """Return whether a combined diff includes at least one hunk header."""
+
+    return any(line.startswith("@@") for line in diff.splitlines())
 
 
 def worktree_path(worktree_id: str) -> Path:

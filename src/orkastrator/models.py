@@ -778,7 +778,7 @@ class IntegrationConflictContext(BaseModel):
 
     conflicted_paths: list[str] = Field(min_length=1, max_length=256)
     cleanly_applied_paths: list[str] = Field(max_length=256)
-    conflicted_hunks: str = Field(min_length=1)
+    conflicted_hunks: str | None = Field(default=None, min_length=1)
 
 
 class IntegrationRecord(BaseModel):

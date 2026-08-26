@@ -1214,9 +1214,21 @@ class ExecutionController:
             if applied.returncode != 0:
                 conflict_context = None
                 try:
+                    active_sequence = await self._git.cherry_pick_in_progress_commits(
+                        lane.worktree_id
+                    )
+                    attempted_paths: list[str] = []
+                    if active_sequence:
+                        current_commit = active_sequence[0]
+                        if current_commit in source_commits:
+                            attempted_paths = await self._git.changed_paths(
+                                fixer_worktree, source_base, current_commit
+                            )
                     try:
                         conflict_context = await self._git.integration_conflict_context(
-                            lane.worktree_id, source_paths
+                            lane.worktree_id,
+                            source_paths,
+                            attempted_paths=attempted_paths,
                         )
                     except Exception:
                         conflict_context = None
@@ -2710,16 +2722,25 @@ class ExecutionController:
         conflict = receipt.conflict_context
         conflicted = "\n".join(f"- {path}" for path in conflict.conflicted_paths)
         clean = "\n".join(f"- {path}" for path in conflict.cleanly_applied_paths) or "(none)"
-        hunks = conflict.conflicted_hunks
-        if max_hunk_bytes is not None:
-            hunks = _truncate_conflict_hunks(hunks, max_hunk_bytes)
+        if conflict.conflicted_hunks is None:
+            hunk_context = (
+                "Conflicted hunk content: none captured (the combined diff contained no hunk "
+                "content; this may be a modify/delete or binary conflict).\n"
+            )
+        else:
+            hunks = conflict.conflicted_hunks
+            if max_hunk_bytes is not None:
+                hunks = _truncate_conflict_hunks(hunks, max_hunk_bytes)
+            hunk_context = (
+                "Conflicted hunks:\n"
+                f"<integration_conflict_hunks>\n{hunks}"
+                "</integration_conflict_hunks>\n"
+            )
         return (
             "Prior integration conflict (supervisor-captured before abort):\n"
             f"Conflicted paths:\n{conflicted}\n"
             f"Cleanly-applied paths:\n{clean}\n"
-            "Conflicted hunks:\n"
-            f"<integration_conflict_hunks>\n{hunks}"
-            "</integration_conflict_hunks>\n"
+            f"{hunk_context}"
             "The failed cherry-pick was fully aborted; no partial application was retained. "
             "Use this evidence instead of re-deriving why the prior commit failed, while still "
             "producing the complete scoped fix in one commit.\n"

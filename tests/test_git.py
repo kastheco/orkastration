@@ -337,6 +337,32 @@ async def test_conflict_context_preserves_non_ascii_paths(tmp_path: Path) -> Non
     await git.abort_cherry_pick(lane_id)
 
 
+async def test_conflict_context_marks_modify_delete_without_hunks(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "lane"
+    fixer = tmp_path / "fixer"
+    lane_id = add_worktree(repo, lane, "lane", base)
+    fixer_id = add_worktree(repo, fixer, "fixer", base)
+    commit(lane, "src/shared.py", "lane\n", "modify on lane")
+    fixer_file = fixer / "src/shared.py"
+    fixer_file.unlink()
+    run(fixer, "git", "add", "src/shared.py")
+    run(fixer, "git", "commit", "-m", "delete in fixer")
+    fixer_head = run(fixer, "git", "rev-parse", "HEAD")
+    git = LocalGit()
+
+    assert (await git.cherry_pick(lane_id, fixer_head)).returncode != 0
+    conflict = await git.integration_conflict_context(
+        lane_id,
+        await git.changed_paths(fixer_id, base, fixer_head),
+    )
+
+    assert conflict is not None
+    assert conflict.conflicted_paths == ["src/shared.py"]
+    assert conflict.conflicted_hunks is None
+    await git.abort_cherry_pick(lane_id)
+
+
 async def test_dirty_state_and_validation_are_observed_without_shell(tmp_path: Path) -> None:
     repo, base = repository(tmp_path)
     lane = tmp_path / "lane"
