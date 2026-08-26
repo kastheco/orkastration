@@ -154,12 +154,13 @@ class LocalGit:
             worktree_id,
             "diff",
             "--name-only",
+            "-z",
             "--no-renames",
             f"{base_sha}..{head_sha}",
             "--",
             *paths,
         )
-        return sorted({line for line in result.stdout.splitlines() if line})
+        return sorted({path for path in result.stdout.split("\0") if path})
 
     async def render_diff(
         self,
@@ -264,11 +265,12 @@ class LocalGit:
             worktree_id,
             "diff",
             "--name-only",
+            "-z",
             "--diff-filter=U",
             "--",
             *expected_paths,
         )
-        conflicted_paths = sorted({line for line in unmerged.stdout.splitlines() if line})
+        conflicted_paths = sorted({path for path in unmerged.stdout.split("\0") if path})
         if not conflicted_paths:
             return None
         rendered = await self._git(

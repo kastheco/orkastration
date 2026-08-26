@@ -302,6 +302,41 @@ async def test_conflicting_commit_aborts_without_resetting_prior_head(tmp_path: 
     assert (lane / "src/shared.py").read_text() == "one\n"
 
 
+async def test_conflict_context_preserves_non_ascii_paths(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    target_path = "src/café.py"
+    commit(repo, target_path, "base\n", "add non-ASCII source")
+    base = run(repo, "git", "rev-parse", "HEAD")
+    lane = tmp_path / "lane"
+    fixer_one = tmp_path / "fixer-one"
+    fixer_two = tmp_path / "fixer-two"
+    lane_id = add_worktree(repo, lane, "lane", base)
+    add_worktree(repo, fixer_one, "fix-one", base)
+    two_id = add_worktree(repo, fixer_two, "fix-two", base)
+    one_sha = commit(fixer_one, target_path, "one\n", "fix one")
+    commit(fixer_two, target_path, "two\n", "fix two")
+    (fixer_two / "src/clean.py").write_text("clean\n")
+    run(fixer_two, "git", "add", "src/clean.py")
+    run(fixer_two, "git", "commit", "--amend", "--no-edit")
+    two_sha = run(fixer_two, "git", "rev-parse", "HEAD")
+    git = LocalGit()
+
+    assert await git.changed_paths(two_id, base, two_sha) == [target_path, "src/clean.py"]
+    assert (await git.cherry_pick(lane_id, one_sha)).returncode == 0
+    assert (await git.cherry_pick(lane_id, two_sha)).returncode != 0
+
+    conflict = await git.integration_conflict_context(
+        lane_id, await git.changed_paths(two_id, base, two_sha)
+    )
+
+    assert conflict is not None
+    assert conflict.conflicted_paths == [target_path]
+    assert conflict.cleanly_applied_paths == ["src/clean.py"]
+    assert "<<<<<<< HEAD" in conflict.conflicted_hunks
+    assert ">>>>>>>" in conflict.conflicted_hunks
+    await git.abort_cherry_pick(lane_id)
+
+
 async def test_dirty_state_and_validation_are_observed_without_shell(tmp_path: Path) -> None:
     repo, base = repository(tmp_path)
     lane = tmp_path / "lane"
