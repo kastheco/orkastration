@@ -2457,17 +2457,20 @@ class ExecutionController:
 
         worker = self._store.worker_result(lane.lane_id)
         base_sha = candidate.target_sha
-        paths = sorted(
-            {
-                path
-                for wave_lane in self._store.lanes(run_id)
-                for path in self._worker_changed_paths(wave_lane)
-            }
-        )
+        # A merge-origin fixer runs on the merge candidate, but its one commit
+        # is integrated by cherry-picking into this lane's checkout. Keep the
+        # contract to paths this lane actually carries; the other lanes' paths
+        # exist in the candidate only and can never reach this branch through a
+        # clean cherry-pick.
+        paths = sorted(set(self._worker_changed_paths(lane)))
         if not paths:
             try:
+                if lane.worktree_id is None or lane.integration_head_sha is None:
+                    raise GitError("merge validation scope has no lane checkout")
                 paths = await self._git.changed_paths(
-                    candidate.worktree_id, base_sha, candidate.merge_sha
+                    lane.worktree_id,
+                    worker.review_revision.base_sha,
+                    lane.integration_head_sha,
                 )
             except GitError as exc:
                 self._store.block_lane(
@@ -2514,7 +2517,10 @@ class ExecutionController:
             ),
             required_outcome=(
                 "Make the same merge candidate pass every frozen stop check while preserving "
-                "the accepted changes already present in the target and lane heads."
+                "the accepted changes already present in the target and lane heads. This fixer "
+                "runs on the merge candidate, but its single commit is cherry-picked into this "
+                "lane, so edit only paths already present in this lane head, not target-only "
+                "paths or hunks."
             ),
             allowed_write_scope=AllowedWriteScope(paths=paths[:128]),
             validation=requirements,

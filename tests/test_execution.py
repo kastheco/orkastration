@@ -3946,6 +3946,81 @@ async def test_last_lane_is_gated_on_the_tree_the_wave_produced(tmp_path: Path) 
     assert result.status == "active", store.events(run_id)
 
 
+async def test_merge_fixer_scope_is_lane_local_and_integrates_cleanly(tmp_path: Path) -> None:
+    class MergeFixGit(FakeGit):
+        async def head(self, worktree_id: str) -> str:
+            if "publication-conflict-merge-validation" in worktree_id:
+                return "d" * 40
+            return await super().head(worktree_id)
+
+        async def changed_paths(
+            self,
+            worktree_id: str,
+            base_sha: str,
+            head_sha: str,
+            paths: Sequence[str] = (),
+        ) -> list[str]:
+            if "publication-conflict-merge-validation" in worktree_id:
+                return ["src/file2.py"]
+            if worktree_id == "repo::/tmp/issue":
+                return ["src/file2.py"]
+            return await super().changed_paths(worktree_id, base_sha, head_sha, paths)
+
+    orca = FakeOrca()
+    git = MergeFixGit()
+    git.merge_validation_failures.add("merge::/tmp/merge-1")
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(max_parallel_lanes=2, merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    worker = json.loads(worker_result())
+    worker["changed_paths"] = ["src/file2.py"]
+    orca.complete_dispatched(json.dumps(worker))
+    review = await value.monitor(run_id)
+    assert [item.role for item in review.started] == [StageKind.INITIAL_REVIEWER]
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    finding = next(
+        item
+        for item in result.findings
+        if item.finding_id.startswith("publication-conflict-merge-validation")
+    )
+    assert finding.contract.allowed_write_scope.paths == ["src/file2.py"]
+    assert result.started[0].role is StageKind.FIXER
+    fix = json.loads(fix_attempt())
+    fix.update(
+        {
+            "finding_id": finding.finding_id,
+            "changed_paths": ["src/file2.py"],
+            "commit_sha": "d" * 40,
+        }
+    )
+    orca.complete_dispatched(json.dumps(fix))
+    result = await value.monitor(run_id)
+    assert result.started[0].role is StageKind.RE_REVIEWER
+
+    orca.complete_dispatched(re_review("resolved", finding_id=finding.finding_id))
+    result = await value.monitor(run_id)
+
+    integration = store.integrations(run_id)
+    assert integration[-1].status == "integrated", store.events(run_id)
+    assert integration[-1].integrated_sha is not None
+    assert git.cherry_pick_calls[-1][0] == "repo::/tmp/issue"
+    assert not any(
+        item.finding_id == finding.finding_id
+        and item.escalation_reason is FindingReason.INTEGRATION_CONFLICT
+        for item in result.findings
+    )
+
+
 async def test_publication_conflict_routes_to_lane_escalation_without_failing_run(
     tmp_path: Path,
 ) -> None:
