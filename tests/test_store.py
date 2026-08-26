@@ -19,6 +19,7 @@ from orkastrator.models import (
     StageKind,
     StagePhase,
     SupervisorPlan,
+    WorkerResult,
 )
 from orkastrator.store import IntegrationBusyError, StateStore, UnsupportedStateError
 from tests.factories import initial_review_report_json, review_finding_data
@@ -198,6 +199,171 @@ def test_lane_integration_reservation_is_serial(tmp_path: Path) -> None:
         base_sha="f" * 40,
     )
     assert receipt.status == "starting"
+
+
+@pytest.mark.parametrize("status", ["blocked", "failed"])
+def test_reconcile_lane_head_reactivates_terminal_runs_and_is_idempotent(
+    tmp_path: Path, status: str
+) -> None:
+    store = StateStore(tmp_path / f"reconcile-{status}.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    report = InitialReviewReport.model_validate_json(
+        initial_review_report_json(review_finding_data())
+    )
+    store.record_initial_review(run_id, lane.lane_id, report)
+    assert report.review_revision is not None
+    store.record_worker_result(
+        run_id,
+        lane.lane_id,
+        WorkerResult(
+            review_revision=report.review_revision,
+            commit_sha="b" * 40,
+            summary="The reviewed checkout is ready.",
+        ),
+    )
+    store.set_lane_phase(run_id, lane.lane_id, LanePhase.BLOCKED)
+    store.set_terminal_status(run_id, status)
+
+    with pytest.raises(KeyError, match="unknown lane"):
+        store.reconcile_lane_head(
+            run_id,
+            "missing-lane",
+            expected_head_sha="b" * 40,
+            reconciled_head_sha="c" * 40,
+            integration_ids=[],
+            note="not a real lane",
+        )
+
+    recovered = store.reconcile_lane_head(
+        run_id,
+        lane.lane_id,
+        expected_head_sha="b" * 40,
+        reconciled_head_sha="c" * 40,
+        integration_ids=["integration-1"],
+        note="recover legacy divergence",
+    )
+
+    assert recovered.integration_head_sha == "c" * 40
+    assert recovered.phase is LanePhase.ACTIVE
+    assert store.run(run_id).status == "active"
+    reconciliations = [
+        event for event in store.events(run_id) if event["kind"] == "lane_head_reconciled"
+    ]
+    assert reconciliations[-1]["payload"] == {
+        "previous_head_sha": "b" * 40,
+        "reconciled_head_sha": "c" * 40,
+        "integration_ids": ["integration-1"],
+        "note": "recover legacy divergence",
+    }
+    actions = [
+        event for event in store.events(run_id) if event["kind"] == "supervisor_hand_action"
+    ]
+    assert actions[-1]["payload"] == {
+        "command": "reconcile-head",
+        "target": lane.name,
+        "phase": "active",
+        "outcome": "active",
+        "note": "recover legacy divergence",
+    }
+
+    repeated = store.reconcile_lane_head(
+        run_id,
+        lane.lane_id,
+        expected_head_sha="b" * 40,
+        reconciled_head_sha="c" * 40,
+        integration_ids=["integration-1"],
+        note="idempotent retry",
+    )
+    assert repeated.integration_head_sha == "c" * 40
+    assert len(
+        [event for event in store.events(run_id) if event["kind"] == "lane_head_reconciled"]
+    ) == 1
+    assert len(
+        [event for event in store.events(run_id) if event["kind"] == "supervisor_hand_action"]
+    ) == 1
+
+    with pytest.raises(ValueError, match="changed during reconciliation"):
+        store.reconcile_lane_head(
+            run_id,
+            lane.lane_id,
+            expected_head_sha="b" * 40,
+            reconciled_head_sha="d" * 40,
+            integration_ids=["integration-2"],
+            note="stale expected head",
+        )
+
+
+def test_record_integration_head_enforces_reservation_and_base_and_records_atomically(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "record-integration-head.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    report = InitialReviewReport.model_validate_json(
+        initial_review_report_json(review_finding_data(1), review_finding_data(2))
+    )
+    store.record_initial_review(run_id, lane.lane_id, report)
+    assert report.review_revision is not None
+    store.record_worker_result(
+        run_id,
+        lane.lane_id,
+        WorkerResult(
+            review_revision=report.review_revision,
+            commit_sha="b" * 40,
+            summary="The reviewed checkout is ready.",
+        ),
+    )
+    first, second = store.findings(run_id)
+    first_receipt = store.begin_integration(
+        run_id,
+        first,
+        fixer_commit_sha="c" * 40,
+        source_commits=["c" * 40],
+        source_finding_ids=[first.finding_id],
+        base_sha="b" * 40,
+    )
+
+    store.record_integration_head(
+        run_id, first, base_sha="b" * 40, integrated_sha="c" * 40
+    )
+    recorded = store.integration(first.finding_key, first.round)
+    assert recorded is not None
+    assert recorded.integration_id == first_receipt.integration_id
+    assert recorded.integrated_sha == "c" * 40
+    assert store.lanes(run_id)[0].integration_head_sha == "c" * 40
+
+    store.finish_integration(
+        run_id,
+        first,
+        status="validation_failed",
+        integrated_sha="c" * 40,
+        validation_results=[],
+    )
+    with pytest.raises(ValueError, match="not reserved"):
+        store.record_integration_head(
+            run_id, first, base_sha="c" * 40, integrated_sha="d" * 40
+        )
+
+    second_receipt = store.begin_integration(
+        run_id,
+        second,
+        fixer_commit_sha="d" * 40,
+        source_commits=["d" * 40],
+        source_finding_ids=[second.finding_id],
+        base_sha="c" * 40,
+    )
+    assert second_receipt.status == "starting"
+    with pytest.raises(ValueError, match="base changed"):
+        store.record_integration_head(
+            run_id, second, base_sha="b" * 40, integrated_sha="e" * 40
+        )
+    unchanged = store.integration(second.finding_key, second.round)
+    assert unchanged is not None
+    assert unchanged.integrated_sha is None
+    assert store.lanes(run_id)[0].integration_head_sha == "c" * 40
 
 
 def test_store_rejects_duplicate_accept_unknown_rows_and_changed_bindings(
