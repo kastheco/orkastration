@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type {
+  ExtensionAPI,
   ExtensionContext,
   SessionShutdownEvent,
   SessionStartEvent,
@@ -63,19 +64,17 @@ class FakeExtensionAPI implements MonitorExtensionAPI {
   sessionShutdownHandler: SessionShutdownHandler | undefined;
   commandHandler: MonitorCommandOptions["handler"] | undefined;
 
-  on(event: "session_start", handler: SessionStartHandler): void;
-  on(event: "session_shutdown", handler: SessionShutdownHandler): void;
-  on(event: "session_start" | "session_shutdown", handler: SessionStartHandler | SessionShutdownHandler): void {
+  on: ExtensionAPI["on"] = ((event: string, handler: (...args: unknown[]) => unknown): void => {
     if (event === "session_start") {
       this.sessionStartHandler = handler as SessionStartHandler;
-    } else {
+    } else if (event === "session_shutdown") {
       this.sessionShutdownHandler = handler as SessionShutdownHandler;
     }
-  }
+  }) as ExtensionAPI["on"];
 
-  registerCommand(_name: string, options: MonitorCommandOptions): void {
-    this.commandHandler = options.handler;
-  }
+  registerCommand: ExtensionAPI["registerCommand"] = (_name, options): void => {
+    this.commandHandler = options.handler as MonitorCommandOptions["handler"];
+  };
 }
 
 test("session lifecycle polls once at a time and clears timer and footer on shutdown", async () => {

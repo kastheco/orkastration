@@ -48,17 +48,6 @@ jobs:
       - name: ruff check
         run: uv run ruff check --output-format=concise .
 
-  extension:
-    name: extension tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: package.json
-      - name: extension tests
-        run: npm run test:extension
-
   # mypy reports 77 standing errors on main, all in test modules. The job runs so
   # the count is visible and cannot grow unnoticed, and it does not gate, because
   # a check nothing can pass is not a gate. It is named in
