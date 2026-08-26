@@ -86,8 +86,11 @@ checkout.
 
 Publication uses non-force deterministic branches and one GitHub PR per lane, opened as a draft and
 marked ready once the exact-SHA checks on the published head pass. Those checks are the gate before
-anything lands. An empty or still-running rollup remains pending. If required checks do not conclude
-within `final_gate.timeout_seconds`, the lane blocks and leaves the pull request open. Advisory checks
+anything lands. An empty or still-running rollup remains pending. A check run that contradicts itself
+is read as terminal: a `conclusion` or a `completed_at` wins over a stale `in_progress` status, so a
+failure GitHub already decided becomes a real CI failure instead of a run that waits for it forever.
+If required checks do not conclude within `final_gate.timeout_seconds`, the lane blocks and leaves
+the pull request open. Advisory checks
 are recorded but do not gate, and the concluded rollup is copied onto the publication receipt before
 an enabled merge runs.
 

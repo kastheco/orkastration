@@ -1226,9 +1226,7 @@ class StateStore:
                 return _finding(row)
             retired = 0
             source_stages = session.exec(
-                select(WorkflowStageRow).where(
-                    WorkflowStageRow.finding_key == source.finding_key
-                )
+                select(WorkflowStageRow).where(WorkflowStageRow.finding_key == source.finding_key)
             ).all()
             for stage in source_stages:
                 if stage.phase in _SETTLED_STAGE_PHASES or stage.processed:

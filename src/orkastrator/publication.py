@@ -555,6 +555,9 @@ def _parse_checks(check_data: object, status_data: object, head_sha: str) -> lis
                 continue
             conclusion = raw.get("conclusion")
             status = raw.get("status")
+            # GitHub can report a check run that already concluded while its status
+            # still reads in_progress. Either terminal field settles it, otherwise a
+            # decided failure would be read as pending until the final gate times out.
             terminal = status == "completed" or conclusion is not None or raw.get("completed_at")
             mapped = _conclusion(str(conclusion)) if terminal else "pending"
             raw_output = raw.get("output")

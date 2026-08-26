@@ -2615,9 +2615,7 @@ class ExecutionController:
         if len(matches) != 1:
             raise ValueError(f"run {run_id} has no unique finding {source_finding_id}")
         source = matches[0]
-        lane = next(
-            item for item in self._store.lanes(run_id) if item.lane_id == source.lane_id
-        )
+        lane = next(item for item in self._store.lanes(run_id) if item.lane_id == source.lane_id)
         if lane.worktree_id is None or lane.integration_head_sha is None:
             raise ValueError(f"lane {lane.name} has no integration checkout and recorded head")
         if finding.review_revision is not None:
@@ -2625,9 +2623,7 @@ class ExecutionController:
                 "recovery contract review_revision must be omitted; "
                 "orkastrator binds it to the current lane head"
             )
-        known_finding_ids = {
-            item.finding_id for item in self._store.findings(run_id, lane.lane_id)
-        }
+        known_finding_ids = {item.finding_id for item in self._store.findings(run_id, lane.lane_id)}
         if finding.id in finding.dependencies:
             raise ValueError(f"finding {finding.id} cannot depend on itself")
         unknown_dependencies = set(finding.dependencies).difference(known_finding_ids)
@@ -2647,9 +2643,7 @@ class ExecutionController:
         revision = ReviewRevision(
             base_sha=checkout_head,
             head_sha=checkout_head,
-            diff_sha256=await self._git.diff_sha256(
-                lane.worktree_id, checkout_head, checkout_head
-            ),
+            diff_sha256=await self._git.diff_sha256(lane.worktree_id, checkout_head, checkout_head),
         )
         coverage_configured = await self._git.pytest_coverage_configured(lane.worktree_id)
         governed = finding.model_copy(
