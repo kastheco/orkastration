@@ -2332,8 +2332,9 @@ class ExecutionController:
                             raise IntegrationConflict(
                                 "merge verification has no integrated lane checkout"
                             )
+                        lane_worktree_id = lane.worktree_id
                         candidate = await self._publisher.prepare_merge(
-                            ready, worktree_id=lane.worktree_id
+                            ready, worktree_id=lane_worktree_id
                         )
                         retain_candidate = False
                         try:
@@ -2349,13 +2350,30 @@ class ExecutionController:
                                 )
                                 self._store.note_publication_progress(run_id, lane.lane_id)
                                 continue
+                            baseline = await self._observe_validation_requirements(
+                                lane_worktree_id, requirements
+                            )
                             validation = await self._observe_validation_requirements(
                                 candidate.worktree_id, requirements
                             )
-                            if any(item.status == "failed" for item in validation):
+                            regressions = [
+                                (requirement, base, merged)
+                                for requirement, base, merged in zip(
+                                    requirements, baseline, validation, strict=True
+                                )
+                                if base.status == "passed" and merged.status == "failed"
+                            ]
+                            if regressions:
                                 retain_candidate = True
                                 await self._record_merge_validation_failure(
-                                    run_id, lane, candidate, requirements, validation
+                                    run_id,
+                                    lane,
+                                    candidate,
+                                    [
+                                        requirement.model_copy(update={"baseline_result": base})
+                                        for requirement, base, _ in regressions
+                                    ],
+                                    [merged for _, _, merged in regressions],
                                 )
                                 self._store.note_publication_progress(run_id, lane.lane_id)
                                 continue
@@ -2473,10 +2491,6 @@ class ExecutionController:
         review_revision = ReviewRevision(
             base_sha=base_sha, head_sha=candidate.merge_sha, diff_sha256=diff_sha256
         )
-        governed = [
-            requirement.model_copy(update={"baseline_result": result})
-            for requirement, result in zip(requirements, validation, strict=True)
-        ]
         failed = [item for item in validation if item.status == "failed"]
         contract = ReviewFinding(
             id=f"publication-conflict-merge-validation-{candidate.merge_sha[:12]}",
@@ -2503,7 +2517,7 @@ class ExecutionController:
                 "the accepted changes already present in the target and lane heads."
             ),
             allowed_write_scope=AllowedWriteScope(paths=paths[:128]),
-            validation=governed,
+            validation=requirements,
         )
         self._store.add_finding(run_id, lane.lane_id, contract, origin="publication_conflict")
 

@@ -3773,7 +3773,42 @@ async def test_merge_failure_is_a_merge_origin_not_a_lane_regression(tmp_path: P
     assert finding.contract.review_revision.base_sha == publisher.merge_candidates[0].target_sha
     assert finding.contract.review_revision.head_sha == publisher.merge_candidates[0].merge_sha
     assert "passed at lane head" in finding.contract.evidence[0].claim
+    assert finding.contract.validation[0].baseline_result is not None
+    assert finding.contract.validation[0].baseline_result.status == "passed"
     assert [item.role for item in result.started] == [StageKind.FIXER]
+
+
+async def test_merge_failure_also_at_lane_head_does_not_stop_landing(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    git.merge_validation_failures.add("merge::/tmp/merge-1")
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert publisher.land_calls == ["b" * 40]
+    assert publisher.discarded_candidates == ["merge::/tmp/merge-1"]
+    assert not any(
+        item.finding_id.startswith("publication-conflict-merge-validation")
+        for item in result.findings
+    )
+    assert git.validation_calls[-2:] == [
+        ["uv run --extra dev pytest"],
+        ["uv run --extra dev pytest"],
+    ]
 
 
 async def test_merge_validation_governs_worker_commands_and_drops_shell_syntax(
@@ -3813,7 +3848,9 @@ async def test_merge_validation_governs_worker_commands_and_drops_shell_syntax(
     result = await value.monitor(run_id)
 
     assert result.status == "complete", store.events(run_id)
-    assert git.validation_calls[-2:] == [
+    assert git.validation_calls[-4:] == [
+        ["uv run --extra dev pytest"],
+        ["uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_execution.py -q"],
         ["uv run --extra dev pytest"],
         ["uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_execution.py -q"],
     ]
