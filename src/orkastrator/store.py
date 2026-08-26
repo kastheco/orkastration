@@ -1209,6 +1209,19 @@ class StateStore:
                 )
             if finding.id == source_finding_id:
                 raise ValueError("a recovery finding needs a new finding id")
+            lane = session.get(LaneRow, source.lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {source.lane_id}")
+            published = session.exec(
+                select(PublicationRow).where(PublicationRow.lane_id == source.lane_id)
+            ).all()
+            if any(
+                PublicationReceipt.model_validate_json(row.payload_json).landed for row in published
+            ):
+                raise ValueError(
+                    f"lane {lane.name} has already landed its pull request; a recovery finding "
+                    "cannot be integrated into a merged lane"
+                )
             created = self._insert_finding(
                 session,
                 source.lane_id,
@@ -1240,9 +1253,6 @@ class StateStore:
                 source.phase = FindingPhase.DEFERRED.value
                 source.escalation_reason = None
                 source.updated_at = _now()
-            lane = session.get(LaneRow, source.lane_id)
-            if lane is None:
-                raise KeyError(f"unknown lane {source.lane_id}")
             lane.phase = LanePhase.ACTIVE.value
             lane.updated_at = _now()
             run = session.get(SupervisorRunRow, run_id)

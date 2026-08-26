@@ -19,6 +19,7 @@ from orkastrator.execution import ExecutionController
 from orkastrator.git import GitError
 from orkastrator.locks import RunLockedError, held_runs, run_lock
 from orkastrator.models import (
+    TERMINAL_FAILURE_STATUSES,
     TERMINAL_LANE_PHASES,
     FindingPhase,
     FindingReason,
@@ -174,9 +175,7 @@ def monitor(
         run_id,
         advance(),
         json_output=json_output,
-        failure_statuses=(
-            frozenset({"blocked", "failed", "report_failed"}) if watch else frozenset()
-        ),
+        failure_statuses=TERMINAL_FAILURE_STATUSES if watch else frozenset(),
     )
 
 

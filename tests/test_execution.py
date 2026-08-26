@@ -5509,6 +5509,55 @@ async def test_recovery_refuses_a_contract_it_can_never_prove(
     assert [item.finding_id for item in store.findings(run_id)] == [source.finding_id]
 
 
+async def test_recovery_refuses_a_lane_whose_pull_request_already_landed(tmp_path: Path) -> None:
+    """A merged lane has nowhere left to put a fix.
+
+    Reactivating it integrates a new head into a publication whose branch the
+    merge deleted, so the lane can never satisfy the gate that its published
+    head equals its integration head, and it stays open forever.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    source = store.findings(run_id)[0]
+    store.set_finding_state(run_id, source.finding_key, phase=FindingPhase.RESOLVED)
+    lane = store.lanes(run_id)[0]
+    assert lane.integration_head_sha is not None
+    store.record_publication(
+        run_id,
+        lane.lane_id,
+        PublicationReceipt(
+            run_id=run_id,
+            lane=lane.name,
+            remote_url="git@github.com:example/repo.git",
+            base_branch="main",
+            branch=f"orkastrator/{run_id[:12]}/{lane.name}",
+            pull_request_url="https://github.com/example/repo/pull/1",
+            head_sha=lane.integration_head_sha,
+            draft=False,
+            landed=True,
+            merge_sha="e" * 40,
+        ),
+    )
+    store.set_lane_phase(run_id, lane.lane_id, LanePhase.COMPLETE)
+    recovery_data = review_finding_data(2)
+    recovery_data.pop("review_revision")
+
+    with pytest.raises(ValueError, match="already landed its pull request"):
+        await value.recover_finding(
+            run_id,
+            source.finding_id,
+            ReviewFinding.model_validate(recovery_data),
+            "CI failed after the lane merged",
+        )
+
+    assert [item.finding_id for item in store.findings(run_id)] == [source.finding_id]
+    assert store.lanes(run_id)[0].phase is LanePhase.COMPLETE
+
+
 async def test_a_conflict_retry_is_rebuilt_on_the_lane_head_it_has_to_land_on(
     tmp_path: Path,
 ) -> None:

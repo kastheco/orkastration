@@ -68,6 +68,17 @@ whether a run still has work from having to restate which phases those are.
 """
 
 
+TERMINAL_FAILURE_STATUSES = frozenset(
+    {LanePhase.BLOCKED.value, LanePhase.FAILED.value, LanePhase.REPORT_FAILED.value}
+)
+"""Run statuses a watching caller must not read as success.
+
+`GraphResult.status` carries these strings, and a watch that exits zero on one
+of them tells a shell the run finished when the run stopped. Deriving them from
+the phases they come from keeps a renamed phase from silently restoring that.
+"""
+
+
 class StagePhase(StrEnum):
     """Locally observed Orca Task lifecycle."""
 

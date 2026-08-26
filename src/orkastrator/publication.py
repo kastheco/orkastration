@@ -554,12 +554,12 @@ def _parse_checks(check_data: object, status_data: object, head_sha: str) -> lis
             if not isinstance(raw, dict) or raw.get("head_sha") != head_sha:
                 continue
             conclusion = raw.get("conclusion")
-            status = raw.get("status")
             # GitHub can report a check run that already concluded while its status
-            # still reads in_progress. Either terminal field settles it, otherwise a
-            # decided failure would be read as pending until the final gate times out.
-            terminal = status == "completed" or conclusion is not None or raw.get("completed_at")
-            mapped = _conclusion(str(conclusion)) if terminal else "pending"
+            # still reads in_progress. The conclusion settles the run whatever the
+            # status says, otherwise a decided failure would be read as pending until
+            # the final gate times out. A run with no conclusion has decided nothing,
+            # however complete its status or completed_at claim it is.
+            mapped = _conclusion(str(conclusion)) if conclusion is not None else "pending"
             raw_output = raw.get("output")
             output: dict[object, object] = raw_output if isinstance(raw_output, dict) else {}
             detail = "\n".join(
