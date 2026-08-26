@@ -424,6 +424,7 @@ class FakeGit(LocalGit):
         # lane head moving under one finding actually looks like.
         self.conflict_commits: set[str] = set()
         self.conflicted_paths: list[str] | None = None
+        self.conflict_context_capture_error = False
         self.conflicted_hunks = (
             "diff --cc src/file1.py\n@@@ -1,1 -1,1 +1,5 @@@\n"
             "++<<<<<<< HEAD\n++lane\n++=======\n++fix\n++>>>>>>> fixer\n"
@@ -575,6 +576,8 @@ class FakeGit(LocalGit):
     ) -> IntegrationConflictContext | None:
         if not self.in_progress:
             return None
+        if self.conflict_context_capture_error:
+            raise RuntimeError("conflict context capture failed")
         conflicted_paths = self.conflicted_paths or list(expected_paths[:1])
         return IntegrationConflictContext(
             conflicted_paths=conflicted_paths,
@@ -1972,6 +1975,30 @@ async def test_integration_conflict_maps_to_the_finding(tmp_path: Path) -> None:
 
     assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
     assert store.integrations(run_id)[0].status == "conflict"
+
+
+async def test_conflict_context_capture_failure_still_records_conflict(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    git.conflict_context_capture_error = True
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+
+    result = await value.monitor(run_id)
+
+    receipt = store.integrations(run_id)[0]
+    assert receipt.status == "conflict"
+    assert receipt.conflict_context is None
+    assert result.findings[0].escalation_reason is FindingReason.INTEGRATION_CONFLICT
+    assert git.abort_calls == 1
 
 
 async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(

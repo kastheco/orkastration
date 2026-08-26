@@ -1214,9 +1214,12 @@ class ExecutionController:
             if applied.returncode != 0:
                 conflict_context = None
                 try:
-                    conflict_context = await self._git.integration_conflict_context(
-                        lane.worktree_id, source_paths
-                    )
+                    try:
+                        conflict_context = await self._git.integration_conflict_context(
+                            lane.worktree_id, source_paths
+                        )
+                    except Exception:
+                        conflict_context = None
                 finally:
                     await self._git.abort_cherry_pick(lane.worktree_id)
                 self._store.finish_integration(
