@@ -530,7 +530,9 @@ async def test_a_repository_that_publishes_no_checks_never_reports_a_pass() -> N
 
     sha = "d" * 40
 
-    observed = await GitHubPublisher(runner=_no_checks_runner(sha)).checks(_no_checks_receipt(sha))
+    observed = await GitHubPublisher(runner=_no_checks_runner(sha)).checks(
+        _no_checks_receipt(sha)
+    )
 
     assert observed.status == "pending"
     assert [item.name for item in observed.checks] == ["check-discovery"]

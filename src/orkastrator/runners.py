@@ -149,7 +149,7 @@ def _pytest(output: str, *, satisfied: bool) -> str | None:
     if not summaries:
         return None
     # The last one is the short test summary; earlier matches are section rules.
-    summary = str(summaries[-1]).strip()
+    summary = summaries[-1].strip()
     if satisfied:
         return summary
 
