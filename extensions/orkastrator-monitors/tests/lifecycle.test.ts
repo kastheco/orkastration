@@ -1,16 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
-  RegisteredCommand,
-  SessionShutdownEvent,
-  SessionStartEvent,
-} from "@earendil-works/pi-coding-agent";
+import type { SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import type { MonitorTask } from "../core.ts";
 import {
+  type MonitorCommandOptions,
+  type MonitorExtensionAPI,
+  type MonitorExtensionContext,
+  type MonitorExtensionHandler,
   installOrkastratorMonitors,
   POLL_INTERVAL_MS,
   STATUS_KEY,
@@ -33,12 +30,11 @@ function task(): MonitorTask {
   };
 }
 
-type FakeContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
-  ui: Pick<ExtensionContext["ui"], "setStatus" | "notify">;
+interface FakeContext extends MonitorExtensionContext {
   trusted: boolean;
   statuses: Array<[string, string | undefined]>;
   notifications: Array<[string, "info" | "warning" | "error" | undefined]>;
-};
+}
 
 function context(trusted = true): FakeContext {
   const ctx: FakeContext = {
@@ -55,36 +51,31 @@ function context(trusted = true): FakeContext {
   return ctx;
 }
 
-type LifecycleEvent = SessionStartEvent | SessionShutdownEvent;
-type LifecycleHandler = (event: LifecycleEvent, ctx: ExtensionContext) => Promise<void> | void;
+type SessionStartHandler = MonitorExtensionHandler<SessionStartEvent>;
+type SessionShutdownHandler = MonitorExtensionHandler<SessionShutdownEvent>;
 
-function lifecycleApi(
-  handlers: Map<"session_start" | "session_shutdown", LifecycleHandler>,
-  onCommand: (handler: RegisteredCommand["handler"]) => void,
-): Pick<ExtensionAPI, "on" | "registerCommand"> {
-  const on = ((event: string, handler: (...args: unknown[]) => unknown) => {
-    if (event === "session_start" || event === "session_shutdown") {
-      handlers.set(event, handler as unknown as LifecycleHandler);
+class FakeExtensionAPI implements MonitorExtensionAPI {
+  sessionStartHandler: SessionStartHandler | undefined;
+  sessionShutdownHandler: SessionShutdownHandler | undefined;
+  commandHandler: MonitorCommandOptions["handler"] | undefined;
+
+  on(event: "session_start", handler: SessionStartHandler): void;
+  on(event: "session_shutdown", handler: SessionShutdownHandler): void;
+  on(event: "session_start" | "session_shutdown", handler: SessionStartHandler | SessionShutdownHandler): void {
+    if (event === "session_start") {
+      this.sessionStartHandler = handler as SessionStartHandler;
+    } else {
+      this.sessionShutdownHandler = handler as SessionShutdownHandler;
     }
-  }) as ExtensionAPI["on"];
+  }
 
-  return {
-    on,
-    registerCommand: (_name, options) => onCommand(options.handler),
-  };
-}
-
-function asExtensionContext(ctx: FakeContext): ExtensionContext {
-  return ctx as unknown as ExtensionContext;
-}
-
-function asCommandContext(ctx: FakeContext): ExtensionCommandContext {
-  return ctx as unknown as ExtensionCommandContext;
+  registerCommand(_name: string, options: MonitorCommandOptions): void {
+    this.commandHandler = options.handler;
+  }
 }
 
 test("session lifecycle polls once at a time and clears timer and footer on shutdown", async () => {
-  const handlers = new Map<"session_start" | "session_shutdown", LifecycleHandler>();
-  let commandHandler: RegisteredCommand["handler"] | undefined;
+  const api = new FakeExtensionAPI();
   const callbacks = new Map<number, () => void>();
   const cleared: number[] = [];
   let nextTimer = 1;
@@ -92,9 +83,6 @@ test("session lifecycle polls once at a time and clears timer and footer on shut
   let maxConcurrentDiscoveries = 0;
   let releaseDiscovery: (() => void) | undefined;
   let calls = 0;
-  const api = lifecycleApi(handlers, (handler) => {
-    commandHandler = handler;
-  });
   const timers = {
     setInterval: (callback: () => void, milliseconds: number) => {
       assert.equal(milliseconds, POLL_INTERVAL_MS);
@@ -119,7 +107,7 @@ test("session lifecycle polls once at a time and clears timer and footer on shut
   installOrkastratorMonitors(api, { discover, timers, now: () => 66_000 });
 
   const ctx = context();
-  await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, asExtensionContext(ctx));
+  await api.sessionStartHandler?.({ type: "session_start", reason: "startup" }, ctx);
   assert.deepEqual(ctx.statuses.at(-1), [STATUS_KEY, "● KAS-706 monitor bb9a9b29"]);
   assert.equal(callbacks.size, 1);
 
@@ -132,27 +120,23 @@ test("session lifecycle polls once at a time and clears timer and footer on shut
   releaseDiscovery?.();
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.ok(commandHandler);
+  assert.ok(api.commandHandler);
   const commandCtx = context();
-  await commandHandler!("", asCommandContext(commandCtx));
+  await api.commandHandler!("", commandCtx);
   assert.equal(callbacks.size, 1);
   assert.match(commandCtx.notifications.at(-1)?.[0] ?? "", /task id: b1234abcd/u);
 
-  await handlers.get("session_shutdown")?.(
-    { type: "session_shutdown", reason: "reload" },
-    asExtensionContext(ctx),
-  );
+  await api.sessionShutdownHandler?.({ type: "session_shutdown", reason: "reload" }, ctx);
   assert.deepEqual(cleared, [1]);
   assert.equal(callbacks.size, 0);
   assert.deepEqual(ctx.statuses.at(-1), [STATUS_KEY, undefined]);
 });
 
 test("reload starts one replacement timer and untrusted sessions never read task files", async () => {
-  const handlers = new Map<"session_start" | "session_shutdown", LifecycleHandler>();
+  const api = new FakeExtensionAPI();
   const callbacks = new Map<number, () => void>();
   let nextTimer = 1;
   let discoveryCalls = 0;
-  const api = lifecycleApi(handlers, () => undefined);
   const timers = {
     setInterval: (callback: () => void) => {
       const id = nextTimer++;
@@ -170,38 +154,25 @@ test("reload starts one replacement timer and untrusted sessions never read task
   });
 
   const first = context();
-  await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, asExtensionContext(first));
+  await api.sessionStartHandler?.({ type: "session_start", reason: "startup" }, first);
   assert.equal(callbacks.size, 1);
-  await handlers.get("session_shutdown")?.(
-    { type: "session_shutdown", reason: "reload" },
-    asExtensionContext(first),
-  );
-  await handlers.get("session_start")?.({ type: "session_start", reason: "reload" }, asExtensionContext(first));
+  await api.sessionShutdownHandler?.({ type: "session_shutdown", reason: "reload" }, first);
+  await api.sessionStartHandler?.({ type: "session_start", reason: "reload" }, first);
   assert.equal(callbacks.size, 1);
 
   const untrusted = context(false);
-  await handlers.get("session_shutdown")?.(
-    { type: "session_shutdown", reason: "new" },
-    asExtensionContext(first),
-  );
-  await handlers.get("session_start")?.(
-    { type: "session_start", reason: "new" },
-    asExtensionContext(untrusted),
-  );
+  await api.sessionShutdownHandler?.({ type: "session_shutdown", reason: "new" }, first);
+  await api.sessionStartHandler?.({ type: "session_start", reason: "new" }, untrusted);
   assert.equal(callbacks.size, 0);
   assert.equal(discoveryCalls, 2);
   assert.deepEqual(untrusted.statuses.at(-1), [STATUS_KEY, undefined]);
 });
 
 test("throwing host UI during a poll does not emit an unhandled rejection", async () => {
-  const handlers = new Map<string, (...args: never[]) => unknown>();
+  const api = new FakeExtensionAPI();
   const callbacks = new Map<number, () => void>();
   let nextTimer = 1;
   let statusCalls = 0;
-  const api = {
-    on: (event: string, handler: (...args: never[]) => unknown) => handlers.set(event, handler),
-    registerCommand: () => undefined,
-  };
   const timers = {
     setInterval: (callback: () => void) => {
       const id = nextTimer++;
@@ -210,7 +181,7 @@ test("throwing host UI during a poll does not emit an unhandled rejection", asyn
     },
     clearInterval: (handle: ReturnType<typeof setInterval>) => callbacks.delete(handle as unknown as number),
   };
-  installOrkastratorMonitors(api as never, {
+  installOrkastratorMonitors(api, {
     discover: async () => [task()],
     timers,
   });
@@ -222,10 +193,12 @@ test("throwing host UI during a poll does not emit an unhandled rejection", asyn
     ctx.statuses.push([key, value]);
   };
   const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown): void => unhandled.push(reason);
+  const onUnhandled = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
   process.on("unhandledRejection", onUnhandled);
   try {
-    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx as never);
+    await api.sessionStartHandler?.({ type: "session_start", reason: "startup" }, ctx);
     assert.equal(callbacks.size, 1);
     [...callbacks.values()][0]!();
     await new Promise((resolve) => setImmediate(resolve));

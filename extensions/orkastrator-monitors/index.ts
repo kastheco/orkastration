@@ -1,6 +1,8 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  SessionShutdownEvent,
+  SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -13,11 +15,25 @@ import { discoverMonitorTasks } from "./discovery.ts";
 export const STATUS_KEY = "orkastrator-monitors";
 export const POLL_INTERVAL_MS = 2_000;
 
-type MonitorExtensionContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
+export type MonitorExtensionContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
   ui: Pick<ExtensionContext["ui"], "notify" | "setStatus">;
 };
 
-type MonitorExtensionAPI = Pick<ExtensionAPI, "on" | "registerCommand">;
+export type MonitorExtensionHandler<Event> = (
+  event: Event,
+  ctx: MonitorExtensionContext,
+) => Promise<void> | void;
+
+export interface MonitorCommandOptions {
+  description?: string;
+  handler: (args: string, ctx: MonitorExtensionContext) => Promise<void>;
+}
+
+export interface MonitorExtensionAPI {
+  on(event: "session_start", handler: MonitorExtensionHandler<SessionStartEvent>): void;
+  on(event: "session_shutdown", handler: MonitorExtensionHandler<SessionShutdownEvent>): void;
+  registerCommand(name: string, options: MonitorCommandOptions): void;
+}
 
 interface TimerApi {
   setInterval(callback: () => void, milliseconds: number): ReturnType<typeof setInterval>;
