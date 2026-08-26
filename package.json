@@ -25,6 +25,12 @@
     ]
   },
   "scripts": {
-    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts"
+    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@types/node": "^22.20.1",
+    "typescript": "^7.0.2"
   }
 }

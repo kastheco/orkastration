@@ -13,6 +13,12 @@ import { discoverMonitorTasks } from "./discovery.ts";
 export const STATUS_KEY = "orkastrator-monitors";
 export const POLL_INTERVAL_MS = 2_000;
 
+type MonitorExtensionContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
+  ui: Pick<ExtensionContext["ui"], "notify" | "setStatus">;
+};
+
+type MonitorExtensionAPI = Pick<ExtensionAPI, "on" | "registerCommand">;
+
 interface TimerApi {
   setInterval(callback: () => void, milliseconds: number): ReturnType<typeof setInterval>;
   clearInterval(handle: ReturnType<typeof setInterval>): void;
@@ -25,20 +31,20 @@ export interface MonitorExtensionDependencies {
 }
 
 export function installOrkastratorMonitors(
-  pi: ExtensionAPI,
+  pi: MonitorExtensionAPI,
   dependencies: MonitorExtensionDependencies = {},
 ): void {
   const discover = dependencies.discover ?? discoverMonitorTasks;
   const timers = dependencies.timers ?? { setInterval, clearInterval };
   const now = dependencies.now ?? Date.now;
   let timer: ReturnType<typeof setInterval> | undefined;
-  let currentContext: ExtensionContext | undefined;
+  let currentContext: MonitorExtensionContext | undefined;
   let currentTasks: MonitorTask[] = [];
   let generation = 0;
   let inFlight: Promise<void> | undefined;
   let inFlightGeneration: number | undefined;
 
-  const stop = (ctx?: ExtensionContext): void => {
+  const stop = (ctx?: MonitorExtensionContext): void => {
     generation += 1;
     const activeTimer = timer;
     timer = undefined;
@@ -59,7 +65,7 @@ export function installOrkastratorMonitors(
     }
   };
 
-  const refresh = (ctx: ExtensionContext): Promise<void> => {
+  const refresh = (ctx: MonitorExtensionContext): Promise<void> => {
     if (inFlight) {
       return inFlightGeneration === generation ? inFlight : inFlight.then(() => refresh(ctx));
     }
