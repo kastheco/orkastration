@@ -46,8 +46,7 @@ roles:
   initial_reviewer:
     agent: claude
     model: opus
-    strength: high
-    fast: true
+    strength: medium
 
   fixer:
     agent: codex
@@ -65,7 +64,6 @@ roles:
     agent: claude
     model: sonnet
     strength: medium
-    fast: true
 
 publication:
   authorized_by: graph_acceptance
