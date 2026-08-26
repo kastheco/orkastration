@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionContext,
+  SessionShutdownEvent,
+  SessionStartEvent,
+} from "@earendil-works/pi-coding-agent";
 import type { MonitorTask } from "../core.ts";
 import {
   type MonitorCommandOptions,
   type MonitorExtensionAPI,
-  type MonitorExtensionContext,
   type MonitorExtensionHandler,
   installOrkastratorMonitors,
   POLL_INTERVAL_MS,
@@ -30,10 +33,11 @@ function task(): MonitorTask {
   };
 }
 
-interface FakeContext extends MonitorExtensionContext {
+interface FakeContext extends Pick<ExtensionContext, "cwd" | "isProjectTrusted"> {
   trusted: boolean;
   statuses: Array<[string, string | undefined]>;
   notifications: Array<[string, "info" | "warning" | "error" | undefined]>;
+  ui: Pick<ExtensionContext["ui"], "notify" | "setStatus">;
 }
 
 function context(trusted = true): FakeContext {

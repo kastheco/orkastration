@@ -1,6 +1,7 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  RegisteredCommand,
   SessionShutdownEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -24,10 +25,9 @@ export type MonitorExtensionHandler<Event> = (
   ctx: MonitorExtensionContext,
 ) => Promise<void> | void;
 
-export interface MonitorCommandOptions {
-  description?: string;
+export type MonitorCommandOptions = Omit<RegisteredCommand, "name" | "sourceInfo" | "handler"> & {
   handler: (args: string, ctx: MonitorExtensionContext) => Promise<void>;
-}
+};
 
 export interface MonitorExtensionAPI {
   on(event: "session_start", handler: MonitorExtensionHandler<SessionStartEvent>): void;
