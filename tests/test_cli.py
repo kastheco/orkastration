@@ -94,6 +94,7 @@ class FakeController:
     parked_question: ClassVar[list[str]] = []
     monitor_status: ClassVar[str] = "complete"
     monitor_results: ClassVar[list[StatusResult]] = []
+    reconciliations: ClassVar[list[tuple[str, str, str]]] = []
 
     def propose(self, value: SupervisorPlan) -> ProposalReceipt:
         return ProposalReceipt(run_id="run-1", proposal=value)
@@ -120,6 +121,10 @@ class FakeController:
             questions=list(type(self).parked_question),
             lanes=[StatusLane(phase=LanePhase(type(self).monitor_status))],
         )
+
+    async def reconcile_head(self, run_id: str, lane: str, note: str) -> StatusResult:
+        type(self).reconciliations.append((run_id, lane, note))
+        return StatusResult(run_id=run_id, status="active")
 
 
 class FakeReauthorizingController(FakeController):
@@ -200,6 +205,27 @@ lanes:
     assert json.loads(accepted.stdout)["status"] == "active"
     assert json.loads(monitored.stdout)["status"] == "complete"
     assert json.loads(monitored.stdout)["exit_reason"] == "terminal_graph"
+
+
+def test_reconcile_head_runs_under_the_run_lock(fake_wiring: None) -> None:
+    FakeController.reconciliations = []
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "reconcile-head",
+            "run-1",
+            "--lane",
+            "issue-123",
+            "--note",
+            "recover KAS-501",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "active"
+    assert FakeController.reconciliations == [("run-1", "issue-123", "recover KAS-501")]
 
 
 def test_a_second_driver_on_one_run_is_refused_by_name(fake_wiring: None, tmp_path: Path) -> None:

@@ -240,6 +240,20 @@ that explicitly failed, or whose result failed repository validation, remains `f
 to turn that work failure into a report retry. For pre-KAS-686 rows without a rejection kind, resume
 recognizes the legacy unreadable-report reason only when it does not match a known work-failure message.
 
+Runs created before the lane-head invariant may have a clean checkout ahead of the recorded integration
+head. Recover those without editing SQLite:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas reconcile-head <run-id> \
+  --lane <lane-name> --note "why this legacy head is trusted" --json
+```
+
+This fails closed unless the checkout head descends from the recorded head and every intervening commit
+has a persisted integration receipt for that same lane. Dirty checkouts, missing receipts, commits from
+another lane, and unrelated or non-descendant history are refused. Failed validation receipts stay
+failed and their findings stay blocking; reconciliation only repairs the lane identity and records both
+an event and a supervisor hand-action receipt.
+
 Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
 so it is a separate command from `reopen` and it records the note as evidence:
 

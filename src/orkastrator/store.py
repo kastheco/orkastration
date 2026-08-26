@@ -1899,9 +1899,9 @@ class StateStore:
         A finding is resolved by an integration receipt, and one receipt can carry
         several findings: the fixer commit it integrates may answer predecessors
         the adjudicator folded into it. So membership is the union of the receipt's
-        own finding and everything it names as a source, and only an `integrated`
-        receipt counts - `conflict` and `validation_failed` mean the lane checkout
-        never moved.
+        own finding and everything it names as a source. Only an `integrated`
+        receipt counts as resolved. A `validation_failed` receipt may name a commit
+        present in the checkout, but its finding remains blocking until adjudicated.
         """
 
         integrated: set[str] = set()
@@ -2108,6 +2108,44 @@ class StateStore:
                 },
             )
 
+    def record_integration_head(
+        self,
+        run_id: str,
+        finding: FindingRecord,
+        *,
+        base_sha: str,
+        integrated_sha: str,
+    ) -> None:
+        """Retain an applied checkout commit before validation can fail or crash."""
+
+        with self._session(immediate=True) as session:
+            row = session.exec(
+                select(IntegrationRow).where(
+                    IntegrationRow.finding_key == finding.finding_key,
+                    IntegrationRow.round == finding.round,
+                )
+            ).first()
+            if row is None or row.status != "starting":
+                raise ValueError("integration is not reserved for head recording")
+            lane = session.get(LaneRow, finding.lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {finding.lane_id}")
+            if lane.integration_head_sha == integrated_sha and row.integrated_sha == integrated_sha:
+                return
+            if lane.integration_head_sha != base_sha or row.base_sha != base_sha:
+                raise ValueError("integration base changed before head recording")
+            row.integrated_sha = integrated_sha
+            row.updated_at = _now()
+            lane.integration_head_sha = integrated_sha
+            lane.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                finding.lane_id,
+                "integration_head_recorded",
+                {"finding_id": finding.finding_id, "integrated_sha": integrated_sha},
+            )
+
     def mark_released(self, run_id: str, stage_id: str) -> None:
         with self._session() as session:
             row = session.get(WorkflowStageRow, stage_id)
@@ -2229,6 +2267,52 @@ class StateStore:
                 "checkout_head_sha": checkout_head_sha,
             },
         )
+
+    def reconcile_lane_head(
+        self,
+        run_id: str,
+        lane_id: str,
+        *,
+        expected_head_sha: str,
+        reconciled_head_sha: str,
+        integration_ids: list[str],
+        note: str,
+    ) -> LaneRecord:
+        """Advance a legacy lane head after the controller proves its Git ledger."""
+
+        with self._session(immediate=True) as session:
+            lane = session.get(LaneRow, lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {lane_id}")
+            if lane.integration_head_sha == reconciled_head_sha:
+                return _lane(lane)
+            if lane.integration_head_sha != expected_head_sha:
+                raise ValueError("lane integration head changed during reconciliation")
+            lane.integration_head_sha = reconciled_head_sha
+            lane.phase = LanePhase.ACTIVE.value
+            lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status in {"blocked", "failed", "report_failed"}:
+                run.status = "active"
+                run.updated_at = _now()
+            payload = {
+                "previous_head_sha": expected_head_sha,
+                "reconciled_head_sha": reconciled_head_sha,
+                "integration_ids": integration_ids,
+                "note": note[:4_000],
+            }
+            self._event(session, run_id, lane_id, "lane_head_reconciled", payload)
+            self._hand_action(
+                session,
+                run_id,
+                lane_id,
+                command="reconcile-head",
+                target=lane.name,
+                phase=LanePhase.ACTIVE.value,
+                note=note,
+            )
+            session.flush()
+            return _lane(lane)
 
     def note_publication_progress(self, run_id: str, lane_id: str) -> None:
         """Record that this lane's publication pass got an answer, ending any streak."""

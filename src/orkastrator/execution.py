@@ -1301,6 +1301,17 @@ class ExecutionController:
                 return
             integrated_sha = await self._git.head(lane.worktree_id)
 
+        try:
+            self._store.record_integration_head(
+                run_id,
+                finding,
+                base_sha=receipt.base_sha,
+                integrated_sha=integrated_sha,
+            )
+        except Exception:
+            await self._git.restore_head(lane.worktree_id, receipt.base_sha)
+            raise
+
         validation = await self._git.validate(
             lane.worktree_id,
             self._integrated_validation_requirements(run_id, finding.lane_id, source_finding_ids),
@@ -2581,6 +2592,58 @@ class ExecutionController:
         return [
             lane for lane in self._store.lanes(run_id) if lane.lane_id in {x.lane_id for x in lanes}
         ]
+
+    async def reconcile_head(self, run_id: str, lane_name: str, note: str) -> LaneRecord:
+        """Recover a legacy lane whose checkout advanced ahead of its ledger."""
+
+        matches = [lane for lane in self._store.lanes(run_id) if lane.name == lane_name]
+        if len(matches) != 1:
+            raise ValueError(f"run {run_id} has no unique lane named {lane_name}")
+        lane = matches[0]
+        if lane.worktree_id is None or lane.integration_head_sha is None:
+            raise ValueError(f"lane {lane.name} has no integration checkout and recorded head")
+        if not await self._git.is_clean(lane.worktree_id):
+            raise ValueError(f"lane {lane.name} checkout is dirty; refusing head reconciliation")
+        checkout_head = await self._git.head(lane.worktree_id)
+        if checkout_head == lane.integration_head_sha:
+            return lane
+        if not await self._git.is_ancestor(
+            lane.worktree_id, lane.integration_head_sha, checkout_head
+        ):
+            raise ValueError(
+                f"lane {lane.name} checkout head {checkout_head} does not descend from recorded "
+                f"head {lane.integration_head_sha}"
+            )
+        commits = await self._git.commits_between(
+            lane.worktree_id, lane.integration_head_sha, checkout_head
+        )
+        receipts_by_head = {
+            receipt.integrated_sha: receipt
+            for receipt in self._store.integrations(run_id)
+            if receipt.lane_id == lane.lane_id
+            and receipt.status in {"integrated", "validation_failed"}
+            and receipt.integrated_sha is not None
+        }
+        previous_head = lane.integration_head_sha
+        unproven: list[str] = []
+        for commit in commits:
+            receipt = receipts_by_head.get(commit)
+            if receipt is None or receipt.base_sha != previous_head:
+                unproven.append(commit)
+            previous_head = commit
+        if not commits or unproven:
+            raise ValueError(
+                f"lane {lane.name} checkout contains commits without same-lane integration "
+                f"receipts: {', '.join(unproven) if unproven else checkout_head}"
+            )
+        return self._store.reconcile_lane_head(
+            run_id,
+            lane.lane_id,
+            expected_head_sha=lane.integration_head_sha,
+            reconciled_head_sha=checkout_head,
+            integration_ids=[receipts_by_head[commit].integration_id for commit in commits],
+            note=note,
+        )
 
     def _require_authorization(self, run_id: str) -> AcceptanceAuthorization:
         """Reject resumed work when its frozen proposal or graph policy changed."""

@@ -141,6 +141,13 @@ class LocalGit:
             raise GitError(f"cannot move dirty lane checkout to fetched base {base_sha}")
         await self._git(worktree_id, "reset", "--hard", base_sha)
 
+    async def restore_head(self, worktree_id: str, head_sha: str) -> None:
+        """Roll a clean integration checkout back to its last recorded head."""
+
+        if not await self.is_clean(worktree_id):
+            raise GitError(f"cannot restore dirty lane checkout to {head_sha}")
+        await self._git(worktree_id, "reset", "--hard", head_sha)
+
     async def changed_paths(
         self,
         worktree_id: str,
