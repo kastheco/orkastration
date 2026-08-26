@@ -89,7 +89,10 @@ marked ready once the exact-SHA checks on the published head pass. Those checks 
 anything lands. An empty or still-running rollup remains pending. If required checks do not conclude
 within `final_gate.timeout_seconds`, the lane blocks and leaves the pull request open. Advisory checks
 are recorded but do not gate, and the concluded rollup is copied onto the publication receipt before
-an enabled merge runs.
+an enabled merge runs. Pull-request content comes from the accepted lane scope, worker summary and
+validation, independent review, exact published head, and the latest exact-head CI rollup. The GitHub
+adapter receives that evidence through a typed content boundary and reconciles the same owned draft as
+CI changes; absent optional evidence is omitted rather than replaced with generic copy.
 
 A pull request has three states and each one gets its own answer. `OPEN` is the working case.
 `MERGED` means the lane's branch reached the base branch, which is the outcome the lane exists to

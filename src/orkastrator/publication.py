@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from orkastrator.git import GitError, worktree_path
-from orkastrator.models import CiCheckResult, CiReceipt, LaneRecord, PublicationReceipt
+from orkastrator.models import (
+    CiCheckResult,
+    CiReceipt,
+    LaneRecord,
+    PublicationReceipt,
+    ValidationResult,
+)
 
 
 class PublicationError(RuntimeError):
@@ -37,6 +43,21 @@ class IntegrationConflict(PublicationError):
     """The lane cannot merge into the current base branch without intervention."""
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationContent:
+    """Frozen workflow evidence rendered into one owned pull request."""
+
+    issue_id: str
+    accepted_scope: str
+    stop_condition: str
+    implementation_summary: str
+    validation_results: tuple[ValidationResult, ...]
+    review_summary: str | None
+    unresolved_findings: tuple[str, ...]
+    published_head: str
+    ci: CiReceipt | None = None
+
+
 class LanePublisher(Protocol):
     """Provider boundary used after a lane converges locally."""
 
@@ -47,7 +68,10 @@ class LanePublisher(Protocol):
         lane: LaneRecord,
         head_sha: str,
         previous: PublicationReceipt | None,
+        content: PublicationContent,
     ) -> PublicationReceipt: ...
+
+    async def reconcile(self, receipt: PublicationReceipt, content: PublicationContent) -> None: ...
 
     async def checks(self, receipt: PublicationReceipt) -> CiReceipt: ...
 
@@ -114,7 +138,10 @@ class GitHubPublisher:
         lane: LaneRecord,
         head_sha: str,
         previous: PublicationReceipt | None,
+        content: PublicationContent,
     ) -> PublicationReceipt:
+        if content.published_head != head_sha:
+            raise PublicationError("pull-request content does not match the published revision")
         try:
             path = worktree_path(lane.worktree_id or "")
         except GitError as exc:
@@ -148,7 +175,8 @@ class GitHubPublisher:
             "--limit",
             "10",
         )
-        body = _pull_request_body(run_id, lane, head_sha)
+        title = _pull_request_title(content)
+        body = _pull_request_body(run_id, content)
         if not isinstance(pull_requests, list):
             raise PublicationError("GitHub returned an invalid pull-request list")
         if len(pull_requests) > 1:
@@ -192,7 +220,17 @@ class GitHubPublisher:
             await self._required(path, "git", "push", "origin", f"{head_sha}:refs/heads/{branch}")
 
         if pull_request is not None:
-            await self._required(path, *self._gh, "pr", "edit", pull_request_url, "--body", body)
+            await self._required(
+                path,
+                *self._gh,
+                "pr",
+                "edit",
+                pull_request_url,
+                "--title",
+                title,
+                "--body",
+                body,
+            )
             draft = bool(pull_request.get("isDraft", True))
         else:
             result = await self._required(
@@ -208,7 +246,7 @@ class GitHubPublisher:
                 "--head",
                 branch,
                 "--title",
-                f"{lane.issue_id}: {lane.name.replace('-', ' ')}",
+                title,
                 "--body",
                 body,
             )
@@ -223,6 +261,35 @@ class GitHubPublisher:
             pull_request_url=pull_request_url,
             head_sha=head_sha,
             draft=draft,
+        )
+
+    async def reconcile(self, receipt: PublicationReceipt, content: PublicationContent) -> None:
+        """Enrich the same owned draft as exact-head evidence becomes available."""
+
+        if content.published_head != receipt.head_sha:
+            raise PublicationError("pull-request content does not match the published revision")
+        state = await self._gh_json(
+            Path.cwd(),
+            "pr",
+            "view",
+            receipt.pull_request_url,
+            "--json",
+            "headRefOid,state,isDraft,body",
+        )
+        _verify_pull_request(state, receipt)
+        marker = f"orkastrator run: `{receipt.run_id}`"
+        if not isinstance(state, dict) or marker not in str(state.get("body") or ""):
+            raise PublicationError("existing pull request is not owned by this accepted run")
+        await self._required(
+            Path.cwd(),
+            *self._gh,
+            "pr",
+            "edit",
+            receipt.pull_request_url,
+            "--title",
+            _pull_request_title(content),
+            "--body",
+            _pull_request_body(receipt.run_id, content),
         )
 
     async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
@@ -429,14 +496,70 @@ def _github_repository(remote_url: str) -> str:
     )
 
 
-def _pull_request_body(run_id: str, lane: LaneRecord, head_sha: str) -> str:
-    return (
-        f"orkastrator run: `{run_id}`\n\n"
-        f"Lane: `{lane.name}`\n"
-        f"Issue: `{lane.issue_id}`\n"
-        f"Published head: `{head_sha}`\n\n"
-        "This pull request remains draft until required checks pass for this exact head."
+def _pull_request_title(content: PublicationContent) -> str:
+    """Use the implementation summary, never the machine-facing lane slug."""
+
+    summary = next(
+        (
+            line.strip().lstrip("#*- ")
+            for line in content.implementation_summary.splitlines()
+            if line.strip()
+        ),
+        "",
     )
+    title = re.split(r"(?<=[.!?])\s", summary, maxsplit=1)[0].rstrip(".!?")
+    title = re.sub(re.escape(content.issue_id), "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s{2,}", " ", title).strip(" :-")
+    if not title:
+        raise PublicationError("worker summary did not contain a usable pull-request title")
+    return title[:120].rstrip()
+
+
+def _pull_request_body(run_id: str, content: PublicationContent) -> str:
+    sections = ["## What changed", content.implementation_summary.strip()]
+    scope = [content.accepted_scope.strip(), f"Stop condition: {content.stop_condition.strip()}"]
+    sections.extend(("## Scope", "\n\n".join(item for item in scope if item)))
+
+    checks = [
+        _check_line(result.command, result.status, result.output)
+        for result in content.validation_results
+    ]
+    if content.ci is not None:
+        checks.append(f"CI for exact head `{content.ci.head_sha}`: {content.ci.status}")
+        checks.extend(
+            _check_line(check.name, check.status, check.output) for check in content.ci.checks
+        )
+    if checks:
+        sections.extend(("## Checks", "\n".join(checks)))
+
+    review: list[str] = []
+    if content.review_summary:
+        review.append(content.review_summary.strip())
+    if content.unresolved_findings:
+        review.append(
+            "Unresolved findings:\n"
+            + "\n".join(f"- {finding.strip()}" for finding in content.unresolved_findings)
+        )
+    if review:
+        sections.extend(("## Review", "\n\n".join(review)))
+
+    sections.extend(
+        (
+            "## Traceability",
+            f"Issue: `{content.issue_id}`\n"
+            f"Published head: `{content.published_head}`\n"
+            f"orkastrator run: `{run_id}`",
+        )
+    )
+    return "\n\n".join(part for part in sections if part)
+
+
+def _check_line(name: str, status: str, output: str) -> str:
+    line = f"- `{name}` - {status}"
+    detail = output.strip()
+    if detail:
+        line += "\n" + "\n".join(f"  - {item}" for item in detail.splitlines())
+    return line
 
 
 def _pull_request_state(payload: dict[object, object]) -> str:

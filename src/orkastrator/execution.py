@@ -59,6 +59,7 @@ from orkastrator.publication import (
     GitHubPublisher,
     IntegrationConflict,
     LanePublisher,
+    PublicationContent,
     PublicationError,
     PullRequestLanded,
 )
@@ -2208,6 +2209,7 @@ class ExecutionController:
         """Publish locally settled lanes and gate them on checks for the exact head."""
 
         self._require_authorization(run_id)
+        proposals = {item.name: item for item in self._store.run(run_id).proposal.lanes}
         for lane in self._store.lanes(run_id):
             failed = self._live_failed_stages(
                 [stage for stage in self._store.stages(run_id) if stage.lane_id == lane.lane_id],
@@ -2293,11 +2295,18 @@ class ExecutionController:
                         )
                         continue
                 if previous is None or previous.head_sha != lane.integration_head_sha:
+                    content = self._publication_content(
+                        run_id,
+                        lane,
+                        proposals[lane.name],
+                        ci=None,
+                    )
                     published = await self._publisher.publish(
                         run_id=run_id,
                         lane=lane,
                         head_sha=lane.integration_head_sha,
                         previous=previous,
+                        content=content,
                     )
                     if published.run_id != run_id or published.lane != lane.name:
                         raise PublicationError("publisher receipt does not match the accepted lane")
@@ -2321,6 +2330,15 @@ class ExecutionController:
                 if ci.head_sha != receipt.head_sha:
                     raise PublicationError("CI observation is not pinned to the published head")
                 self._store.record_ci_receipt(run_id, lane.lane_id, ci)
+                await self._publisher.reconcile(
+                    receipt,
+                    self._publication_content(
+                        run_id,
+                        lane,
+                        proposals[lane.name],
+                        ci=ci,
+                    ),
+                )
                 if ci.status == "passed":
                     receipt = receipt.model_copy(update={"ci": ci})
                     self._store.record_publication(run_id, lane.lane_id, receipt)
@@ -2353,6 +2371,7 @@ class ExecutionController:
                         f"pull request left open at {receipt.pull_request_url}",
                     )
                 self._store.note_publication_progress(run_id, lane.lane_id)
+
             except PullRequestLanded as exc:
                 # Merged between publishing and observing. Preserve the frozen
                 # published head alongside the head and merge commit GitHub landed.
@@ -2374,6 +2393,35 @@ class ExecutionController:
                         lane.lane_id,
                         f"{exc} (unchanged over {attempts} publication passes)",
                     )
+
+    def _publication_content(
+        self,
+        run_id: str,
+        lane: LaneRecord,
+        proposal: LaneProposal,
+        *,
+        ci: CiReceipt | None,
+    ) -> PublicationContent:
+        """Assemble provider-neutral PR content from persisted lane evidence."""
+
+        worker = self._store.worker_result(lane.lane_id)
+        review = self._store.initial_review(lane.lane_id)
+        unresolved = tuple(
+            finding.effective_contract.failure_mode
+            for finding in self._store.findings(run_id, lane.lane_id)
+            if finding.phase is not FindingPhase.RESOLVED
+        )
+        return PublicationContent(
+            issue_id=lane.issue_id,
+            accepted_scope=proposal.prompt,
+            stop_condition=proposal.stop_condition,
+            implementation_summary=worker.summary,
+            validation_results=tuple(worker.validation_results),
+            review_summary=review.summary if review is not None else None,
+            unresolved_findings=unresolved,
+            published_head=lane.integration_head_sha or worker.commit_sha,
+            ci=ci,
+        )
 
     @staticmethod
     def _live_failed_stages(
