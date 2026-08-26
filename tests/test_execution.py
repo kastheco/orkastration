@@ -13,7 +13,12 @@ from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
 from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
-from orkastrator.execution import ExecutionController, _format_frozen_diff, _next_key
+from orkastrator.execution import (
+    _PUBLICATION_ATTEMPTS,
+    ExecutionController,
+    _format_frozen_diff,
+    _next_key,
+)
 from orkastrator.git import BaseResolution, GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
@@ -3782,6 +3787,50 @@ async def test_stale_ci_sha_and_publication_errors_block_the_lane_once_they_pers
         payload = blocked[-1]["payload"]
         assert isinstance(payload, dict)
         assert "unchanged over 3 publication passes" in payload["reason"]
+
+
+async def test_publication_survives_an_unreadable_lane_checkout(tmp_path: Path) -> None:
+    class UnreadablePublicationCheckoutGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lane_head_reads = 0
+
+        async def head(self, worktree_id: str) -> str:
+            if worktree_id == "repo::/tmp/issue":
+                self.lane_head_reads += 1
+                # The worker and initial reviewer must still verify the frozen
+                # head. Only the later publication-time read is unreadable.
+                if self.lane_head_reads >= 5:
+                    raise GitError("rev-parse failed: unreadable lane checkout")
+            return await super().head(worktree_id)
+
+    orca = FakeOrca()
+    git = UnreadablePublicationCheckoutGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+
+    assert first.status == "active"
+    assert first.lanes[0].phase is LanePhase.ACTIVE
+    assert publisher.publish_calls == []
+
+    result = first
+    for _ in range(_PUBLICATION_ATTEMPTS - 1):
+        result = await value.monitor(run_id)
+
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    assert blocked
+    reason = blocked[-1]["payload"]["reason"]
+    assert "rev-parse failed: unreadable lane checkout" in reason
+    assert "unchanged over 3 publication passes" in reason
 
 
 async def test_a_remote_that_has_not_answered_yet_is_not_the_lanes_failure(
