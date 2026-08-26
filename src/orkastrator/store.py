@@ -2181,6 +2181,26 @@ class StateStore:
             session.commit()
             return self._publication_error_streak(session, run_id, lane_id)
 
+    def record_lane_head_divergence(
+        self,
+        run_id: str,
+        lane_id: str,
+        *,
+        recorded_head_sha: str,
+        checkout_head_sha: str,
+    ) -> None:
+        """Record that publication found a checkout state different from its ledger identity."""
+
+        self._append_event(
+            run_id,
+            lane_id,
+            "lane_head_diverged",
+            {
+                "recorded_head_sha": recorded_head_sha,
+                "checkout_head_sha": checkout_head_sha,
+            },
+        )
+
     def note_publication_progress(self, run_id: str, lane_id: str) -> None:
         """Record that this lane's publication pass got an answer, ending any streak."""
 

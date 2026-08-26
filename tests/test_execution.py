@@ -13,7 +13,12 @@ from sqlmodel import Session, select
 
 from orkastrator.config import AgentProfile, GraphConfig, StageBudget, StageBudgets
 from orkastrator.db import AcceptanceAuthorizationRow, EventRow, LaneRow
-from orkastrator.execution import ExecutionController, _format_frozen_diff, _next_key
+from orkastrator.execution import (
+    _PUBLICATION_ATTEMPTS,
+    ExecutionController,
+    _format_frozen_diff,
+    _next_key,
+)
 from orkastrator.git import BaseResolution, GitCommandResult, GitError, LocalGit
 from orkastrator.models import (
     CiCheckResult,
@@ -1894,6 +1899,7 @@ async def test_integrated_receipt_replay_settles_every_composite_finding(
         integrated_sha="f" * 40,
         validation_results=[],
     )
+    git.heads["repo::/tmp/issue"] = "f" * 40
 
     result = await value.monitor(run_id)
 
@@ -3041,6 +3047,126 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
 
 
+async def test_publication_refuses_and_records_a_checkout_ahead_of_the_ledger(
+    tmp_path: Path,
+) -> None:
+    checkout_head_sha = "d" * 40
+
+    class CheckoutAdvancesAfterReviewGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self._review_started = False
+            self._review_head_pending = False
+
+        async def pytest_coverage_configured(self, worktree_id: str | None) -> bool:
+            self._review_started = True
+            self._review_head_pending = True
+            return await super().pytest_coverage_configured(worktree_id)
+
+        async def head(self, worktree_id: str) -> str:
+            if worktree_id == "repo::/tmp/issue" and self._review_head_pending:
+                self._review_head_pending = False
+                return await super().head(worktree_id)
+            if worktree_id == "repo::/tmp/issue" and self._review_started:
+                return checkout_head_sha
+            return await super().head(worktree_id)
+
+    orca = FakeOrca()
+    git = CheckoutAdvancesAfterReviewGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    recorded_head_sha = "b" * 40
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    divergence = next(
+        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
+    )
+    assert divergence["payload"] == {
+        "recorded_head_sha": recorded_head_sha,
+        "checkout_head_sha": checkout_head_sha,
+    }
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    assert blocked[-1]["payload"]["reason"] == (
+        f"lane checkout HEAD {checkout_head_sha} does not match recorded integration head "
+        f"{recorded_head_sha}; refusing publication"
+    )
+
+
+async def test_publication_with_an_agreeing_checkout_uses_the_recorded_head(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert publisher.publish_calls == [("b" * 40, None)]
+    assert not [
+        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
+    ]
+
+
+async def test_publication_refuses_a_dirty_lane_checkout(tmp_path: Path) -> None:
+    class DirtyAtPublicationGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self._review_clean_checks = 0
+
+        async def is_clean(self, worktree_id: str) -> bool:
+            if (
+                worktree_id == "repo::/tmp/issue"
+                and self.lane_clean_override is False
+                and self._review_clean_checks < 3
+            ):
+                self._review_clean_checks += 1
+                return True
+            return await super().is_clean(worktree_id)
+
+    orca = FakeOrca()
+    git = DirtyAtPublicationGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    git.lane_clean_override = False
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    recorded_head_sha = "b" * 40
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    divergence = next(
+        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
+    )
+    assert divergence["payload"] == {
+        "recorded_head_sha": recorded_head_sha,
+        "checkout_head_sha": recorded_head_sha,
+    }
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    assert blocked[-1]["payload"]["reason"] == (
+        f"lane checkout at recorded integration head {recorded_head_sha} carries "
+        "uncommitted work; refusing publication"
+    )
+
+
 async def test_failed_round_one_reviewer_does_not_stop_resolved_round_two_publication(
     tmp_path: Path,
 ) -> None:
@@ -3798,6 +3924,50 @@ async def test_stale_ci_sha_and_publication_errors_block_the_lane_once_they_pers
         payload = blocked[-1]["payload"]
         assert isinstance(payload, dict)
         assert "unchanged over 3 publication passes" in payload["reason"]
+
+
+async def test_publication_survives_an_unreadable_lane_checkout(tmp_path: Path) -> None:
+    class UnreadablePublicationCheckoutGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lane_head_reads = 0
+
+        async def head(self, worktree_id: str) -> str:
+            if worktree_id == "repo::/tmp/issue":
+                self.lane_head_reads += 1
+                # The worker and initial reviewer must still verify the frozen
+                # head. Only the later publication-time read is unreadable.
+                if self.lane_head_reads >= 5:
+                    raise GitError("rev-parse failed: unreadable lane checkout")
+            return await super().head(worktree_id)
+
+    orca = FakeOrca()
+    git = UnreadablePublicationCheckoutGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+
+    assert first.status == "active"
+    assert first.lanes[0].phase is LanePhase.ACTIVE
+    assert publisher.publish_calls == []
+
+    result = first
+    for _ in range(_PUBLICATION_ATTEMPTS - 1):
+        result = await value.monitor(run_id)
+
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    assert blocked
+    reason = blocked[-1]["payload"]["reason"]
+    assert "rev-parse failed: unreadable lane checkout" in reason
+    assert "unchanged over 3 publication passes" in reason
 
 
 async def test_a_remote_that_has_not_answered_yet_is_not_the_lanes_failure(

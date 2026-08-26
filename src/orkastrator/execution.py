@@ -2243,6 +2243,30 @@ class ExecutionController:
             # merged even when the merge is discovered while observing checks.
             receipt: PublicationReceipt | None = previous
             try:
+                if lane.worktree_id is not None:
+                    checkout_head_sha = await self._git.head(lane.worktree_id)
+                    checkout_clean = await self._git.is_clean(lane.worktree_id)
+                    if checkout_head_sha != lane.integration_head_sha or not checkout_clean:
+                        recorded_head_sha = lane.integration_head_sha
+                        self._store.record_lane_head_divergence(
+                            run_id,
+                            lane.lane_id,
+                            recorded_head_sha=recorded_head_sha,
+                            checkout_head_sha=checkout_head_sha,
+                        )
+                        reason = (
+                            f"lane checkout HEAD {checkout_head_sha} does not match recorded "
+                            f"integration head {recorded_head_sha}; refusing publication"
+                            if checkout_head_sha != recorded_head_sha
+                            else f"lane checkout at recorded integration head {recorded_head_sha} "
+                            "carries uncommitted work; refusing publication"
+                        )
+                        self._store.block_lane(
+                            run_id,
+                            lane.lane_id,
+                            reason,
+                        )
+                        continue
                 if previous is None or previous.head_sha != lane.integration_head_sha:
                     published = await self._publisher.publish(
                         run_id=run_id,
@@ -2299,7 +2323,7 @@ class ExecutionController:
             except IntegrationConflict as exc:
                 await self._record_publication_conflict(run_id, lane, str(exc))
                 self._store.note_publication_progress(run_id, lane.lane_id)
-            except PublicationError as exc:
+            except (GitError, PublicationError) as exc:
                 # One failed observation is not knowledge. `assistant-kas-576`
                 # blocked one second after pushing its branch, on a required-check
                 # query GitHub had not caught up with yet, and every check was
