@@ -1,6 +1,6 @@
 version: 2
-max_parallel_lanes: 6
-max_parallel_workers: 6
+max_parallel_lanes: 10
+max_parallel_workers: 10
 
 review_cycle:
   initial_scope: lane_changeset
