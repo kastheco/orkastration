@@ -27,6 +27,7 @@ from orkastrator.models import (
     FindingReason,
     GraphResult,
     IntegrationConflictContext,
+    IntegrationRecord,
     LanePhase,
     LaneRecord,
     PublicationReceipt,
@@ -37,6 +38,7 @@ from orkastrator.models import (
     SupervisorPlan,
     ValidationRequirement,
     ValidationResult,
+    WorkerResult,
 )
 from orkastrator.orca import MAX_TASK_SPEC_BYTES, JsonObject, OrcaError, OrcaTimeout
 from orkastrator.publication import IntegrationConflict, PublicationError, PullRequestLanded
@@ -425,11 +427,13 @@ class FakeGit(LocalGit):
         )
         self.fetch_calls: list[str] = []
         self.pin_calls: list[tuple[str, str]] = []
+        self.restore_calls: list[tuple[str, str]] = []
         self.integrated: dict[str, str] = {}
         self.changed_override: list[str] | None = None
         self.changed_by_head: dict[str, list[str]] = {}
         self.head_override: str | None = None
         self.ancestor_override: bool | None = None
+        self.lane_ancestor_override: bool | None = None
         self.lane_head_override: str | None = None
         self.conflict = False
         # Conflict for one named fix rather than for the whole run, which is what a
@@ -530,12 +534,18 @@ class FakeGit(LocalGit):
     async def pin_base(self, worktree_id: str, base_sha: str) -> None:
         self.pin_calls.append((worktree_id, base_sha))
 
+    async def restore_head(self, worktree_id: str, head_sha: str) -> None:
+        self.restore_calls.append((worktree_id, head_sha))
+        self.heads[worktree_id] = head_sha
+
     async def diff_sha256(self, worktree_id: str, base_sha: str, head_sha: str) -> str:
         if self.diff_sha256_override is not None and worktree_id == "repo::/tmp/issue":
             return self.diff_sha256_override
         return "c" * 64
 
     async def is_ancestor(self, worktree_id: str, base_sha: str, head_sha: str) -> bool:
+        if worktree_id == "repo::/tmp/issue" and self.lane_ancestor_override is not None:
+            return self.lane_ancestor_override
         if self.ancestor_override is not None and "finding-" in worktree_id:
             return self.ancestor_override
         return True
@@ -1834,6 +1844,273 @@ async def test_approved_commits_integrate_serially_and_are_auditable(tmp_path: P
         "uv run --extra dev pytest",
         "uv run --extra dev pytest --no-cov -p no:cacheprovider tests/test_two.py",
     ]
+
+
+async def test_two_failed_validations_keep_the_lane_head_on_the_checkout_and_publish(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(max_workers=2, max_fixers=2),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(1), review_finding_data(2))
+    fixer_starts = [item for item in orca.starts if "fixer" in str(item["lane_name"])]
+    for start in fixer_starts:
+        finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
+        orca.complete_task(str(start["task_id"]), fix_attempt(finding_id))
+    result = await value.monitor(run_id)
+    for started in result.started:
+        stage = next(item for item in store.stages(run_id) if item.orca_task_id == started.task_id)
+        assert stage.finding_id is not None
+        orca.complete_task(started.task_id, re_review("resolved", finding_id=stage.finding_id))
+
+    await value.monitor(run_id)
+    result = await value.monitor(run_id)
+
+    receipts = store.integrations(run_id)
+    assert [receipt.status for receipt in receipts] == ["validation_failed", "validation_failed"]
+    assert all(receipt.validation_results[0].status == "failed" for receipt in receipts)
+    assert git.heads["repo::/tmp/issue"] == receipts[-1].integrated_sha
+    assert store.lanes(run_id)[0].integration_head_sha == receipts[-1].integrated_sha
+    assert all(
+        finding.escalation_reason is FindingReason.VALIDATION_FAILED
+        for finding in result.findings
+    )
+
+    for finding in result.findings:
+        store.settle_finding(
+            run_id,
+            finding.finding_id,
+            phase=FindingPhase.DEFERRED,
+            note="validation command was invalid; fix verified independently",
+        )
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert publisher.publish_calls == [(receipts[-1].integrated_sha, None)]
+
+
+async def test_readjudicating_an_earlier_failed_integration_keeps_the_advanced_head(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(max_workers=2, max_fixers=2),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data(1), review_finding_data(2))
+    for start in [item for item in orca.starts if "fixer" in str(item["lane_name"])]:
+        finding_id = "finding-1" if "finding-1" in str(start["lane_name"]) else "finding-2"
+        orca.complete_task(str(start["task_id"]), fix_attempt(finding_id))
+    result = await value.monitor(run_id)
+    for started in result.started:
+        stage = next(item for item in store.stages(run_id) if item.orca_task_id == started.task_id)
+        assert stage.finding_id is not None
+        orca.complete_task(started.task_id, re_review("resolved", finding_id=stage.finding_id))
+
+    await value.monitor(run_id)
+    result = await value.monitor(run_id)
+    receipts = store.integrations(run_id)
+    first, second = receipts
+    assert first.status == "validation_failed"
+    assert second.status == "validation_failed"
+    assert first.integrated_sha is not None
+    assert second.integrated_sha is not None
+    assert first.integrated_sha != second.integrated_sha
+
+    escalation_stage = next(
+        stage
+        for stage in store.stages(run_id)
+        if stage.role is StageKind.ESCALATION and stage.finding_id == "finding-1"
+    )
+    assert escalation_stage.orca_task_id is not None
+    orca.complete_task(
+        escalation_stage.orca_task_id,
+        escalation("validation_failed", "accept_fix", finding_id="finding-1"),
+    )
+    result = await value.monitor(run_id)
+
+    assert git.restore_calls == []
+    assert git.heads["repo::/tmp/issue"] == second.integrated_sha
+    assert store.lanes(run_id)[0].integration_head_sha == second.integrated_sha
+    assert store.integrations(run_id)[0].status == "validation_failed"
+    assert (
+        next(item for item in result.findings if item.finding_id == "finding-1").escalation_reason
+        is FindingReason.VALIDATION_FAILED
+    )
+
+    for finding in result.findings:
+        store.settle_finding(
+            run_id,
+            finding.finding_id,
+            phase=FindingPhase.DEFERRED,
+            note="validation failure independently adjudicated",
+        )
+    result = await value.monitor(run_id)
+    assert result.status == "complete"
+    assert publisher.publish_calls == [(second.integrated_sha, None)]
+
+
+async def test_integration_rolls_back_when_the_applied_head_cannot_be_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    monkeypatch.setattr(
+        store,
+        "record_integration_head",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await value.monitor(run_id)
+
+    assert git.restore_calls == [("repo::/tmp/issue", "b" * 40)]
+    assert git.heads["repo::/tmp/issue"] == "b" * 40
+    assert store.lanes(run_id)[0].integration_head_sha == "b" * 40
+
+
+async def test_reconcile_head_recovers_only_a_receipt_proven_legacy_divergence(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.lane_validation_fails = True
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    await value.monitor(run_id)
+    receipt = store.integrations(run_id)[0]
+    assert receipt.status == "validation_failed"
+    assert receipt.integrated_sha is not None
+    lane = store.lanes(run_id)[0]
+    assert lane.integration_head_sha == receipt.integrated_sha
+
+    with Session(store._engine) as session:
+        row = session.get(LaneRow, lane.lane_id)
+        assert row is not None
+        row.integration_head_sha = receipt.base_sha
+        row.phase = LanePhase.BLOCKED.value
+        session.add(row)
+        session.commit()
+    git.commit_chain_override = [receipt.integrated_sha]
+
+    recovered = await value.reconcile_head(run_id, lane.name, "recover legacy KAS-501 state")
+    repeated = await value.reconcile_head(run_id, lane.name, "idempotent retry")
+
+    assert recovered.integration_head_sha == receipt.integrated_sha
+    assert recovered.phase is LanePhase.ACTIVE
+    assert repeated.integration_head_sha == receipt.integrated_sha
+    assert store.integrations(run_id)[0].status == "validation_failed"
+    assert store.findings(run_id)[0].escalation_reason is FindingReason.VALIDATION_FAILED
+    reconciliations = [
+        event for event in store.events(run_id) if event["kind"] == "lane_head_reconciled"
+    ]
+    assert len(reconciliations) == 1
+    actions = []
+    for event in store.events(run_id):
+        payload = event["payload"]
+        if (
+            event["kind"] == "supervisor_hand_action"
+            and isinstance(payload, dict)
+            and payload.get("command") == "reconcile-head"
+        ):
+            actions.append(event)
+    assert len(actions) == 1
+
+    store.settle_finding(
+        run_id,
+        "finding-1",
+        phase=FindingPhase.DEFERRED,
+        note="invalid validation command was independently adjudicated",
+    )
+    result = await value.monitor(run_id)
+    assert result.status == "complete"
+    assert publisher.publish_calls == [(receipt.integrated_sha, None)]
+
+
+@pytest.mark.parametrize(
+    ("dirty", "ancestor", "cross_lane", "commits", "message"),
+    [
+        (True, True, False, ["c" * 40], "dirty"),
+        (False, False, False, ["c" * 40], "does not descend"),
+        (False, True, False, ["c" * 40], "without same-lane integration receipts"),
+        (False, True, True, ["c" * 40], "without same-lane integration receipts"),
+    ],
+)
+async def test_reconcile_head_refuses_unsafe_legacy_divergence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dirty: bool,
+    ancestor: bool,
+    cross_lane: bool,
+    commits: list[str],
+    message: str,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    lane = store.lanes(run_id)[0]
+    assert lane.integration_head_sha is None
+    result = WorkerResult.model_validate_json(worker_result())
+    store.record_worker_result(run_id, lane.lane_id, result)
+    lane = store.lanes(run_id)[0]
+    assert lane.integration_head_sha is not None
+    git.heads["repo::/tmp/issue"] = "d" * 40
+    git.lane_clean_override = not dirty
+    git.commit_chain_override = commits
+    git.lane_ancestor_override = ancestor
+    if cross_lane:
+        foreign_receipt = IntegrationRecord(
+            integration_id="foreign-integration",
+            finding_key="foreign-finding",
+            lane_id="foreign-lane",
+            round=1,
+            fixer_commit_sha="e" * 40,
+            source_commits=["e" * 40],
+            source_finding_ids=["finding-foreign"],
+            base_sha=lane.integration_head_sha,
+            integrated_sha="c" * 40,
+            status="validation_failed",
+            validation_results=[],
+            created_at=datetime(2026, 8, 26, tzinfo=UTC),
+            updated_at=datetime(2026, 8, 26, tzinfo=UTC),
+        )
+        monkeypatch.setattr(store, "integrations", lambda _run_id: [foreign_receipt])
+
+    with pytest.raises(ValueError, match=message):
+        await value.reconcile_head(run_id, lane.name, "unsafe")
 
 
 async def test_introduced_regression_integrates_the_approved_composite_chain(

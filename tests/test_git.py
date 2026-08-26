@@ -230,6 +230,44 @@ async def test_disjoint_fixer_commits_integrate_serially(tmp_path: Path) -> None
     assert await git.find_cherry_pick(lane_id, one_sha) == first_head
 
 
+async def test_restore_head_rewinds_a_clean_checkout(tmp_path: Path) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "lane"
+    lane_id = add_worktree(repo, lane, "lane", base)
+    commit(lane, "src/later.py", "later\n", "later change")
+    git = LocalGit()
+
+    assert await git.head(lane_id) != base
+    assert await git.is_clean(lane_id)
+
+    await git.restore_head(lane_id, base)
+
+    assert await git.head(lane_id) == base
+    assert not (lane / "src/later.py").exists()
+    assert await git.is_clean(lane_id)
+
+
+async def test_restore_head_refuses_a_dirty_checkout_without_changing_it(
+    tmp_path: Path,
+) -> None:
+    repo, base = repository(tmp_path)
+    lane = tmp_path / "lane"
+    lane_id = add_worktree(repo, lane, "lane", base)
+    (lane / "src/shared.py").write_text("dirty\n")
+    (lane / "untracked.txt").write_text("owner work\n")
+    before_status = run(lane, "git", "status", "--porcelain", "--untracked-files=all")
+    before_content = (lane / "src/shared.py").read_text()
+    git = LocalGit()
+
+    with pytest.raises(GitError):
+        await git.restore_head(lane_id, base)
+
+    assert await git.head(lane_id) == base
+    assert (lane / "src/shared.py").read_text() == before_content
+    assert (lane / "untracked.txt").read_text() == "owner work\n"
+    assert run(lane, "git", "status", "--porcelain", "--untracked-files=all") == before_status
+
+
 async def test_render_diff_returns_the_complete_path_scoped_frozen_text(tmp_path: Path) -> None:
     repo, base = repository(tmp_path)
     lane = tmp_path / "render"

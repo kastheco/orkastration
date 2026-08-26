@@ -266,6 +266,23 @@ def resume(
     )
 
 
+@app.command("reconcile-head")
+def reconcile_head(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    lane: Annotated[str, typer.Option("--lane", help="Diverged lane to reconcile.")],
+    note: Annotated[
+        str, typer.Option("--note", help="Why this legacy divergence is being recovered.")
+    ],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Advance a recorded lane head only when Git and its integration ledger prove it."""
+
+    async def reconcile() -> BaseModel:
+        return await _controller().reconcile_head(run_id, lane, note)
+
+    _drive(run_id, reconcile(), json_output=json_output)
+
+
 @app.command("record-external-merge")
 def record_external_merge(
     run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
