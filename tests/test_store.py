@@ -7,6 +7,8 @@ import pytest
 
 from orkastrator.models import (
     AttemptKind,
+    CiCheckResult,
+    CiReceipt,
     EscalationDecision,
     FindingPhase,
     FindingReason,
@@ -1015,3 +1017,48 @@ def test_a_published_head_may_land_but_never_un_land(tmp_path: Path) -> None:
             lane.lane_id,
             landed.model_copy(update={"pull_request_url": "https://github.com/owner/repo/pull/9"}),
         )
+
+
+def test_a_published_head_may_replace_its_concluded_ci_rollup_but_not_erase_it(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.setup()
+    run_id = store.record_proposal(sample_proposal())
+    lane = store.lanes(run_id)[0]
+    receipt = PublicationReceipt(
+        run_id=run_id,
+        lane=lane.name,
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch=f"orkastrator/{run_id[:12]}/{lane.name}",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha="b" * 40,
+        draft=False,
+        ci=CiReceipt(
+            provider="github",
+            head_sha="b" * 40,
+            status="passed",
+            checks=[CiCheckResult(name="pytest", status="passed", output="first")],
+        ),
+    )
+
+    store.record_publication(run_id, lane.lane_id, receipt)
+    replacement = receipt.model_copy(
+        update={
+            "ci": CiReceipt(
+                provider="github",
+                head_sha="b" * 40,
+                status="passed",
+                checks=[
+                    CiCheckResult(name="pytest", status="passed", output="second"),
+                    CiCheckResult(name="ruff", status="passed", output="passed"),
+                ],
+            )
+        }
+    )
+    store.record_publication(run_id, lane.lane_id, replacement)
+
+    assert store.publications(run_id) == [replacement]
+    with pytest.raises(ValueError, match="CI rollup cannot be erased"):
+        store.record_publication(run_id, lane.lane_id, replacement.model_copy(update={"ci": None}))

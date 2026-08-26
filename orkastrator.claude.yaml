@@ -81,6 +81,7 @@ final_gate:
   require_remote: true
   require_all_checks: true
   restart_initial_review: false
+  timeout_seconds: 900
   # kashh's own `all-checks` job deletes this suite from the set it requires
   # while its launch boundary is intermittent (.github/workflows/pr-checks.yml).
   # Name it here so the supervisor enforces the same set the repository does.

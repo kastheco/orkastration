@@ -525,30 +525,20 @@ def _no_checks_receipt(sha: str) -> PublicationReceipt:
     )
 
 
-async def test_a_repository_that_publishes_no_checks_can_be_declared_ungated() -> None:
-    """A repository with no workflows never leaves the "nothing reported" state.
-
-    Without an explicit opt-out its lane polls forever: the empty result is read
-    as a race that will resolve, and it never does. `treat_no_checks_as_passed`
-    is the owner saying the empty result is final for this repository.
-    """
+async def test_a_repository_that_publishes_no_checks_never_reports_a_pass() -> None:
+    """An empty answer cannot authorize a merge, even when it persists."""
 
     sha = "d" * 40
 
-    observed = await GitHubPublisher(
-        runner=_no_checks_runner(sha), treat_no_checks_as_passed=True
-    ).checks(_no_checks_receipt(sha))
+    observed = await GitHubPublisher(runner=_no_checks_runner(sha)).checks(
+        _no_checks_receipt(sha)
+    )
 
-    assert observed.status == "passed"
+    assert observed.status == "pending"
     assert [item.name for item in observed.checks] == ["check-discovery"]
 
 
-async def test_declaring_a_repository_ungated_does_not_pass_a_real_pending_check() -> None:
-    """The opt-out answers "this repository reports nothing", not "stop waiting".
-
-    A check that exists and reported pending is still a race worth another tick,
-    so the flag must not shortcut it.
-    """
+async def test_a_real_pending_check_does_not_pass() -> None:
 
     sha = "e" * 40
     runner = QueueRunner(
@@ -568,9 +558,7 @@ async def test_declaring_a_repository_ungated_does_not_pass_a_real_pending_check
         ),
     )
 
-    observed = await GitHubPublisher(
-        runner=runner, treat_no_checks_as_passed=True
-    ).checks(_no_checks_receipt(sha))
+    observed = await GitHubPublisher(runner=runner).checks(_no_checks_receipt(sha))
 
     assert observed.status == "pending"
     assert [item.name for item in observed.checks] == ["tests"]

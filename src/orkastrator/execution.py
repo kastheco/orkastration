@@ -2322,8 +2322,10 @@ class ExecutionController:
                     raise PublicationError("CI observation is not pinned to the published head")
                 self._store.record_ci_receipt(run_id, lane.lane_id, ci)
                 if ci.status == "passed":
+                    receipt = receipt.model_copy(update={"ci": ci})
+                    self._store.record_publication(run_id, lane.lane_id, receipt)
                     ready = await self._publisher.mark_ready(receipt)
-                    if ready.head_sha != receipt.head_sha or ready.draft:
+                    if ready.head_sha != receipt.head_sha or ready.draft or ready.ci != ci:
                         raise PublicationError("provider did not mark the exact pull request ready")
                     self._store.record_publication(run_id, lane.lane_id, ready)
                     if self._config.publication.merge:
@@ -2339,6 +2341,17 @@ class ExecutionController:
                         self._store.record_publication(run_id, lane.lane_id, landed)
                 elif ci.status == "failed":
                     await self._record_ci_failure(run_id, lane, publications, ci)
+                elif (
+                    self._store.ci_wait_seconds(lane.lane_id, ci.head_sha)
+                    >= self._config.final_gate.timeout_seconds
+                ):
+                    self._store.block_lane(
+                        run_id,
+                        lane.lane_id,
+                        "final-gate timeout: required checks did not conclude within "
+                        f"{self._config.final_gate.timeout_seconds:g} seconds; "
+                        f"pull request left open at {receipt.pull_request_url}",
+                    )
                 self._store.note_publication_progress(run_id, lane.lane_id)
             except PullRequestLanded as exc:
                 # Merged between publishing and observing. Preserve the frozen
@@ -2348,7 +2361,7 @@ class ExecutionController:
             except IntegrationConflict as exc:
                 await self._record_publication_conflict(run_id, lane, str(exc))
                 self._store.note_publication_progress(run_id, lane.lane_id)
-            except (GitError, PublicationError) as exc:
+            except (GitError, PublicationError, ValueError) as exc:
                 # One failed observation is not knowledge. `assistant-kas-576`
                 # blocked one second after pushing its branch, on a required-check
                 # query GitHub had not caught up with yet, and every check was
