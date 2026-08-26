@@ -162,6 +162,41 @@ async def test_create_and_reconcile_publish_structured_evidence(tmp_path: Path) 
         await GitHubPublisher(runner=foreign_runner).reconcile(receipt, publication_content(ci=ci))
 
 
+async def test_reconcile_preserves_the_merge_commit_when_the_pull_request_landed() -> None:
+    sha = "b" * 40
+    merge_sha = "c" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": sha,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "body": "orkastrator run: `run-1234567890`",
+                    "mergeCommit": {"oid": merge_sha},
+                }
+            )
+        )
+    )
+
+    with pytest.raises(PullRequestLanded) as landed:
+        await GitHubPublisher(runner=runner).reconcile(receipt, publication_content())
+
+    assert landed.value.receipt.landed is True
+    assert landed.value.receipt.merged_head_sha == sha
+    assert landed.value.receipt.merge_sha == merge_sha
+
+
 def test_pull_request_body_omits_missing_optional_evidence() -> None:
     body = _pull_request_body(
         "run-1234567890",

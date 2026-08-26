@@ -278,7 +278,7 @@ class GitHubPublisher:
             "view",
             receipt.pull_request_url,
             "--json",
-            "headRefOid,state,isDraft,body",
+            "headRefOid,state,isDraft,mergeCommit,body",
         )
         _verify_pull_request(state, receipt)
         marker = f"orkastrator run: `{receipt.run_id}`"
