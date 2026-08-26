@@ -3778,6 +3778,49 @@ async def test_merge_failure_is_a_merge_origin_not_a_lane_regression(tmp_path: P
     assert [item.role for item in result.started] == [StageKind.FIXER]
 
 
+async def test_reproduced_merge_failure_escalates_instead_of_advancing_to_re_review(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.merge_validation_failures.add("merge::/tmp/merge-1")
+    publisher = FakePublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        git=git,
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+    finding = next(
+        item
+        for item in result.findings
+        if item.finding_id.startswith("publication-conflict-merge-validation")
+    )
+    fixer_worktree = next(
+        stage.worktree_id for stage in result.stages if stage.role is StageKind.FIXER
+    )
+    assert fixer_worktree is not None
+    git.merge_validation_failures.add(fixer_worktree)
+
+    orca.complete_dispatched(fix_attempt(finding.finding_id))
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].escalation_reason is FindingReason.VALIDATION_FAILED
+    assert [launch.role for launch in result.started] == [StageKind.ESCALATION]
+    assert not any(stage.role is StageKind.RE_REVIEWER for stage in result.stages)
+    attempt = store.latest_fix_attempt(finding.finding_key)
+    assert attempt is not None
+    assert attempt.validation_results[0].status == "failed"
+    assert attempt.validation_results[0].output == "failed"
+
+
 async def test_merge_failure_also_at_lane_head_does_not_stop_landing(tmp_path: Path) -> None:
     orca = FakeOrca()
     git = FakeGit()
