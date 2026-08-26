@@ -2178,7 +2178,7 @@ class StateStore:
         recorded_head_sha: str,
         checkout_head_sha: str,
     ) -> None:
-        """Record that publication found a checkout different from its ledger identity."""
+        """Record that publication found a checkout state different from its ledger identity."""
 
         self._append_event(
             run_id,

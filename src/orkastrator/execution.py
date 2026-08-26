@@ -2181,7 +2181,8 @@ class ExecutionController:
             try:
                 if lane.worktree_id is not None:
                     checkout_head_sha = await self._git.head(lane.worktree_id)
-                    if checkout_head_sha != lane.integration_head_sha:
+                    checkout_clean = await self._git.is_clean(lane.worktree_id)
+                    if checkout_head_sha != lane.integration_head_sha or not checkout_clean:
                         recorded_head_sha = lane.integration_head_sha
                         self._store.record_lane_head_divergence(
                             run_id,
@@ -2189,11 +2190,17 @@ class ExecutionController:
                             recorded_head_sha=recorded_head_sha,
                             checkout_head_sha=checkout_head_sha,
                         )
+                        reason = (
+                            f"lane checkout HEAD {checkout_head_sha} does not match recorded "
+                            f"integration head {recorded_head_sha}; refusing publication"
+                            if checkout_head_sha != recorded_head_sha
+                            else f"lane checkout at recorded integration head {recorded_head_sha} "
+                            "carries uncommitted work; refusing publication"
+                        )
                         self._store.block_lane(
                             run_id,
                             lane.lane_id,
-                            f"lane checkout HEAD {checkout_head_sha} does not match recorded "
-                            f"integration head {recorded_head_sha}; refusing publication",
+                            reason,
                         )
                         continue
                 if previous is None or previous.head_sha != lane.integration_head_sha:

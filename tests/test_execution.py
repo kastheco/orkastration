@@ -3114,6 +3114,52 @@ async def test_publication_with_an_agreeing_checkout_uses_the_recorded_head(
     ]
 
 
+async def test_publication_refuses_a_dirty_lane_checkout(tmp_path: Path) -> None:
+    class DirtyAtPublicationGit(FakeGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self._review_clean_checks = 0
+
+        async def is_clean(self, worktree_id: str) -> bool:
+            if (
+                worktree_id == "repo::/tmp/issue"
+                and self.lane_clean_override is False
+                and self._review_clean_checks < 3
+            ):
+                self._review_clean_checks += 1
+                return True
+            return await super().is_clean(worktree_id)
+
+    orca = FakeOrca()
+    git = DirtyAtPublicationGit()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, git=git, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    git.lane_clean_override = False
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    recorded_head_sha = "b" * 40
+    assert result.status == "blocked"
+    assert result.lanes[0].phase is LanePhase.BLOCKED
+    assert publisher.publish_calls == []
+    divergence = next(
+        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
+    )
+    assert divergence["payload"] == {
+        "recorded_head_sha": recorded_head_sha,
+        "checkout_head_sha": recorded_head_sha,
+    }
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    assert blocked[-1]["payload"]["reason"] == (
+        f"lane checkout at recorded integration head {recorded_head_sha} carries "
+        "uncommitted work; refusing publication"
+    )
+
+
 async def test_failed_round_one_reviewer_does_not_stop_resolved_round_two_publication(
     tmp_path: Path,
 ) -> None:
