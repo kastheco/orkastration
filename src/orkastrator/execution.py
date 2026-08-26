@@ -2361,7 +2361,7 @@ class ExecutionController:
             except IntegrationConflict as exc:
                 await self._record_publication_conflict(run_id, lane, str(exc))
                 self._store.note_publication_progress(run_id, lane.lane_id)
-            except (GitError, PublicationError) as exc:
+            except (GitError, PublicationError, ValueError) as exc:
                 # One failed observation is not knowledge. `assistant-kas-576`
                 # blocked one second after pushing its branch, on a required-check
                 # query GitHub had not caught up with yet, and every check was

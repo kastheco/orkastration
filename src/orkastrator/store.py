@@ -461,8 +461,8 @@ class StateStore:
                     and previous.merged_head_sha != receipt.merged_head_sha
                 ):
                     raise ValueError("a publication merged head cannot change")
-                if previous.ci is not None and previous.ci != receipt.ci:
-                    raise ValueError("a publication CI rollup cannot change")
+                if previous.ci is not None and receipt.ci is None:
+                    raise ValueError("a publication CI rollup cannot be erased")
                 row.payload_json = payload
                 row.updated_at = now
                 if receipt.landed and not previous.landed:

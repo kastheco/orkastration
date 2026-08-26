@@ -3677,6 +3677,62 @@ async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sh
     ]
 
 
+async def test_publication_reobserves_a_published_head_with_a_new_passing_rollup(
+    tmp_path: Path,
+) -> None:
+    class ReobservingPublisher(FakePublisher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.check_calls = 0
+
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            self.check_calls += 1
+            checks = [CiCheckResult(name="pytest", status="passed", output=str(self.check_calls))]
+            if self.check_calls == 2:
+                checks.append(CiCheckResult(name="ruff", status="passed", output="passed"))
+            return CiReceipt(
+                provider="github",
+                head_sha=receipt.head_sha,
+                status="passed",
+                checks=checks,
+            )
+
+        async def land(self, receipt: PublicationReceipt) -> PublicationReceipt:
+            if not self.land_calls:
+                self.land_calls.append(receipt.head_sha)
+                raise PublicationError("transient landing failure")
+            return await super().land(receipt)
+
+    orca = FakeOrca()
+    publisher = ReobservingPublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+    assert first.status == "active"
+
+    second = await value.monitor(run_id)
+
+    assert second.status == "complete"
+    lane = store.lanes(run_id)[0]
+    publications = store.publications(run_id, lane.lane_id)
+    assert len(publications) == 1
+    assert publications[0].landed is True
+    assert publications[0].ci is not None
+    assert [(check.name, check.output) for check in publications[0].ci.checks] == [
+        ("pytest", "2"),
+        ("ruff", "passed"),
+    ]
+
+
 async def test_pending_ci_times_out_with_the_pull_request_left_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
