@@ -23,6 +23,7 @@ from orkastrator.models import (
     FindingPhase,
     FindingReason,
     PolicyReauthorization,
+    ReviewFinding,
     StagePhase,
     SupervisorPlan,
     workflow_contract_schemas,
@@ -169,7 +170,14 @@ def monitor(
                 return result.model_copy(update={"exit_reason": "terminal_graph"})
             await asyncio.sleep(interval)
 
-    _drive(run_id, advance(), json_output=json_output)
+    _drive(
+        run_id,
+        advance(),
+        json_output=json_output,
+        failure_statuses=(
+            frozenset({"blocked", "failed", "report_failed"}) if watch else frozenset()
+        ),
+    )
 
 
 @app.command()
@@ -212,6 +220,38 @@ def reopen(
     except (ConfigError, KeyError, ValueError) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(record.model_dump(mode="json"), json_output=json_output)
+
+
+@app.command()
+def recover(
+    run_id: Annotated[str, typer.Argument(help="Accepted graph run ID.")],
+    finding: Annotated[
+        str, typer.Option("--finding", help="Historical finding this recovery supersedes.")
+    ],
+    file: Annotated[
+        Path,
+        typer.Option(
+            "--file",
+            "-f",
+            help="YAML or JSON ReviewFinding contract for the newly proven defect.",
+        ),
+    ],
+    note: Annotated[
+        str, typer.Option("--note", help="Why this current-head recovery is authorized.")
+    ],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
+) -> None:
+    """Create a fresh finding bound to the lane's exact recorded current head."""
+
+    try:
+        contract = ReviewFinding.model_validate(yaml.safe_load(file.read_text()))
+    except (OSError, yaml.YAMLError, ValidationError, TypeError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+    _drive(
+        run_id,
+        _controller().recover_finding(run_id, finding, contract, note),
+        json_output=json_output,
+    )
 
 
 @app.command()
@@ -639,7 +679,13 @@ def _controller() -> ExecutionController:
     )
 
 
-def _drive[T](run_id: str, awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
+def _drive[T](
+    run_id: str,
+    awaitable: Coroutine[Any, Any, T],
+    *,
+    json_output: bool,
+    failure_statuses: frozenset[str] = frozenset(),
+) -> None:
     """Run one command that dispatches to Orca, as the run's only driver.
 
     Orca refuses a `worker-start` from a terminal other than the one bound to
@@ -651,13 +697,22 @@ def _drive[T](run_id: str, awaitable: Coroutine[Any, Any, T], *, json_output: bo
     try:
         settings, _, _ = _components()
         with run_lock(settings.database_path, run_id):
-            _run(awaitable, json_output=json_output)
+            _run(
+                awaitable,
+                json_output=json_output,
+                failure_statuses=failure_statuses,
+            )
     except (ConfigError, RunLockedError) as exc:
         awaitable.close()
         _fail(str(exc), json_output=json_output)
 
 
-def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
+def _run[T](
+    awaitable: Coroutine[Any, Any, T],
+    *,
+    json_output: bool,
+    failure_statuses: frozenset[str] = frozenset(),
+) -> None:
     try:
         result = asyncio.run(awaitable)
     except (
@@ -672,6 +727,10 @@ def _run[T](awaitable: Coroutine[Any, Any, T], *, json_output: bool) -> None:
     ) as exc:
         _fail(str(exc), json_output=json_output)
     _emit(result, json_output=json_output)
+    if isinstance(result, BaseModel) and result.__class__.model_fields.get("status") is not None:
+        status = getattr(result, "status", None)
+        if status in failure_statuses:
+            raise typer.Exit(code=1)
 
 
 def _policy_change_lines(run_id: str, result: PolicyReauthorization) -> list[str]:

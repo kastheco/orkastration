@@ -80,6 +80,7 @@ FindingOrigin = Literal[
     "ci_failure",
     "worker_blocked",
     "publication_conflict",
+    "recovery",
 ]
 ContractRow = TypeVar("ContractRow", FixAttemptRow, ReReviewRow, EscalationRow)
 
@@ -1179,6 +1180,106 @@ class StateStore:
             ).one()
             return _finding(row)
 
+    def record_recovery_finding(
+        self,
+        run_id: str,
+        source_finding_id: str,
+        finding: ReviewFinding,
+        *,
+        note: str,
+    ) -> FindingRecord:
+        """Freeze a new finding beside its historical source without rewriting either."""
+
+        with self._session() as session:
+            source = session.exec(
+                select(FindingRow)
+                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+                .where(LaneRow.run_id == run_id, FindingRow.finding_id == source_finding_id)
+            ).first()
+            if source is None:
+                raise KeyError(f"run {run_id} has no finding {source_finding_id}")
+            source_phase = FindingPhase(source.phase)
+            if source_phase not in {
+                FindingPhase.BLOCKED,
+                FindingPhase.RESOLVED,
+                FindingPhase.DEFERRED,
+            }:
+                raise ValueError(
+                    f"finding {source_finding_id} is {source_phase.value}, not settled or blocked"
+                )
+            if finding.id == source_finding_id:
+                raise ValueError("a recovery finding needs a new finding id")
+            created = self._insert_finding(
+                session,
+                source.lane_id,
+                finding,
+                origin="recovery",
+                now=_now(),
+            )
+            row = session.exec(
+                select(FindingRow).where(
+                    FindingRow.lane_id == source.lane_id,
+                    FindingRow.finding_id == finding.id,
+                )
+            ).one()
+            if not created:
+                return _finding(row)
+            retired = 0
+            source_stages = session.exec(
+                select(WorkflowStageRow).where(
+                    WorkflowStageRow.finding_key == source.finding_key
+                )
+            ).all()
+            for stage in source_stages:
+                if stage.phase in _SETTLED_STAGE_PHASES or stage.processed:
+                    continue
+                stage.processed = True
+                stage.phase = StagePhase.BLOCKED.value
+                stage.stage_key = f"{stage.stage_key}:recovered{_now():%Y%m%d%H%M%S%f}"
+                stage.updated_at = _now()
+                retired += 1
+            if source_phase is FindingPhase.BLOCKED:
+                source.phase = FindingPhase.DEFERRED.value
+                source.escalation_reason = None
+                source.updated_at = _now()
+            lane = session.get(LaneRow, source.lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {source.lane_id}")
+            lane.phase = LanePhase.ACTIVE.value
+            lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status != "active":
+                run.status = "active"
+                run.updated_at = _now()
+            revision = finding.review_revision
+            assert revision is not None
+            self._event(
+                session,
+                run_id,
+                source.lane_id,
+                "finding_recovery_created",
+                {
+                    "source_finding_id": source_finding_id,
+                    "source_finding_key": source.finding_key,
+                    "recovery_finding_id": finding.id,
+                    "base_sha": revision.head_sha,
+                    "source_from_phase": source_phase.value,
+                    "source_phase": source.phase,
+                    "retired_stages": retired,
+                    "note": note[:4_000],
+                },
+            )
+            self._hand_action(
+                session,
+                run_id,
+                source.lane_id,
+                command="recover",
+                target=f"{source_finding_id}->{finding.id}",
+                phase=FindingPhase.PENDING_FIX.value,
+                note=note,
+            )
+            return _finding(row)
+
     def reopen_finding(
         self,
         run_id: str,
@@ -2184,7 +2285,9 @@ class StateStore:
             row.updated_at = _now()
             self._event(session, run_id, lane_id, "lane_transitioned", {"phase": phase.value})
 
-    def block_lane(self, run_id: str, lane_id: str, reason: str) -> None:
+    def block_lane(
+        self, run_id: str, lane_id: str, reason: str, *, source: Literal["finding"] | None = None
+    ) -> None:
         """Record that this lane is blocked, once per thing that blocks it.
 
         A block is not an event that keeps happening. Every monitor tick
@@ -2216,7 +2319,64 @@ class StateStore:
                 )
             elif self._latest_block_reason(session, run_id, lane_id) == reason:
                 return
-            self._event(session, run_id, lane_id, "lane_blocked", {"reason": reason})
+            payload = {"reason": reason}
+            if source is not None:
+                payload["source"] = source
+            self._event(session, run_id, lane_id, "lane_blocked", payload)
+
+    def release_finding_block(self, run_id: str, lane_id: str) -> bool:
+        """Release only the lane block owned by findings once none remain blocked."""
+
+        with self._session() as session:
+            lane = session.get(LaneRow, lane_id)
+            if lane is None:
+                raise KeyError(f"unknown lane {lane_id}")
+            if lane.phase != LanePhase.BLOCKED.value:
+                return False
+            blocking = session.exec(
+                select(FindingRow.finding_key).where(
+                    FindingRow.lane_id == lane_id,
+                    FindingRow.phase == FindingPhase.BLOCKED.value,
+                )
+            ).first()
+            if blocking is not None:
+                return False
+            event = session.exec(
+                select(EventRow)
+                .where(
+                    EventRow.run_id == run_id,
+                    EventRow.lane_id == lane_id,
+                    EventRow.kind == "lane_blocked",
+                )
+                .order_by(col(EventRow.created_at).desc(), col(EventRow.event_id).desc())
+            ).first()
+            if event is None:
+                return False
+            payload = json.loads(event.payload_json)
+            if not isinstance(payload, dict):
+                return False
+            reason = payload.get("reason")
+            legacy_finding_block = (
+                isinstance(reason, str)
+                and reason.startswith("finding ")
+                and reason.endswith(": the lane cannot converge while it stands")
+            )
+            if payload.get("source") != "finding" and not legacy_finding_block:
+                return False
+            lane.phase = LanePhase.ACTIVE.value
+            lane.updated_at = _now()
+            run = session.get(SupervisorRunRow, run_id)
+            if run is not None and run.status == "blocked":
+                run.status = "active"
+                run.updated_at = _now()
+            self._event(
+                session,
+                run_id,
+                lane_id,
+                "lane_finding_block_released",
+                {"previous_reason": reason},
+            )
+            return True
 
     @staticmethod
     def _latest_block_reason(session: Session, run_id: str, lane_id: str) -> str | None:

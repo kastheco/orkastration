@@ -773,6 +773,7 @@ class FindingRecord(BaseModel):
         "ci_failure",
         "worker_blocked",
         "publication_conflict",
+        "recovery",
     ]
     contract: ReviewFinding
     effective_contract: ReviewFinding
@@ -784,6 +785,18 @@ class FindingRecord(BaseModel):
     dispatch_base_sha: GitObjectId | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RecoveryReceipt(BaseModel):
+    """Immutable operator authorization for a fresh finding at a lane head."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    lane: str
+    source_finding_id: FindingId
+    base_sha: GitObjectId
+    finding: FindingRecord
 
 
 class IntegrationConflictContext(BaseModel):

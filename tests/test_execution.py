@@ -32,6 +32,7 @@ from orkastrator.models import (
     LaneRecord,
     PublicationReceipt,
     ReReviewResult,
+    ReviewFinding,
     ReviewRevision,
     StageKind,
     StagePhase,
@@ -5325,6 +5326,147 @@ async def test_a_retired_reopened_failure_no_longer_latches_its_lane(tmp_path: P
     assert recovered.lanes[0].phase is LanePhase.ACTIVE
 
 
+async def test_recovery_freezes_a_new_contract_at_the_current_lane_head(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    source = store.findings(run_id)[0]
+    store.advance_fix_base(run_id, source.finding_key, "a" * 40)
+    store.set_finding_state(run_id, source.finding_key, phase=FindingPhase.BLOCKED)
+    lane = store.lanes(run_id)[0]
+    store.block_lane(
+        run_id,
+        lane.lane_id,
+        "finding finding-1 is blocked at round 1: the lane cannot converge while it stands",
+        source="finding",
+    )
+    store.set_terminal_status(run_id, "blocked")
+    recovery_data = review_finding_data(2)
+    recovery_data.pop("review_revision")
+
+    receipt = await value.recover_finding(
+        run_id,
+        source.finding_id,
+        ReviewFinding.model_validate(recovery_data),
+        "setup-node failed after the original finding settled",
+    )
+
+    current_head = store.lanes(run_id)[0].integration_head_sha
+    assert current_head == "b" * 40
+    assert receipt.source_finding_id == source.finding_id
+    assert receipt.base_sha == current_head
+    assert receipt.finding.origin == "recovery"
+    assert receipt.finding.effective_contract.review_revision == ReviewRevision(
+        base_sha=current_head,
+        head_sha=current_head,
+        diff_sha256="c" * 64,
+    )
+    assert receipt.finding.dispatch_base_sha is None
+    unchanged_source = next(
+        item for item in store.findings(run_id) if item.finding_id == source.finding_id
+    )
+    assert unchanged_source.phase is FindingPhase.DEFERRED
+    assert unchanged_source.dispatch_base_sha == "a" * 40
+    retired_source_stages = [
+        item for item in store.stages(run_id) if item.finding_id == source.finding_id
+    ]
+    assert retired_source_stages
+    assert all(item.released for item in retired_source_stages)
+    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
+    assert store.run(run_id).status == "active"
+    recovery_events = [
+        item for item in store.events(run_id) if item["kind"] == "finding_recovery_created"
+    ]
+    recovery_payload = recovery_events[-1]["payload"]
+    assert isinstance(recovery_payload, dict)
+    assert recovery_payload["source_finding_id"] == source.finding_id
+
+
+async def test_current_head_recovery_produces_a_same_lane_integration_receipt(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    source = store.findings(run_id)[0]
+    store.set_finding_state(run_id, source.finding_key, phase=FindingPhase.BLOCKED)
+    lane = store.lanes(run_id)[0]
+    store.block_lane(
+        run_id,
+        lane.lane_id,
+        "finding finding-1 is blocked at round 1: the lane cannot converge while it stands",
+        source="finding",
+    )
+    recovery_data = review_finding_data(2)
+    recovery_data.pop("review_revision")
+    receipt = await value.recover_finding(
+        run_id,
+        source.finding_id,
+        ReviewFinding.model_validate(recovery_data),
+        "replace the stale finding with the observed CI failure",
+    )
+
+    await value.monitor(run_id)
+    orca.complete_dispatched(fix_attempt("finding-2", base_sha=receipt.base_sha))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved", finding_id="finding-2"))
+    result = await value.monitor(run_id)
+
+    recovery = next(item for item in result.findings if item.finding_id == "finding-2")
+    assert not any(
+        item.finding_id == source.finding_id
+        and item.phase in {StagePhase.STARTING, StagePhase.DISPATCHED}
+        for item in result.stages
+    )
+    integration = store.integration(recovery.finding_key, recovery.round)
+    assert integration is not None
+    assert integration.status == "integrated"
+    assert integration.lane_id == lane.lane_id
+    assert integration.base_sha == receipt.base_sha
+    assert integration.source_finding_ids == ["finding-2"]
+
+
+@pytest.mark.parametrize(
+    ("dirty", "checkout_head", "message"),
+    [
+        (True, None, "checkout is dirty"),
+        (False, "d" * 40, "does not match recorded integration head"),
+    ],
+)
+async def test_recovery_refuses_unproven_lane_state(
+    tmp_path: Path,
+    dirty: bool,
+    checkout_head: str | None,
+    message: str,
+) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    source = store.findings(run_id)[0]
+    store.set_finding_state(run_id, source.finding_key, phase=FindingPhase.BLOCKED)
+    git.lane_clean_override = not dirty
+    git.lane_head_override = checkout_head
+    recovery_data = review_finding_data(2)
+    recovery_data.pop("review_revision")
+
+    with pytest.raises(ValueError, match=message):
+        await value.recover_finding(
+            run_id,
+            source.finding_id,
+            ReviewFinding.model_validate(recovery_data),
+            "the old finding no longer describes the defect",
+        )
+
+    assert [item.finding_id for item in store.findings(run_id)] == [source.finding_id]
+
+
 async def test_a_conflict_retry_is_rebuilt_on_the_lane_head_it_has_to_land_on(
     tmp_path: Path,
 ) -> None:
@@ -5430,6 +5572,33 @@ async def test_a_rebased_retry_lands_and_the_round_slot_follows_it(tmp_path: Pat
     assert landed.fixer_commit_sha == fixer_sha("finding-2", 3)
     reopened = [item for item in store.events(run_id) if item["kind"] == "integration_reopened"]
     assert reopened and reopened[-1]["payload"]["previous_commit_sha"] == fixer_sha("finding-2", 1)
+
+
+async def test_resolving_the_last_blocked_finding_releases_publication_in_the_same_tick(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+
+    lane = store.lanes(run_id)[0]
+    store.block_lane(
+        run_id,
+        lane.lane_id,
+        "finding finding-1 is blocked at round 1: the lane cannot converge while it stands",
+    )
+    store.set_terminal_status(run_id, "blocked")
+    orca.complete_dispatched(re_review("resolved"))
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert result.lanes[0].phase is LanePhase.COMPLETE
+    assert result.publications
 
 
 async def test_a_fix_stacked_on_another_fix_is_never_rebased_off_it(tmp_path: Path) -> None:

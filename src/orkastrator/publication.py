@@ -555,7 +555,8 @@ def _parse_checks(check_data: object, status_data: object, head_sha: str) -> lis
                 continue
             conclusion = raw.get("conclusion")
             status = raw.get("status")
-            mapped = "pending" if status != "completed" else _conclusion(str(conclusion))
+            terminal = status == "completed" or conclusion is not None or raw.get("completed_at")
+            mapped = _conclusion(str(conclusion)) if terminal else "pending"
             raw_output = raw.get("output")
             output: dict[object, object] = raw_output if isinstance(raw_output, dict) else {}
             detail = "\n".join(

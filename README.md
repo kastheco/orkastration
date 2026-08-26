@@ -164,6 +164,10 @@ uv run --project /home/kas/dev/orkastrator orkas monitor \
   <run-id> --watch --interval 5 --json
 ```
 
+Watch mode exits zero for a complete graph or an unanswered operator question. A terminal `blocked`,
+`failed`, or `report_failed` graph is still emitted as JSON but exits nonzero, so shell supervision does
+not mistake a stopped run for successful completion.
+
 Inspect persisted state without touching Orca:
 
 ```bash
@@ -187,6 +191,28 @@ A finding that already settled on the merits - `resolved` or `deferred` - is ref
 undoes work an agent got right and sends another one to redo it. A `blocked` finding needs no force,
 because that is the case reopen exists for. The event records the phase it came from and whether the
 reopen was forced.
+
+When later evidence proves a different defect at the current lane head, do not force-reopen the old
+contract. Create a fresh recovery finding instead:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas recover <run-id> \
+  --finding <historical-finding-id> --file <recovery-finding.yaml> \
+  --note "why the new current-head defect is authorized" --json
+uv run --project /home/kas/dev/orkastrator orkas monitor <run-id> --watch --json
+```
+
+The file is a `ReviewFinding` YAML or JSON object and must omit `review_revision`; orkastrator binds
+that revision to the lane's clean recorded integration head and records the validation baselines there.
+The new finding needs its own id and an exact allowed write scope, required outcome, evidence, and
+deterministic validation. A blocked historical finding becomes deferred, while all of its contracts,
+attempts, stages, verdicts, and integration receipts remain in the ledger. Any live historical stage is
+retired. The new finding then follows the ordinary fixer, re-review, serial integration, final-gate, and
+publication path, so a successful recovery creates a same-lane integration receipt rather than weakening
+`reconcile-head` or manufacturing authorization.
+
+Recovery refuses a dirty checkout, a checkout whose HEAD differs from the recorded integration head,
+an unknown dependency, or a contract that supplies its own revision.
 
 Acceptance freezes the proposal and the graph configuration together, so editing
 `orkastrator.yaml` while a run is in flight fails every tick after it with `proposal or graph policy

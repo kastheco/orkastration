@@ -41,6 +41,7 @@ from orkastrator.models import (
     PolicyReauthorization,
     ProposalReceipt,
     PublicationReceipt,
+    RecoveryReceipt,
     ReReviewResult,
     ReviewFinding,
     ReviewRevision,
@@ -1481,6 +1482,8 @@ class ExecutionController:
         for item in self._store.findings(run_id, lane_id):
             if item.finding_id in selected:
                 self._store.set_finding_state(run_id, item.finding_key, phase=phase)
+        if phase is FindingPhase.RESOLVED:
+            self._store.release_finding_block(run_id, lane_id)
 
     def _fix_base_sha(self, finding: FindingRecord) -> str:
         """The commit this finding's fix is built on, which is not always the review.
@@ -1839,7 +1842,7 @@ class ExecutionController:
     async def _release_settled(self, run_id: str) -> None:
         for stage in self._store.stages(run_id):
             if (
-                stage.phase in {StagePhase.COMPLETED, StagePhase.FAILED}
+                stage.phase in {StagePhase.COMPLETED, StagePhase.FAILED, StagePhase.BLOCKED}
                 and stage.orca_dispatch_id is not None
                 and not stage.released
             ):
@@ -2193,6 +2196,7 @@ class ExecutionController:
                     lane.lane_id,
                     f"finding {blocking.finding_id} is blocked at round {blocking.round}: "
                     "the lane cannot converge while it stands",
+                    source="finding",
                 )
             else:
                 self._store.set_lane_phase(run_id, lane.lane_id, phase)
@@ -2594,6 +2598,94 @@ class ExecutionController:
         return [
             lane for lane in self._store.lanes(run_id) if lane.lane_id in {x.lane_id for x in lanes}
         ]
+
+    async def recover_finding(
+        self,
+        run_id: str,
+        source_finding_id: str,
+        finding: ReviewFinding,
+        note: str,
+    ) -> RecoveryReceipt:
+        """Freeze a newly proven defect against the exact current lane head."""
+
+        self._require_authorization(run_id)
+        matches = [
+            item for item in self._store.findings(run_id) if item.finding_id == source_finding_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"run {run_id} has no unique finding {source_finding_id}")
+        source = matches[0]
+        lane = next(
+            item for item in self._store.lanes(run_id) if item.lane_id == source.lane_id
+        )
+        if lane.worktree_id is None or lane.integration_head_sha is None:
+            raise ValueError(f"lane {lane.name} has no integration checkout and recorded head")
+        if finding.review_revision is not None:
+            raise ValueError(
+                "recovery contract review_revision must be omitted; "
+                "orkastrator binds it to the current lane head"
+            )
+        known_finding_ids = {
+            item.finding_id for item in self._store.findings(run_id, lane.lane_id)
+        }
+        unknown_dependencies = set(finding.dependencies).difference(known_finding_ids)
+        if unknown_dependencies:
+            raise ValueError(
+                f"recovery finding {finding.id} depends on unknown findings "
+                f"{sorted(unknown_dependencies)}"
+            )
+        if finding.id in finding.dependencies:
+            raise ValueError(f"finding {finding.id} cannot depend on itself")
+        if not await self._git.is_clean(lane.worktree_id):
+            raise ValueError(f"lane {lane.name} checkout is dirty; refusing finding recovery")
+        checkout_head = await self._git.head(lane.worktree_id)
+        if checkout_head != lane.integration_head_sha:
+            raise ValueError(
+                f"lane {lane.name} checkout head {checkout_head} does not match recorded "
+                f"integration head {lane.integration_head_sha}"
+            )
+        revision = ReviewRevision(
+            base_sha=checkout_head,
+            head_sha=checkout_head,
+            diff_sha256=await self._git.diff_sha256(
+                lane.worktree_id, checkout_head, checkout_head
+            ),
+        )
+        coverage_configured = await self._git.pytest_coverage_configured(lane.worktree_id)
+        governed = finding.model_copy(
+            update={
+                "review_revision": revision,
+                "validation": [
+                    _govern_validation_requirement(
+                        requirement,
+                        coverage_configured=coverage_configured,
+                    )
+                    for requirement in finding.validation
+                ],
+            }
+        )
+        _require_a_provable_finding([governed], [])
+        governed = (await self._freeze_validation_baselines(lane.worktree_id, [governed]))[0]
+        if not await self._git.is_clean(lane.worktree_id):
+            raise ValueError("recovery validation dirtied the lane checkout")
+        recovered = self._store.record_recovery_finding(
+            run_id,
+            source_finding_id,
+            governed,
+            note=note,
+        )
+        run = self._store.run(run_id)
+        if run.orca_run_id is None:
+            raise ValueError(f"run {run_id} has not been accepted")
+        await self._orca.use_run(run.orca_run_id)
+        await self._release_settled(run_id)
+        return RecoveryReceipt(
+            run_id=run_id,
+            lane=lane.name,
+            source_finding_id=source_finding_id,
+            base_sha=checkout_head,
+            finding=recovered,
+        )
 
     async def reconcile_head(self, run_id: str, lane_name: str, note: str) -> LaneRecord:
         """Recover a legacy lane whose checkout advanced ahead of its ledger."""

@@ -23,6 +23,7 @@ from orkastrator.models import (
     PolicyReauthorization,
     ProposalReceipt,
     PublicationReceipt,
+    ReviewFinding,
     StagePhase,
     SupervisorPlan,
 )
@@ -95,6 +96,7 @@ class FakeController:
     monitor_status: ClassVar[str] = "complete"
     monitor_results: ClassVar[list[StatusResult]] = []
     reconciliations: ClassVar[list[tuple[str, str, str]]] = []
+    recoveries: ClassVar[list[tuple[str, str, ReviewFinding, str]]] = []
 
     def propose(self, value: SupervisorPlan) -> ProposalReceipt:
         return ProposalReceipt(run_id="run-1", proposal=value)
@@ -124,6 +126,12 @@ class FakeController:
 
     async def reconcile_head(self, run_id: str, lane: str, note: str) -> StatusResult:
         type(self).reconciliations.append((run_id, lane, note))
+        return StatusResult(run_id=run_id, status="active")
+
+    async def recover_finding(
+        self, run_id: str, source: str, finding: ReviewFinding, note: str
+    ) -> StatusResult:
+        type(self).recoveries.append((run_id, source, finding, note))
         return StatusResult(run_id=run_id, status="active")
 
 
@@ -226,6 +234,66 @@ def test_reconcile_head_runs_under_the_run_lock(fake_wiring: None) -> None:
     assert result.exit_code == 0
     assert json.loads(result.stdout)["status"] == "active"
     assert FakeController.reconciliations == [("run-1", "issue-123", "recover KAS-501")]
+
+
+def test_recover_loads_a_fresh_contract_and_runs_under_the_run_lock(
+    fake_wiring: None, tmp_path: Path
+) -> None:
+    FakeController.recoveries = []
+    contract = tmp_path / "recovery.yaml"
+    contract.write_text(
+        yaml.safe_dump(
+            {
+                "id": "finding-current-ci-failure",
+                "evidence": [
+                    {
+                        "location": {
+                            "path": ".github/workflows/ci.yml",
+                            "start_line": 1,
+                            "end_line": 1,
+                        },
+                        "claim": "setup-node failed because npm cache requires a lockfile",
+                    }
+                ],
+                "failure_mode": "The required extension job cannot start.",
+                "required_outcome": "Remove only the lockfile-dependent npm cache setting.",
+                "allowed_write_scope": {
+                    "paths": [".github/workflows/ci.yml"],
+                    "symbols": [],
+                },
+                "forbidden_scope": [],
+                "validation": [
+                    {"command": "npm run typecheck", "expected": "passes", "workdir": "pi"}
+                ],
+                "dependencies": [],
+            },
+            sort_keys=False,
+        )
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "recover",
+            "run-1",
+            "--finding",
+            "finding-typescript-never-typechecked",
+            "--file",
+            str(contract),
+            "--note",
+            "recover the observed required-check failure",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["status"] == "active"
+    [(run_id, source, loaded, note)] = FakeController.recoveries
+    assert run_id == "run-1"
+    assert source == "finding-typescript-never-typechecked"
+    assert loaded.id == "finding-current-ci-failure"
+    assert loaded.review_revision is None
+    assert note == "recover the observed required-check failure"
 
 
 def test_a_second_driver_on_one_run_is_refused_by_name(fake_wiring: None, tmp_path: Path) -> None:
@@ -429,7 +497,7 @@ def test_watch_survives_a_terminal_lane_while_another_stage_is_dispatched(
         cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"]
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert FakeController.monitor_results == []
     payload = json.loads(result.stdout)
     assert payload["status"] == terminal_phase.value
@@ -477,7 +545,7 @@ def test_watch_survives_every_lane_terminal_while_a_stage_is_still_dispatched(
         cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"]
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     # Every queued tick was consumed, so the watch did not stop on either of the
     # two where a stage was still in flight.
     assert FakeController.monitor_results == []
