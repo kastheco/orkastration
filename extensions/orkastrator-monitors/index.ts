@@ -2,6 +2,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   RegisteredCommand,
+  SessionShutdownEvent,
+  SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -27,7 +29,11 @@ export type MonitorCommandOptions = Omit<RegisteredCommand, "name" | "sourceInfo
   handler: (args: string, ctx: MonitorExtensionContext) => Promise<void>;
 };
 
-export type MonitorExtensionAPI = Pick<ExtensionAPI, "on" | "registerCommand">;
+export interface MonitorExtensionAPI {
+  on(event: "session_start", handler: MonitorExtensionHandler<SessionStartEvent>): void;
+  on(event: "session_shutdown", handler: MonitorExtensionHandler<SessionShutdownEvent>): void;
+  registerCommand(name: string, options: MonitorCommandOptions): void;
+}
 
 interface TimerApi {
   setInterval(callback: () => void, milliseconds: number): ReturnType<typeof setInterval>;
