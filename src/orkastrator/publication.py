@@ -102,12 +102,10 @@ class GitHubPublisher:
         gh_command: tuple[str, ...] = ("gh",),
         runner: CommandRunner | None = None,
         advisory_checks: Iterable[str] = (),
-        treat_no_checks_as_passed: bool = False,
     ):
         self._gh = gh_command
         self._runner = runner or SubprocessCommandRunner()
         self._advisory = frozenset(advisory_checks)
-        self._no_checks_passes = treat_no_checks_as_passed
 
     async def publish(
         self,
@@ -261,12 +259,11 @@ class GitHubPublisher:
         gating = [item for item in checks if item.name not in self._advisory]
         if any(item.status in {"failed", "cancelled"} for item in gating):
             status = "failed"
-        elif self._no_checks_passes and [item.name for item in gating] == [_CHECK_DISCOVERY]:
-            # The repository publishes nothing to wait for and the owner has said
-            # so. Only the synthetic discovery result qualifies: a real check that
-            # reported pending is still a race worth another tick.
-            status = "passed"
-        elif not gating or any(item.status == "pending" for item in gating):
+        elif (
+            not gating
+            or any(item.status == "pending" for item in gating)
+            or not any(item.status == "passed" for item in gating)
+        ):
             # No checks at all is not a pass. GitHub needs a moment to register a
             # push's workflow runs, so a lane that asks right after publishing sees
             # an empty list, and reading that as "passed" would merge a lane whose

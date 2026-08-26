@@ -54,6 +54,7 @@ def config(
     max_workers: int = 4,
     max_fixers: int = 2,
     merge: bool = False,
+    ci_timeout_seconds: float = 900.0,
 ) -> GraphConfig:
     raw = graph_config_data(max_parallel_lanes=max_parallel_lanes)
     raw["max_parallel_workers"] = max_workers
@@ -77,6 +78,9 @@ def config(
     publication = raw["publication"]
     assert isinstance(publication, dict)
     publication["merge"] = merge
+    final_gate = raw["final_gate"]
+    assert isinstance(final_gate, dict)
+    final_gate["timeout_seconds"] = ci_timeout_seconds
     return GraphConfig.model_validate(raw)
 
 
@@ -651,11 +655,13 @@ class FakePublisher:
 
     async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
-        checks = []
+        checks = [CiCheckResult(name="pytest", status="passed", output="passed")]
         if status == "failed":
             checks = [
                 CiCheckResult(name="tests", status="failed", output="tests/test_ci.py failed")
             ]
+        elif status == "pending":
+            checks = [CiCheckResult(name="pytest", status="pending", output="running")]
         return CiReceipt(provider="github", head_sha=receipt.head_sha, status=status, checks=checks)
 
     async def mark_ready(self, receipt: PublicationReceipt) -> PublicationReceipt:
@@ -3664,6 +3670,109 @@ async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sh
     receipt = store.publications(run_id)[-1]
     assert receipt.landed is True
     assert receipt.merge_sha == "e" * 40
+    assert receipt.ci is not None
+    assert receipt.ci.status == "passed"
+    assert [(check.name, check.status) for check in receipt.ci.checks] == [
+        ("pytest", "passed")
+    ]
+
+
+async def test_pending_ci_times_out_with_the_pull_request_left_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [datetime(2026, 8, 26, tzinfo=UTC)]
+    monkeypatch.setattr("orkastrator.store._now", lambda: now[0])
+    orca = FakeOrca()
+    publisher = FakePublisher(["pending"])
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True, ci_timeout_seconds=60),
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    waiting = await value.monitor(run_id)
+    assert waiting.status == "active"
+    assert publisher.land_calls == []
+
+    now[0] += timedelta(seconds=61)
+    timed_out = await value.monitor(run_id)
+
+    assert timed_out.status == "blocked"
+    assert publisher.land_calls == []
+    receipt = store.publications(run_id)[-1]
+    assert receipt.draft is True
+    assert receipt.landed is False
+    assert receipt.ci is None
+    blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
+    reason = blocked[-1]["payload"]["reason"]
+    assert reason == (
+        "final-gate timeout: required checks did not conclude within 60 seconds; "
+        "pull request left open at https://github.com/example/repo/pull/1"
+    )
+
+
+async def test_required_failure_does_not_merge_but_advisory_failure_does(
+    tmp_path: Path,
+) -> None:
+    required_failure = FakePublisher(["failed"])
+    orca = FakeOrca()
+    value, _ = controller(
+        tmp_path / "required",
+        orca,
+        graph_config=config(merge=True),
+        publisher=required_failure,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    failed = await value.monitor(run_id)
+
+    assert failed.status == "active"
+    assert required_failure.land_calls == []
+    assert [launch.role for launch in failed.started] == [StageKind.FIXER]
+
+    class AdvisoryFailure(FakePublisher):
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            return CiReceipt(
+                provider="github",
+                head_sha=receipt.head_sha,
+                status="passed",
+                checks=[
+                    CiCheckResult(name="mypy (advisory)", status="failed", output="77 errors"),
+                    CiCheckResult(name="pytest", status="passed", output="passed"),
+                ],
+            )
+
+    advisory_failure = AdvisoryFailure()
+    orca = FakeOrca()
+    value, store = controller(
+        tmp_path / "advisory",
+        orca,
+        graph_config=config(merge=True),
+        publisher=advisory_failure,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    passed = await value.monitor(run_id)
+
+    assert passed.status == "complete"
+    assert advisory_failure.land_calls == ["b" * 40]
+    concluded = store.publications(run_id)[-1].ci
+    assert concluded is not None
+    assert [(check.name, check.status) for check in concluded.checks] == [
+        ("mypy (advisory)", "failed"),
+        ("pytest", "passed"),
+    ]
 
 
 async def test_publication_conflict_routes_to_lane_escalation_without_failing_run(

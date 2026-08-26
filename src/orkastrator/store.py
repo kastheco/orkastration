@@ -446,6 +446,7 @@ class StateStore:
                             "landed": receipt.landed,
                             "merged_head_sha": receipt.merged_head_sha,
                             "merge_sha": receipt.merge_sha,
+                            "ci": receipt.ci,
                         }
                     )
                     != receipt
@@ -460,6 +461,8 @@ class StateStore:
                     and previous.merged_head_sha != receipt.merged_head_sha
                 ):
                     raise ValueError("a publication merged head cannot change")
+                if previous.ci is not None and previous.ci != receipt.ci:
+                    raise ValueError("a publication CI rollup cannot change")
                 row.payload_json = payload
                 row.updated_at = now
                 if receipt.landed and not previous.landed:
@@ -525,6 +528,26 @@ class StateStore:
                 statement.order_by(col(CiReceiptRow.created_at), col(CiReceiptRow.receipt_id))
             ).all()
             return [CiReceipt.model_validate_json(row.payload_json) for row in rows]
+
+    def ci_wait_seconds(self, lane_id: str, head_sha: str) -> float:
+        """Return wall-clock time since CI was first observed for this exact head."""
+
+        with self._session() as session:
+            row = session.exec(
+                select(CiReceiptRow).where(
+                    CiReceiptRow.lane_id == lane_id,
+                    CiReceiptRow.head_sha == head_sha,
+                )
+            ).first()
+            if row is None:
+                return 0.0
+            receipt = CiReceipt.model_validate_json(row.payload_json)
+            if receipt.status != "pending":
+                return 0.0
+            started_at = row.created_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            return max(0.0, (_now() - started_at).total_seconds())
 
     def record_ci_failure(self, run_id: str, lane_id: str, failure: CiFailureFinding) -> bool:
         payload = failure.model_dump_json()

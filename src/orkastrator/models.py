@@ -559,6 +559,15 @@ class PolicyReauthorization(WorkflowContract):
     applied: bool = False
 
 
+class CiReceipt(WorkflowContract):
+    """Final-gate result pinned to the published head revision."""
+
+    provider: Literal["github"]
+    head_sha: GitObjectId
+    status: Literal["pending", "passed", "failed"]
+    checks: list[CiCheckResult] = Field(default_factory=list, max_length=256)
+
+
 class PublicationReceipt(WorkflowContract):
     """Auditable external mutations authorized by one accepted run."""
 
@@ -584,6 +593,11 @@ class PublicationReceipt(WorkflowContract):
     # and externally merged pull requests can be landed without this value, but
     # an automated landing always records it.
     merge_sha: GitObjectId | None = None
+    # The concluded exact-head rollup that authorized orkastrator's ready/merge
+    # transition. Pending observations remain in the CI ledger; putting only a
+    # concluded result here makes a landed receipt self-contained evidence that
+    # a check actually reported before publication advanced.
+    ci: CiReceipt | None = None
 
     @model_validator(mode="after")
     def merge_commit_requires_landing(self) -> PublicationReceipt:
@@ -591,16 +605,14 @@ class PublicationReceipt(WorkflowContract):
             raise ValueError("a publication merge sha requires a landed receipt")
         if self.merged_head_sha is not None and not self.landed:
             raise ValueError("a publication merged head requires a landed receipt")
+        if self.ci is not None:
+            if self.ci.head_sha != self.head_sha:
+                raise ValueError("a publication CI rollup must match its published head")
+            if self.ci.status != "passed" or not any(
+                check.status == "passed" for check in self.ci.checks
+            ):
+                raise ValueError("a publication CI rollup requires a concluded passing check")
         return self
-
-
-class CiReceipt(WorkflowContract):
-    """Final-gate result pinned to the published head revision."""
-
-    provider: Literal["github"]
-    head_sha: GitObjectId
-    status: Literal["pending", "passed", "failed"]
-    checks: list[CiCheckResult] = Field(default_factory=list, max_length=256)
 
 
 class OrcaWorkerResult(BaseModel):
