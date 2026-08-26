@@ -58,6 +58,10 @@ class PublicationContent:
     ci: CiReceipt | None = None
 
 
+_PULL_REQUEST_BODY_LIMIT = 60_000
+_TRUNCATION_MARKER = " ... [truncated]"
+
+
 class LanePublisher(Protocol):
     """Provider boundary used after a lane converges locally."""
 
@@ -516,21 +520,30 @@ def _pull_request_title(content: PublicationContent) -> str:
 
 
 def _pull_request_body(run_id: str, content: PublicationContent) -> str:
-    sections = ["## What changed", content.implementation_summary.strip()]
-    scope = [content.accepted_scope.strip(), f"Stop condition: {content.stop_condition.strip()}"]
-    sections.extend(("## Scope", "\n\n".join(item for item in scope if item)))
+    sections: list[tuple[str, str, list[str]]] = [
+        ("## What changed", "\n\n", [content.implementation_summary.strip()]),
+        (
+            "## Scope",
+            "\n\n",
+            [
+                item
+                for item in (
+                    content.accepted_scope.strip(),
+                    f"Stop condition: {content.stop_condition.strip()}",
+                )
+                if item.strip()
+            ],
+        ),
+    ]
 
     checks = [
-        _check_line(result.command, result.status, result.output)
-        for result in content.validation_results
+        (result.command, result.status, result.output) for result in content.validation_results
     ]
     if content.ci is not None:
-        checks.append(f"CI for exact head `{content.ci.head_sha}`: {content.ci.status}")
-        checks.extend(
-            _check_line(check.name, check.status, check.output) for check in content.ci.checks
-        )
+        checks.insert(0, (f"CI for exact head {content.ci.head_sha}", content.ci.status, ""))
+        checks.extend((check.name, check.status, check.output) for check in content.ci.checks)
     if checks:
-        sections.extend(("## Checks", "\n".join(checks)))
+        sections.append(("## Checks", "\n", [""] * len(checks)))
 
     review: list[str] = []
     if content.review_summary:
@@ -541,25 +554,103 @@ def _pull_request_body(run_id: str, content: PublicationContent) -> str:
             + "\n".join(f"- {finding.strip()}" for finding in content.unresolved_findings)
         )
     if review:
-        sections.extend(("## Review", "\n\n".join(review)))
+        sections.append(("## Review", "\n\n", review))
 
-    sections.extend(
-        (
-            "## Traceability",
-            f"Issue: `{content.issue_id}`\n"
-            f"Published head: `{content.published_head}`\n"
+    traceability = (
+        "## Traceability",
+        "\n\n",
+        [
+            f"Issue: `{content.issue_id}`",
+            f"Published head: `{content.published_head}`",
             f"orkastrator run: `{run_id}`",
-        )
+        ],
     )
-    return "\n\n".join(part for part in sections if part)
+    sections.append(traceability)
+
+    payload_lengths: list[int] = []
+    for title, _, items in sections[:-1]:
+        if title == "## Checks":
+            payload_lengths.extend(
+                len(_check_line(name, status, output)) for name, status, output in checks
+            )
+        else:
+            payload_lengths.extend(len(payload) for payload in items)
+    fixed_length = sum(len(title) + (2 if items else 0) for title, _, items in sections)
+    fixed_length += sum(
+        len(joiner) * (len(items) - 1)
+        for _, joiner, items in sections
+        if len(items) > 1
+    )
+    fixed_length += 2 * (len(sections) - 1)
+    available = max(
+        0,
+        _PULL_REQUEST_BODY_LIMIT - fixed_length - sum(len(item) for item in traceability[2]),
+    )
+    budgets = _allocate_budgets(payload_lengths, available)
+    budget_index = 0
+    rendered_sections: list[str] = []
+    for title, joiner, items in sections:
+        rendered_items: list[str] = []
+        for item_index, item in enumerate(items):
+            if title == "## Checks":
+                name, status, output = checks[item_index]
+                rendered = _check_line(name, status, output, max_chars=budgets[budget_index])
+            elif title == "## Traceability":
+                rendered = item
+            else:
+                rendered = _truncate(item, budgets[budget_index])
+            rendered_items.append(rendered)
+            if title != "## Traceability":
+                budget_index += 1
+        rendered_sections.append(title + ("\n\n" + joiner.join(rendered_items) if rendered_items else ""))
+    return "\n\n".join(rendered_sections)
 
 
-def _check_line(name: str, status: str, output: str) -> str:
+def _allocate_budgets(lengths: list[int], total: int) -> list[int]:
+    """Share the body budget across all payloads without dropping a section."""
+
+    if not lengths:
+        return []
+    if sum(lengths) <= total:
+        return lengths
+    minimum = min(128, total // len(lengths))
+    budgets = [min(length, minimum) for length in lengths]
+    remaining = total - sum(budgets)
+    deficits = [max(0, length - budget) for length, budget in zip(lengths, budgets)]
+    deficit_total = sum(deficits)
+    if remaining and deficit_total:
+        for index, deficit in enumerate(deficits):
+            budgets[index] += min(deficit, remaining * deficit // deficit_total)
+        remaining = total - sum(budgets)
+        for index, deficit in enumerate(deficits):
+            if not remaining:
+                break
+            if budgets[index] < lengths[index]:
+                budgets[index] += 1
+                remaining -= 1
+    return budgets
+
+
+def _truncate(value: str, limit: int) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    if limit <= len(_TRUNCATION_MARKER):
+        return _TRUNCATION_MARKER[:limit]
+    return value[: limit - len(_TRUNCATION_MARKER)].rstrip() + _TRUNCATION_MARKER
+
+
+def _check_line(name: str, status: str, output: str, *, max_chars: int | None = None) -> str:
     line = f"- `{name}` - {status}"
     detail = output.strip()
     if detail:
         line += "\n" + "\n".join(f"  - {item}" for item in detail.splitlines())
-    return line
+    if max_chars is None or len(line) <= max_chars:
+        return line
+    prefix = f"- `{_truncate(name, max_chars)}` - {status}"
+    if len(prefix) >= max_chars:
+        return _truncate(prefix, max_chars)
+    return prefix + ("\n" + _truncate(detail, max_chars - len(prefix) - 1) if detail else "")
 
 
 def _pull_request_state(payload: dict[object, object]) -> str:

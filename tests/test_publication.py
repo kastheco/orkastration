@@ -24,6 +24,7 @@ from orkastrator.publication import (
     PublicationError,
     PullRequestLanded,
     _github_repository,
+    _PULL_REQUEST_BODY_LIMIT,
     _pull_request_body,
     _raise_if_integration_conflict,
 )
@@ -181,6 +182,47 @@ def test_pull_request_body_omits_missing_optional_evidence() -> None:
     assert "## Review" not in body
     assert "CI for exact head" not in body
     assert "unresolved" not in body.lower()
+
+
+def test_pull_request_body_stays_within_the_github_limit() -> None:
+    head_sha = "b" * 40
+    content = PublicationContent(
+        issue_id="ISSUE-123",
+        accepted_scope="s" * 12_000,
+        stop_condition="stop",
+        implementation_summary="i" * 8_000,
+        validation_results=tuple(
+            ValidationResult(
+                command=f"validation-{index}",
+                status="passed",
+                output="v" * 8_000,
+            )
+            for index in range(64)
+        ),
+        review_summary="r" * 8_000,
+        unresolved_findings=tuple("f" * 8_000 for _ in range(128)),
+        published_head=head_sha,
+        ci=CiReceipt(
+            provider="github",
+            head_sha=head_sha,
+            status="passed",
+            checks=[
+                CiCheckResult(
+                    name=f"check-{index}",
+                    status="passed",
+                    output="c" * 8_000,
+                )
+                for index in range(256)
+            ],
+        ),
+    )
+
+    body = _pull_request_body("run-1234567890", content)
+
+    assert len(body) <= _PULL_REQUEST_BODY_LIMIT
+    assert f"Published head: `{head_sha}`" in body
+    assert "orkastrator run: `run-1234567890`" in body
+    assert "[truncated]" in body
 
 
 async def test_create_draft_pr_observe_exact_checks_and_mark_ready(tmp_path: Path) -> None:
