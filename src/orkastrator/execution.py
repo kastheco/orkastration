@@ -1119,8 +1119,11 @@ class ExecutionController:
         if lane.worktree_id is None or lane.integration_head_sha is None:
             raise ValueError("lane omitted its integration checkout or frozen head")
         fixer_worktree = fixer_worktree or self._fixer_worktree(run_id, finding)
-        _, source_commits, source_finding_ids = await self._integration_sources(
+        source_base, source_commits, source_finding_ids = await self._integration_sources(
             run_id, finding, attempt, fixer_worktree
+        )
+        source_paths = await self._git.changed_paths(
+            fixer_worktree, source_base, attempt.commit_sha
         )
         identity = FixAttemptIdentity(
             fixer_commit_sha=attempt.commit_sha,
@@ -1209,13 +1212,20 @@ class ExecutionController:
                 return
             applied = await self._git.cherry_pick_many(lane.worktree_id, source_commits)
             if applied.returncode != 0:
-                await self._git.abort_cherry_pick(lane.worktree_id)
+                conflict_context = None
+                try:
+                    conflict_context = await self._git.integration_conflict_context(
+                        lane.worktree_id, source_paths
+                    )
+                finally:
+                    await self._git.abort_cherry_pick(lane.worktree_id)
                 self._store.finish_integration(
                     run_id,
                     finding,
                     status="conflict",
                     integrated_sha=None,
                     validation_results=[],
+                    conflict_context=conflict_context,
                 )
                 self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
                 return
@@ -2626,9 +2636,11 @@ class ExecutionController:
         if stage.role is StageKind.FIXER:
             schema = json.dumps(FixAttempt.model_json_schema(), sort_keys=True)
             prior = self._store.fix_attempt(finding.finding_key, finding.round - 1)
+            conflict_context = self._fixer_conflict_context(finding)
             prefix = (
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
+                f"{conflict_context}"
                 "Start from the assigned frozen review head and produce exactly one commit that "
                 "fully resolves the finding. Do not widen scope. Run exactly the validation "
                 "commands this finding names and report each one; they are the whole obligation, "
@@ -2669,6 +2681,27 @@ class ExecutionController:
             "review_revision are read from the record, so send any placeholder there. Send "
             f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
             f"{context}"
+        )
+
+    def _fixer_conflict_context(self, finding: FindingRecord) -> str:
+        """Render the last failed cherry-pick as retry-only fixer evidence."""
+
+        receipt = self._store.integration(finding.finding_key, finding.round)
+        if receipt is None or receipt.conflict_context is None:
+            return ""
+        conflict = receipt.conflict_context
+        conflicted = "\n".join(f"- {path}" for path in conflict.conflicted_paths)
+        clean = "\n".join(f"- {path}" for path in conflict.cleanly_applied_paths) or "(none)"
+        return (
+            "Prior integration conflict (supervisor-captured before abort):\n"
+            f"Conflicted paths:\n{conflicted}\n"
+            f"Cleanly-applied paths:\n{clean}\n"
+            "Conflicted hunks:\n"
+            f"<integration_conflict_hunks>\n{conflict.conflicted_hunks}"
+            "</integration_conflict_hunks>\n"
+            "The failed cherry-pick was fully aborted; no partial application was retained. "
+            "Use this evidence instead of re-deriving why the prior commit failed, while still "
+            "producing the complete scoped fix in one commit.\n"
         )
 
     async def _stage_spec_with_frozen_diff(

@@ -191,6 +191,7 @@ class IntegrationRow(SQLModel, table=True):
     source_finding_ids_json: str = "[]"
     status: str
     validation_json: str
+    conflict_context_json: str | None = None
     created_at: datetime
     updated_at: datetime
 

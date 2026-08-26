@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from orkastrator.models import ValidationRequirement, ValidationResult
+from orkastrator.models import IntegrationConflictContext, ValidationRequirement, ValidationResult
 from orkastrator.runners import condense
 
 
@@ -254,6 +254,39 @@ class LocalGit:
         result = await self._git(worktree_id, "cherry-pick", "--abort", check=False)
         if result.returncode != 0:
             raise GitError(f"failed to abort cherry-pick: {result.stderr.strip()[:2_000]}")
+
+    async def integration_conflict_context(
+        self, worktree_id: str, expected_paths: Sequence[str]
+    ) -> IntegrationConflictContext | None:
+        """Capture the conflicted paths, clean paths, and hunks before aborting."""
+
+        unmerged = await self._git(
+            worktree_id,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+            "--",
+            *expected_paths,
+        )
+        conflicted_paths = sorted({line for line in unmerged.stdout.splitlines() if line})
+        if not conflicted_paths:
+            return None
+        rendered = await self._git(
+            worktree_id,
+            "diff",
+            "--binary",
+            "--full-index",
+            "--diff-filter=U",
+            "--",
+            *conflicted_paths,
+        )
+        if not rendered.stdout:
+            raise GitError("conflicted integration produced no conflicted hunk diff")
+        return IntegrationConflictContext(
+            conflicted_paths=conflicted_paths,
+            cleanly_applied_paths=sorted(set(expected_paths) - set(conflicted_paths)),
+            conflicted_hunks=rendered.stdout,
+        )
 
     async def cherry_pick_in_progress_commits(self, worktree_id: str) -> list[str] | None:
         """Return source commits owned by the active Git sequencer, if any."""

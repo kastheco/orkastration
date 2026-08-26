@@ -276,15 +276,25 @@ async def test_conflicting_commit_aborts_without_resetting_prior_head(tmp_path: 
     one_id = add_worktree(repo, fixer_one, "fix-one", base)
     two_id = add_worktree(repo, fixer_two, "fix-two", base)
     one_sha = commit(fixer_one, "src/shared.py", "one\n", "fix one")
-    two_sha = commit(fixer_two, "src/shared.py", "two\n", "fix two")
+    commit(fixer_two, "src/shared.py", "two\n", "fix two")
+    (fixer_two / "src/clean.py").write_text("clean\n")
+    run(fixer_two, "git", "add", "src/clean.py")
+    run(fixer_two, "git", "commit", "--amend", "--no-edit")
+    two_sha = run(fixer_two, "git", "rev-parse", "HEAD")
     git = LocalGit()
 
     assert await git.changed_paths(one_id, base, one_sha) == ["src/shared.py"]
-    assert await git.changed_paths(two_id, base, two_sha) == ["src/shared.py"]
+    assert await git.changed_paths(two_id, base, two_sha) == ["src/clean.py", "src/shared.py"]
     assert (await git.cherry_pick(lane_id, one_sha)).returncode == 0
     prior_head = await git.head(lane_id)
     assert (await git.cherry_pick(lane_id, two_sha)).returncode != 0
     assert await git.cherry_pick_in_progress_commits(lane_id) == [two_sha]
+    conflict = await git.integration_conflict_context(lane_id, ["src/clean.py", "src/shared.py"])
+    assert conflict is not None
+    assert conflict.conflicted_paths == ["src/shared.py"]
+    assert conflict.cleanly_applied_paths == ["src/clean.py"]
+    assert "<<<<<<< HEAD" in conflict.conflicted_hunks
+    assert ">>>>>>>" in conflict.conflicted_hunks
     await git.abort_cherry_pick(lane_id)
 
     assert await git.head(lane_id) == prior_head

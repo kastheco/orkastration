@@ -21,6 +21,7 @@ from orkastrator.models import (
     FindingPhase,
     FindingReason,
     GraphResult,
+    IntegrationConflictContext,
     LanePhase,
     LaneRecord,
     PublicationReceipt,
@@ -422,6 +423,11 @@ class FakeGit(LocalGit):
         # Conflict for one named fix rather than for the whole run, which is what a
         # lane head moving under one finding actually looks like.
         self.conflict_commits: set[str] = set()
+        self.conflicted_paths: list[str] | None = None
+        self.conflicted_hunks = (
+            "diff --cc src/file1.py\n@@@ -1,1 -1,1 +1,5 @@@\n"
+            "++<<<<<<< HEAD\n++lane\n++=======\n++fix\n++>>>>>>> fixer\n"
+        )
         self.crash_after_cherry_pick = False
         self.integration_count = 0
         self.cherry_pick_calls: list[tuple[str, list[str]]] = []
@@ -563,6 +569,18 @@ class FakeGit(LocalGit):
         self.active_sequence_commits = None
         if self.pre_sequence_head is not None:
             self.heads[worktree_id] = self.pre_sequence_head
+
+    async def integration_conflict_context(
+        self, worktree_id: str, expected_paths: Sequence[str]
+    ) -> IntegrationConflictContext | None:
+        if not self.in_progress:
+            return None
+        conflicted_paths = self.conflicted_paths or list(expected_paths[:1])
+        return IntegrationConflictContext(
+            conflicted_paths=conflicted_paths,
+            cleanly_applied_paths=sorted(set(expected_paths) - set(conflicted_paths)),
+            conflicted_hunks=self.conflicted_hunks,
+        )
 
     async def cherry_pick_in_progress_commits(self, worktree_id: str) -> list[str] | None:
         return self.active_sequence_commits if self.in_progress else None
@@ -1215,6 +1233,8 @@ async def test_still_open_uses_two_rounds_then_escalates(tmp_path: Path) -> None
     result = await value.monitor(run_id)
     assert result.findings[0].round == 2
     assert result.started[0].role is StageKind.FIXER
+    retry_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
+    assert "Prior integration conflict" not in retry_spec
 
     orca.complete_dispatched(fix_attempt(round=2))
     await value.monitor(run_id)
@@ -1978,6 +1998,47 @@ async def test_conflict_retry_relands_the_same_round_instead_of_spending_one(
     assert result.findings[0].round == 1
     assert result.started[0].role is StageKind.FIXER
     assert any(":retry1" in stage.stage_key for stage in store.stages(run_id))
+
+
+async def test_conflict_retry_receives_paths_and_conflicted_hunks(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    git = FakeGit()
+    git.conflict = True
+    git.changed_override = [
+        "src/actions.py",
+        "src/data.py",
+        "tests/test_overview.py",
+    ]
+    git.conflicted_paths = ["tests/test_overview.py"]
+    finding = review_finding_data()
+    finding["allowed_write_scope"] = {
+        "paths": ["src/actions.py", "src/data.py", "tests/test_overview.py"],
+        "symbols": [],
+    }
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, finding)
+
+    first_fixer = next(item for item in orca.tasks_by_id.values() if item["status"] == "dispatched")
+    assert "Prior integration conflict" not in str(first_fixer["spec"])
+    orca.complete_dispatched(fix_attempt(changed_path="src/actions.py"))
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("resolved"))
+    await value.monitor(run_id)
+
+    receipt = store.integrations(run_id)[0]
+    assert receipt.conflict_context is not None
+    assert receipt.conflict_context.conflicted_paths == ["tests/test_overview.py"]
+    assert receipt.conflict_context.cleanly_applied_paths == ["src/actions.py", "src/data.py"]
+    orca.complete_dispatched(escalation("integration_conflict", "approve_unchanged"))
+    result = await value.monitor(run_id)
+
+    retry_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
+    assert "Conflicted paths:\n- tests/test_overview.py" in retry_spec
+    assert "Cleanly-applied paths:\n- src/actions.py\n- src/data.py" in retry_spec
+    assert git.conflicted_hunks in retry_spec
+    assert "no partial application was retained" in retry_spec
 
 
 async def test_accepting_a_conflicted_fix_rebuilds_it_on_the_lane_head(
