@@ -82,6 +82,43 @@ def publication_content(
     )
 
 
+async def test_reconcile_skips_the_edit_when_the_pull_request_is_already_current() -> None:
+    sha = "b" * 40
+    run_id = "run-1234567890"
+    receipt = PublicationReceipt(
+        run_id=run_id,
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    content = publication_content()
+    body = _pull_request_body(run_id, content)
+    state = json.dumps(
+        {"headRefOid": sha, "state": "OPEN", "isDraft": True, "body": body}
+    )
+    ci = CiReceipt(
+        provider="github",
+        head_sha=sha,
+        status="pending",
+        checks=(CiCheckResult(name="pytest", status="pending", output="queued"),),
+    )
+    runner = QueueRunner(result(state), result(state), result(state), result())
+    publisher = GitHubPublisher(runner=runner)
+
+    await publisher.reconcile(receipt, content)
+    await publisher.reconcile(receipt, content)
+    assert len(runner.calls) == 2
+    assert all(call[:3] == ("gh", "pr", "view") for call in runner.calls)
+
+    await publisher.reconcile(receipt, publication_content(ci=ci))
+    assert len(runner.calls) == 4
+    assert runner.calls[-1][:3] == ("gh", "pr", "edit")
+
+
 async def test_create_and_reconcile_publish_structured_evidence(tmp_path: Path) -> None:
     sha = "b" * 40
     run_id = "run-1234567890"

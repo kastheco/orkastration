@@ -284,6 +284,9 @@ class GitHubPublisher:
         marker = f"orkastrator run: `{receipt.run_id}`"
         if not isinstance(state, dict) or marker not in str(state.get("body") or ""):
             raise PublicationError("existing pull request is not owned by this accepted run")
+        body = _pull_request_body(receipt.run_id, content)
+        if str(state.get("body") or "") == body:
+            return
         await self._required(
             Path.cwd(),
             *self._gh,
@@ -293,7 +296,7 @@ class GitHubPublisher:
             "--title",
             _pull_request_title(content),
             "--body",
-            _pull_request_body(receipt.run_id, content),
+            body,
         )
 
     async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
