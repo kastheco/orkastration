@@ -108,7 +108,7 @@ test("session lifecycle polls once at a time and clears timer and footer on shut
 
   const ctx = context();
   await api.sessionStartHandler?.({ type: "session_start", reason: "startup" }, ctx);
-  assert.deepEqual(ctx.statuses.at(-1), [STATUS_KEY, "● KAS-706 monitor bb9a9b29"]);
+  assert.deepEqual(ctx.statuses.at(-1), [STATUS_KEY, "● KAS-706 monitor b1234abcd"]);
   assert.equal(callbacks.size, 1);
 
   const tick = [...callbacks.values()][0]!;

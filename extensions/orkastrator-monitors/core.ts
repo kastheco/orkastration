@@ -267,7 +267,7 @@ export function renderMonitorFooter(tasks: readonly MonitorTask[], maxWidth = 72
   const live = liveMonitorTasks(tasks);
   if (live.length === 0) return undefined;
   const descriptions = live.map(
-    (task) => `● ${monitorLabel(task)} ${task.runId.replaceAll("-", "").slice(0, 8)}`,
+    (task) => `● ${monitorLabel(task)} ${task.id}`,
   );
   if (descriptions.length === 1) return truncate(descriptions[0]!, maxWidth);
 

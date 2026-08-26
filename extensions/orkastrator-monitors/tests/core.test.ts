@@ -127,12 +127,27 @@ test("malformed and unrelated task records are ignored", () => {
 });
 
 test("running monitor renders a persistent compact footer", () => {
-  assert.equal(renderMonitorFooter([task()]), "● KAS-706 monitor bb9a9b29");
+  assert.equal(renderMonitorFooter([task()]), "● KAS-706 monitor b1234abcd");
   assert.equal(renderMonitorFooter([task({ status: "completed", endTime: 2_000 })]), undefined);
   assert.equal(renderMonitorFooter([task({ status: "failed", endTime: 2_000 })]), undefined);
   assert.equal(renderMonitorFooter([task({ status: "killed", endTime: 2_000 })]), undefined);
   assert.equal(renderMonitorFooter([task({ stale: true })]), undefined);
   assert.equal(renderMonitorFooter([]), undefined);
+});
+
+test("running monitor renders the objective task-id footer example", () => {
+  assert.equal(
+    renderMonitorFooter([task({ id: "bb9a9b29b" })]),
+    "● KAS-706 monitor bb9a9b29b",
+  );
+});
+
+test("same-run monitors remain distinct through their task ids", () => {
+  const first = task({ id: "bb9a9b29b" });
+  const second = task({ id: "c2345defg" });
+  assert.equal(renderMonitorFooter([first]), "● KAS-706 monitor bb9a9b29b");
+  assert.equal(renderMonitorFooter([second]), "● KAS-706 monitor c2345defg");
+  assert.notEqual(renderMonitorFooter([first]), renderMonitorFooter([second]));
 });
 
 test("multiple monitors are bounded and summarized", () => {
