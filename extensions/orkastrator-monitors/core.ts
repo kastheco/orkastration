@@ -316,7 +316,7 @@ export function renderMonitorDetails(tasks: readonly MonitorTask[], now = Date.n
         `PID: ${task.pid ?? "unavailable"}`,
         `status: ${task.status}`,
         ...(elapsed === undefined ? [] : [`elapsed: ${elapsed}`]),
-        `output: ${task.outputPath}`,
+        `output: ${cleanLabel(task.outputPath)}`,
       ].join("\n");
     })
     .join("\n\n");

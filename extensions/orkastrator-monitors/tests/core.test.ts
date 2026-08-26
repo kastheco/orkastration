@@ -168,3 +168,21 @@ test("detail command reports only recorded task facts and computed elapsed time"
   );
   assert.doesNotMatch(details, /review|worker phase/iu);
 });
+
+test("detail command sanitizes control characters from output paths", () => {
+  const details = renderMonitorDetails([
+    task({ outputPath: "out\u001b[2J\nstatus: running" }),
+  ], 1_000);
+
+  assert.equal(details, [
+    "task id: b1234abcd",
+    `run id: ${RUN_ID}`,
+    "PID: 4242",
+    "status: running",
+    "elapsed: 0s",
+    "output: out [2J status: running",
+  ].join("\n"));
+  const outputLines = details.split("\n").filter((line) => line.startsWith("output: "));
+  assert.deepEqual(outputLines, ["output: out [2J status: running"]);
+  assert.doesNotMatch(outputLines[0]!, /[\u0000-\u001f\u007f-\u009f]/u);
+});
