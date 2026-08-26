@@ -45,6 +45,7 @@ from orkastrator.models import (
     FixAttempt,
     FixAttemptIdentity,
     InitialReviewReport,
+    IntegrationConflictContext,
     IntegrationRecord,
     LanePhase,
     LaneRecord,
@@ -2022,6 +2023,7 @@ class StateStore:
                 row.integrated_sha = None
             row.status = "starting"
             row.validation_json = "[]"
+            row.conflict_context_json = None
             row.updated_at = _now()
             self._event(
                 session,
@@ -2041,6 +2043,7 @@ class StateStore:
         status: Literal["integrated", "conflict", "validation_failed"],
         integrated_sha: str | None,
         validation_results: list[ValidationResult],
+        conflict_context: IntegrationConflictContext | None = None,
     ) -> None:
         with self._session() as session:
             row = session.exec(
@@ -2057,6 +2060,9 @@ class StateStore:
             row.integrated_sha = integrated_sha
             row.validation_json = json.dumps(
                 [item.model_dump(mode="json") for item in validation_results]
+            )
+            row.conflict_context_json = (
+                conflict_context.model_dump_json() if conflict_context is not None else None
             )
             row.updated_at = _now()
             if status in {"integrated", "validation_failed"}:
@@ -2638,6 +2644,7 @@ class StateStore:
             "integrations": (
                 ("source_commits_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("source_finding_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("conflict_context_json", "TEXT"),
             ),
         }
         inspector = inspect(self._engine)
@@ -2787,6 +2794,11 @@ def _integration(row: IntegrationRow) -> IntegrationRecord:
         validation_results=[
             ValidationResult.model_validate(item) for item in json.loads(row.validation_json)
         ],
+        conflict_context=(
+            IntegrationConflictContext.model_validate_json(row.conflict_context_json)
+            if row.conflict_context_json is not None
+            else None
+        ),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

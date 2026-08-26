@@ -1174,8 +1174,11 @@ class ExecutionController:
         if lane.worktree_id is None or lane.integration_head_sha is None:
             raise ValueError("lane omitted its integration checkout or frozen head")
         fixer_worktree = fixer_worktree or self._fixer_worktree(run_id, finding)
-        _, source_commits, source_finding_ids = await self._integration_sources(
+        source_base, source_commits, source_finding_ids = await self._integration_sources(
             run_id, finding, attempt, fixer_worktree
+        )
+        source_paths = await self._git.changed_paths(
+            fixer_worktree, source_base, attempt.commit_sha
         )
         identity = FixAttemptIdentity(
             fixer_commit_sha=attempt.commit_sha,
@@ -1264,13 +1267,35 @@ class ExecutionController:
                 return
             applied = await self._git.cherry_pick_many(lane.worktree_id, source_commits)
             if applied.returncode != 0:
-                await self._git.abort_cherry_pick(lane.worktree_id)
+                conflict_context = None
+                try:
+                    active_sequence = await self._git.cherry_pick_in_progress_commits(
+                        lane.worktree_id
+                    )
+                    attempted_paths: list[str] = []
+                    if active_sequence:
+                        current_commit = active_sequence[0]
+                        if current_commit in source_commits:
+                            attempted_paths = await self._git.changed_paths(
+                                fixer_worktree, source_base, current_commit
+                            )
+                    try:
+                        conflict_context = await self._git.integration_conflict_context(
+                            lane.worktree_id,
+                            source_paths,
+                            attempted_paths=attempted_paths,
+                        )
+                    except Exception:
+                        conflict_context = None
+                finally:
+                    await self._git.abort_cherry_pick(lane.worktree_id)
                 self._store.finish_integration(
                     run_id,
                     finding,
                     status="conflict",
                     integrated_sha=None,
                     validation_results=[],
+                    conflict_context=conflict_context,
                 )
                 self._escalate(run_id, finding, FindingReason.INTEGRATION_CONFLICT)
                 return
@@ -2724,9 +2749,11 @@ class ExecutionController:
         if stage.role is StageKind.FIXER:
             schema = json.dumps(FixAttempt.model_json_schema(), sort_keys=True)
             prior = self._store.fix_attempt(finding.finding_key, finding.round - 1)
-            prefix = (
+            prefix_head = (
                 f"Fix only this frozen finding at round {finding.round}: {contract}\n"
                 f"Prior-round evidence: {prior.model_dump_json() if prior else 'none'}\n"
+            )
+            prefix_tail = (
                 "Start from the assigned frozen review head and produce exactly one commit that "
                 "fully resolves the finding. Do not widen scope. Run exactly the validation "
                 "commands this finding names and report each one; they are the whole obligation, "
@@ -2735,6 +2762,19 @@ class ExecutionController:
                 "and spend your effort on status, changed_paths and validation_results. Send "
                 f"worker_done with body set to only the JSON matching this schema: {schema}"
             )
+            conflict_context = self._fixer_conflict_context(finding, max_hunk_bytes=0)
+            prefix = prefix_head + conflict_context + prefix_tail
+            hunk_budget = (
+                MAX_TASK_SPEC_BYTES
+                - len(f"{prefix}\n\n\n\n{context}".encode())
+                - self._config.frozen_diff_budget_bytes
+                + len(_CONFLICT_HUNK_TRUNCATION_MARKER.encode())
+            )
+            if hunk_budget > 0:
+                conflict_context = self._fixer_conflict_context(
+                    finding, max_hunk_bytes=hunk_budget
+                )
+                prefix = prefix_head + conflict_context + prefix_tail
             return await self._stage_spec_with_frozen_diff(
                 prefix, context, lane_record, stage, run_id
             )
@@ -2767,6 +2807,41 @@ class ExecutionController:
             "review_revision are read from the record, so send any placeholder there. Send "
             f"worker_done with body set to only the JSON matching this schema: {schema}\n\n"
             f"{context}"
+        )
+
+    def _fixer_conflict_context(
+        self, finding: FindingRecord, *, max_hunk_bytes: int | None = None
+    ) -> str:
+        """Render the last failed cherry-pick as retry-only fixer evidence."""
+
+        receipt = self._store.integration(finding.finding_key, finding.round)
+        if receipt is None or receipt.conflict_context is None:
+            return ""
+        conflict = receipt.conflict_context
+        conflicted = "\n".join(f"- {path}" for path in conflict.conflicted_paths)
+        clean = "\n".join(f"- {path}" for path in conflict.cleanly_applied_paths) or "(none)"
+        if conflict.conflicted_hunks is None:
+            hunk_context = (
+                "Conflicted hunk content: none captured (the combined diff contained no hunk "
+                "content; this may be a modify/delete or binary conflict).\n"
+            )
+        else:
+            hunks = conflict.conflicted_hunks
+            if max_hunk_bytes is not None:
+                hunks = _truncate_conflict_hunks(hunks, max_hunk_bytes)
+            hunk_context = (
+                "Conflicted hunks:\n"
+                f"<integration_conflict_hunks>\n{hunks}"
+                "</integration_conflict_hunks>\n"
+            )
+        return (
+            "Prior integration conflict (supervisor-captured before abort):\n"
+            f"Conflicted paths:\n{conflicted}\n"
+            f"Cleanly-applied paths:\n{clean}\n"
+            f"{hunk_context}"
+            "The failed cherry-pick was fully aborted; no partial application was retained. "
+            "Use this evidence instead of re-deriving why the prior commit failed, while still "
+            "producing the complete scoped fix in one commit.\n"
         )
 
     async def _stage_spec_with_frozen_diff(
@@ -2840,6 +2915,26 @@ class ExecutionController:
             budget_bytes=self._config.frozen_diff_budget_bytes,
             max_spec_bytes=max_spec_bytes,
         )
+
+
+def _truncate_conflict_hunks(hunks: str, max_bytes: int) -> str:
+    """Bound conflict hunk evidence while preserving an explicit omission marker."""
+
+    encoded = hunks.encode()
+    if len(encoded) <= max_bytes:
+        return hunks
+    marker = _CONFLICT_HUNK_TRUNCATION_MARKER
+    marker_bytes = len(marker.encode())
+    if max_bytes <= marker_bytes:
+        return marker[:max_bytes].encode().decode("utf-8", errors="ignore")
+    kept = encoded[: max_bytes - marker_bytes].decode("utf-8", errors="ignore")
+    return kept + marker
+
+
+_CONFLICT_HUNK_TRUNCATION_MARKER = (
+    "\n[Conflicted hunk evidence was truncated to fit the task spec; omitted hunk content "
+    "is not included.]"
+)
 
 
 def _format_frozen_diff(

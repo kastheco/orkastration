@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from orkastrator.models import ValidationRequirement, ValidationResult
+from orkastrator.models import IntegrationConflictContext, ValidationRequirement, ValidationResult
 from orkastrator.runners import condense
 
 
@@ -154,12 +154,13 @@ class LocalGit:
             worktree_id,
             "diff",
             "--name-only",
+            "-z",
             "--no-renames",
             f"{base_sha}..{head_sha}",
             "--",
             *paths,
         )
-        return sorted({line for line in result.stdout.splitlines() if line})
+        return sorted({path for path in result.stdout.split("\0") if path})
 
     async def render_diff(
         self,
@@ -254,6 +255,44 @@ class LocalGit:
         result = await self._git(worktree_id, "cherry-pick", "--abort", check=False)
         if result.returncode != 0:
             raise GitError(f"failed to abort cherry-pick: {result.stderr.strip()[:2_000]}")
+
+    async def integration_conflict_context(
+        self,
+        worktree_id: str,
+        expected_paths: Sequence[str],
+        *,
+        attempted_paths: Sequence[str] | None = None,
+    ) -> IntegrationConflictContext | None:
+        """Capture the conflicted paths, clean paths, and hunks before aborting."""
+
+        unmerged = await self._git(
+            worktree_id,
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=U",
+            "--",
+            *expected_paths,
+        )
+        conflicted_paths = sorted({path for path in unmerged.stdout.split("\0") if path})
+        if not conflicted_paths:
+            return None
+        rendered = await self._git(
+            worktree_id,
+            "diff",
+            "--binary",
+            "--full-index",
+            "--diff-filter=U",
+            "--",
+            *conflicted_paths,
+        )
+        conflicted_hunks = rendered.stdout if _contains_diff_hunk(rendered.stdout) else None
+        applied_paths = expected_paths if attempted_paths is None else attempted_paths
+        return IntegrationConflictContext(
+            conflicted_paths=conflicted_paths,
+            cleanly_applied_paths=sorted(set(applied_paths) - set(conflicted_paths)),
+            conflicted_hunks=conflicted_hunks,
+        )
 
     async def cherry_pick_in_progress_commits(self, worktree_id: str) -> list[str] | None:
         """Return source commits owned by the active Git sequencer, if any."""
@@ -434,6 +473,12 @@ _PYTEST_CONFIG_SECTIONS = (
     ("setup.cfg", "[tool:pytest]"),
 )
 """Where a repository declares pytest options, and the section that holds them."""
+
+
+def _contains_diff_hunk(diff: str) -> bool:
+    """Return whether a combined diff includes at least one hunk header."""
+
+    return any(line.startswith("@@") for line in diff.splitlines())
 
 
 def worktree_path(worktree_id: str) -> Path:

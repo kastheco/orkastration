@@ -774,6 +774,16 @@ class FindingRecord(BaseModel):
     updated_at: datetime
 
 
+class IntegrationConflictContext(BaseModel):
+    """Git evidence captured before a failed integration is aborted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conflicted_paths: list[str] = Field(min_length=1, max_length=256)
+    cleanly_applied_paths: list[str] = Field(max_length=256)
+    conflicted_hunks: str | None = Field(default=None, min_length=1)
+
+
 class IntegrationRecord(BaseModel):
     """Auditable serial integration state for one approved finding commit."""
 
@@ -790,6 +800,7 @@ class IntegrationRecord(BaseModel):
     integrated_sha: GitObjectId | None
     status: Literal["starting", "integrated", "conflict", "validation_failed"]
     validation_results: list[ValidationResult]
+    conflict_context: IntegrationConflictContext | None = None
     created_at: datetime
     updated_at: datetime
 
