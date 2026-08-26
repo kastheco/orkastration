@@ -1025,7 +1025,14 @@ class StateStore:
             row.processed = True
             row.updated_at = _now()
 
-    def mark_stage_processed(self, run_id: str, stage: StageRecord, reason: str) -> None:
+    def mark_stage_processed(
+        self,
+        run_id: str,
+        stage: StageRecord,
+        reason: str,
+        *,
+        rejection_kind: Literal["work_failed", "report_unreadable"],
+    ) -> None:
         with self._session() as session:
             row = session.get(WorkflowStageRow, stage.stage_id)
             if row is None or row.processed:
@@ -1037,7 +1044,11 @@ class StateStore:
                 run_id,
                 stage.lane_id,
                 "stage_result_rejected",
-                {"stage_id": stage.stage_id, "reason": reason},
+                {
+                    "stage_id": stage.stage_id,
+                    "reason": reason,
+                    "rejection_kind": rejection_kind,
+                },
             )
 
     def record_initial_review(self, run_id: str, lane_id: str, report: InitialReviewReport) -> None:
@@ -2197,27 +2208,41 @@ class StateStore:
         return streak
 
     def resume_lane(self, run_id: str, lane_id: str, note: str) -> None:
-        """Lift a lane block, and clear the run status that block wrote.
+        """Recover a blocked or report-rejected lane and reconcile its stages.
 
-        Both halves, because either one alone leaves the owner somewhere they
-        cannot get out of. A lane left BLOCKED is skipped by publication; a run
-        row left `blocked` reads as stopped even once every lane is healthy.
+        Retire the rejected attempt and recreate its scheduler key before
+        clearing the terminal lane and run states. A genuine work failure is
+        deliberately not recoverable through this route.
         """
 
         with self._session() as session:
             lane = session.get(LaneRow, lane_id)
             if lane is None:
                 raise KeyError(f"unknown lane {lane_id}")
-            if lane.phase != LanePhase.BLOCKED.value:
-                raise ValueError(f"lane {lane.name} is {lane.phase}, not blocked")
-            failed_lane_stages = session.exec(
+            report_stage_ids = self._recoverable_report_stage_ids(session, run_id, lane_id)
+            report_failure = lane.phase == LanePhase.REPORT_FAILED.value or (
+                lane.phase == LanePhase.FAILED.value and bool(report_stage_ids)
+            )
+            if lane.phase != LanePhase.BLOCKED.value and not report_failure:
+                raise ValueError(
+                    f"lane {lane.name} is {lane.phase}, not blocked or failed on an "
+                    "unreadable report"
+                )
+            stage_filter = (
+                WorkflowStageRow.phase == StagePhase.FAILED.value
+                if lane.phase == LanePhase.BLOCKED.value
+                else col(WorkflowStageRow.stage_id).in_(report_stage_ids)
+            )
+            recoverable_stages = session.exec(
                 select(WorkflowStageRow).where(
                     WorkflowStageRow.lane_id == lane_id,
-                    WorkflowStageRow.finding_id.is_(None),
-                    WorkflowStageRow.phase == StagePhase.FAILED.value,
+                    col(WorkflowStageRow.finding_id).is_(None),
+                    stage_filter,
                 )
             ).all()
-            for stage in failed_lane_stages:
+            if report_failure and not recoverable_stages:
+                raise ValueError(f"lane {lane.name} has no unreadable report stage to recover")
+            for stage in recoverable_stages:
                 # Keep the failed attempt as evidence, but move its key out of
                 # the scheduler's live namespace. `resume` is the explicit
                 # supervisor recovery action for a lane-level stage failure.
@@ -2249,7 +2274,7 @@ class StateStore:
             lane.phase = LanePhase.ACTIVE.value
             lane.updated_at = _now()
             run = session.get(SupervisorRunRow, run_id)
-            if run is not None and run.status in {"blocked", "failed"}:
+            if run is not None and run.status in {"blocked", "failed", "report_failed"}:
                 run.status = "active"
                 run.updated_at = _now()
             self._event(
@@ -2268,6 +2293,85 @@ class StateStore:
                 phase=LanePhase.ACTIVE.value,
                 note=note,
             )
+
+    def lane_has_recoverable_report_failure(self, run_id: str, lane_id: str) -> bool:
+        """Say whether the ledger proves this lane failed only while reading a report."""
+
+        with self._session() as session:
+            return bool(self._recoverable_report_stage_ids(session, run_id, lane_id))
+
+    @staticmethod
+    def _recoverable_report_stage_ids(
+        session: Session, run_id: str, lane_id: str
+    ) -> list[str]:
+        """Return live lane-level attempts rejected because their report was unreadable.
+
+        The reason-prefix fallback recognizes rows written before KAS-686 added
+        the explicit rejection kind, but excludes the old work-failure messages
+        that used the same prefix.
+        """
+
+        events = session.exec(
+            select(EventRow)
+            .where(
+                EventRow.run_id == run_id,
+                EventRow.lane_id == lane_id,
+                EventRow.kind == "stage_result_rejected",
+            )
+            .order_by(col(EventRow.created_at), col(EventRow.event_id))
+        ).all()
+        stage_ids: list[str] = []
+        for row in events:
+            payload = json.loads(row.payload_json)
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("rejection_kind")
+            reason = payload.get("reason")
+            if kind == "report_unreadable":
+                pass
+            elif kind is not None or not (
+                isinstance(reason, str) and reason.startswith("invalid structured result:")
+            ):
+                continue
+            elif kind is None:
+                detail = reason.removeprefix("invalid structured result:").strip()
+                legacy_work_failure_markers = (
+                    "worker reported a failed outcome",
+                    "worker ",
+                    "blocked worker ",
+                    "initial review ",
+                    "validation runner ",
+                    "fixed attempt ",
+                    "ci fixer ",
+                    "fixer ",
+                    "re-review ",
+                    "escalation ",
+                    "stage ",
+                    "finding ",
+                    "integration ",
+                    "accepted integration ",
+                    "approved fixer ",
+                    "lane ",
+                    "git ",
+                    "worktree ",
+                    "cannot move dirty lane checkout ",
+                    "failed to abort cherry-pick ",
+                    "not a local orca identity",
+                    "bad object ",
+                )
+                if detail.casefold().startswith(legacy_work_failure_markers):
+                    continue
+            stage_id = payload.get("stage_id")
+            if not isinstance(stage_id, str):
+                continue
+            stage = session.get(WorkflowStageRow, stage_id)
+            if (
+                stage is not None
+                and stage.finding_id is None
+                and ":resumed" not in stage.stage_key
+            ):
+                stage_ids.append(stage_id)
+        return stage_ids
 
     def record_hand_action(
         self,
@@ -2293,7 +2397,7 @@ class StateStore:
             )
 
     def set_terminal_status(self, run_id: str, status: str) -> None:
-        if status not in {"complete", "failed", "blocked"}:
+        if status not in {"complete", "failed", "blocked", "report_failed"}:
             raise ValueError(f"invalid terminal status {status}")
         with self._session() as session:
             row = session.get(SupervisorRunRow, run_id)

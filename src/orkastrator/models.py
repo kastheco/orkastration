@@ -54,9 +54,12 @@ class LanePhase(StrEnum):
     BLOCKED = "blocked"
     COMPLETE = "complete"
     FAILED = "failed"
+    REPORT_FAILED = "report_failed"
 
 
-TERMINAL_LANE_PHASES = frozenset({LanePhase.BLOCKED, LanePhase.COMPLETE, LanePhase.FAILED})
+TERMINAL_LANE_PHASES = frozenset(
+    {LanePhase.BLOCKED, LanePhase.COMPLETE, LanePhase.FAILED, LanePhase.REPORT_FAILED}
+)
 """Lane phases nothing in the graph moves a lane out of on its own.
 
 A blocked lane is as finished as a complete one from the graph's side: only an

@@ -249,7 +249,7 @@ def resume(
     ] = "resumed by the supervisor",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine JSON.")] = False,
 ) -> None:
-    """Clear a lane block and let the run advance again.
+    """Recover a lane block or an unreadable lane-level stage report.
 
     `reopen` and `settle` act on findings. A lane that blocked with every
     finding already settled - on a CI query made a second too early, on a pull

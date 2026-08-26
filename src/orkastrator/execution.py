@@ -311,7 +311,7 @@ class ExecutionController:
         started.extend(await self._start_ready(run_id))
         status = self._derive_status(run_id)
         current = self._store.run(run_id).status
-        if status in {"complete", "failed", "blocked"} and current != status:
+        if status in {"complete", "failed", "blocked", "report_failed"} and current != status:
             self._store.set_terminal_status(run_id, status)
         return GraphResult(
             run_id=run_id,
@@ -418,18 +418,59 @@ class ExecutionController:
         for stage in self._store.stages(run_id):
             if stage.processed or stage.phase not in {StagePhase.COMPLETED, StagePhase.FAILED}:
                 continue
-            if stage.phase is StagePhase.FAILED or stage.result_json is None:
-                self._reject_stage(run_id, stage, "failed or missing worker lifecycle result")
+            if stage.phase is StagePhase.FAILED:
+                self._reject_stage(
+                    run_id,
+                    stage,
+                    "worker task failed without a lifecycle result",
+                    rejection_kind="work_failed",
+                )
+                continue
+            if stage.result_json is None:
+                self._reject_stage(
+                    run_id,
+                    stage,
+                    "completed worker task has no lifecycle result",
+                    rejection_kind="report_unreadable",
+                )
                 continue
             try:
                 result = OrcaWorkerResult.model_validate_json(stage.result_json)
-                if result.outcome != "succeeded":
-                    raise ValueError("worker reported a failed outcome")
+            except (ValidationError, TypeError, json.JSONDecodeError) as exc:
+                self._reject_stage(
+                    run_id,
+                    stage,
+                    f"invalid structured result: {exc}",
+                    rejection_kind="report_unreadable",
+                )
+                continue
+            if result.outcome != "succeeded":
+                self._reject_stage(
+                    run_id,
+                    stage,
+                    "worker reported a failed outcome",
+                    rejection_kind="work_failed",
+                )
+                continue
+            try:
                 await self._apply_contract(run_id, stage, result)
             except IntegrationBusyError:
                 continue
-            except (GitError, ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                self._reject_stage(run_id, stage, f"invalid structured result: {exc}")
+            except (ValidationError, TypeError, json.JSONDecodeError) as exc:
+                self._reject_stage(
+                    run_id,
+                    stage,
+                    f"invalid structured result: {exc}",
+                    rejection_kind="report_unreadable",
+                )
+                continue
+            except (GitError, ValueError) as exc:
+                self._reject_stage(
+                    run_id,
+                    stage,
+                    f"worker result failed validation: {exc}",
+                    rejection_kind="work_failed",
+                )
                 continue
             self._store.record_lifecycle_receipt(run_id, stage, result)
 
@@ -1031,9 +1072,21 @@ class ExecutionController:
             return False
         return self._store.fix_attempt_count(finding.finding_key, limit) == 1
 
-    def _reject_stage(self, run_id: str, stage: StageRecord, reason: str) -> None:
+    def _reject_stage(
+        self,
+        run_id: str,
+        stage: StageRecord,
+        reason: str,
+        *,
+        rejection_kind: Literal["work_failed", "report_unreadable"],
+    ) -> None:
         if stage.finding_id is None:
-            self._store.set_lane_phase(run_id, stage.lane_id, LanePhase.FAILED)
+            phase = (
+                LanePhase.REPORT_FAILED
+                if rejection_kind == "report_unreadable"
+                else LanePhase.FAILED
+            )
+            self._store.set_lane_phase(run_id, stage.lane_id, phase)
         elif stage.role is StageKind.ESCALATION:
             finding = self._finding_for_stage(run_id, stage)
             self._store.set_finding_state(run_id, finding.finding_key, phase=FindingPhase.BLOCKED)
@@ -1043,7 +1096,9 @@ class ExecutionController:
                 self._finding_for_stage(run_id, stage),
                 FindingReason.AMBIGUOUS_RESULT,
             )
-        self._store.mark_stage_processed(run_id, stage, reason)
+        self._store.mark_stage_processed(
+            run_id, stage, reason, rejection_kind=rejection_kind
+        )
 
     def _escalate(self, run_id: str, finding: FindingRecord, reason: FindingReason) -> None:
         self._store.set_finding_state(
@@ -1481,7 +1536,7 @@ class ExecutionController:
                 stage.role is StageKind.WORKER and stage.processed for stage in lane_stages
             )
             reviewer_exists = any(stage.role is StageKind.INITIAL_REVIEWER for stage in lane_stages)
-            if worker_done and lane.phase is not LanePhase.FAILED and not reviewer_exists:
+            if worker_done and lane.phase is LanePhase.ACTIVE and not reviewer_exists:
                 self._store.ensure_stage(
                     run_id,
                     lane.lane_id,
@@ -2055,6 +2110,8 @@ class ExecutionController:
                 # Lane-level failures have no finding round that can supersede
                 # them. Keep the explicit failure until supervisor recovery.
                 phase = LanePhase.FAILED
+            elif lane.phase is LanePhase.REPORT_FAILED:
+                phase = LanePhase.REPORT_FAILED
             else:
                 reviewed = any(
                     stage.role is StageKind.INITIAL_REVIEWER and stage.processed
@@ -2114,6 +2171,8 @@ class ExecutionController:
             return "active"
         if any(phase is LanePhase.FAILED for phase in lane_phases):
             return "failed"
+        if any(phase is LanePhase.REPORT_FAILED for phase in lane_phases):
+            return "report_failed"
         if any(phase is LanePhase.BLOCKED for phase in lane_phases):
             return "blocked"
         if lane_phases and all(phase is LanePhase.COMPLETE for phase in lane_phases):
@@ -2138,7 +2197,12 @@ class ExecutionController:
                     "requires supervisor action: resume this lane to retry the stage",
                 )
                 continue
-            if lane.phase in {LanePhase.BLOCKED, LanePhase.FAILED, LanePhase.COMPLETE}:
+            if lane.phase in {
+                LanePhase.BLOCKED,
+                LanePhase.FAILED,
+                LanePhase.REPORT_FAILED,
+                LanePhase.COMPLETE,
+            }:
                 # A complete lane is finished: its head is published, its pull
                 # request is out of draft and its required checks passed for that
                 # exact head. Coming back to it every tick re-edits the pull
@@ -2413,7 +2477,7 @@ class ExecutionController:
         return result
 
     def resume(self, run_id: str, lane_name: str | None, note: str) -> list[LaneRecord]:
-        """Clear a lane block the owner has looked at, and let the run advance again.
+        """Recover an owner-reviewed block or an unreadable lane-level report.
 
         For a lane-level worker or initial-reviewer failure, the store retires
         the failed attempt and stages a replacement under the original key, so
@@ -2435,11 +2499,21 @@ class ExecutionController:
         lanes = [
             lane
             for lane in self._store.lanes(run_id)
-            if lane.phase is LanePhase.BLOCKED and lane_name in {None, lane.name}
+            if lane_name in {None, lane.name}
+            and (
+                lane.phase in {LanePhase.BLOCKED, LanePhase.REPORT_FAILED}
+                or (
+                    lane.phase is LanePhase.FAILED
+                    and self._store.lane_has_recoverable_report_failure(run_id, lane.lane_id)
+                )
+            )
         ]
         if not lanes:
             named = f"lane {lane_name} of " if lane_name else ""
-            raise ValueError(f"{named}run {run_id} has no blocked lane to resume")
+            raise ValueError(
+                f"{named}run {run_id} has no blocked lane to resume and no unreadable "
+                "report to recover"
+            )
         for lane in lanes:
             self._store.resume_lane(run_id, lane.lane_id, note)
         return [
