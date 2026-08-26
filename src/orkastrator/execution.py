@@ -78,6 +78,8 @@ class OrcaGraphController(Protocol):
 
     async def messages(self, orca_run_id: str, limit: int = 200) -> list[JsonObject]: ...
 
+    async def reply(self, orca_run_id: str, message_id: str, body: str) -> JsonObject: ...
+
     async def create_task(self, spec: str, dependencies: list[str]) -> tuple[str, JsonObject]: ...
 
     async def tasks(self, orca_run_id: str) -> list[JsonObject]: ...
@@ -179,9 +181,10 @@ class ExecutionController:
             raise ValueError(f"run {run_id} cannot be accepted from status {run.status}")
         else:
             self._require_authorization(run_id)
-            orca_run_id = self._store.run(run_id).orca_run_id
-            if orca_run_id is None:
+            accepted_run_id = self._store.run(run_id).orca_run_id
+            if accepted_run_id is None:
                 raise ValueError(f"run {run_id} was accepted without an Orca Run")
+            orca_run_id = accepted_run_id
         # Task and worker commands resolve against the Run bound to this coordinator
         # terminal. Recovering an existing Run, or accepting from a later process,
         # leaves that binding pointing elsewhere, so rebind before touching Tasks.
@@ -815,9 +818,7 @@ class ExecutionController:
                             _govern_validation_requirement(
                                 requirement,
                                 coverage_configured=(
-                                    await self._git.pytest_coverage_configured(
-                                        stage.worktree_id
-                                    )
+                                    await self._git.pytest_coverage_configured(stage.worktree_id)
                                 ),
                             )
                             for requirement in item.finding.validation
@@ -1097,9 +1098,7 @@ class ExecutionController:
                 self._finding_for_stage(run_id, stage),
                 FindingReason.AMBIGUOUS_RESULT,
             )
-        self._store.mark_stage_processed(
-            run_id, stage, reason, rejection_kind=rejection_kind
-        )
+        self._store.mark_stage_processed(run_id, stage, reason, rejection_kind=rejection_kind)
 
     def _escalate(self, run_id: str, finding: FindingRecord, reason: FindingReason) -> None:
         self._store.set_finding_state(
@@ -1229,9 +1228,9 @@ class ExecutionController:
             # same frozen output until it blocked. Only an integrated receipt above
             # is terminal; these two are facts about one attempt.
             if readjudicated:
-                receipt = self._store.reopen_integration(
-                    run_id, finding, attempt=identity
-                ) or receipt
+                receipt = (
+                    self._store.reopen_integration(run_id, finding, attempt=identity) or receipt
+                )
             if receipt.status != "starting":
                 self._escalate(
                     run_id,
@@ -2054,6 +2053,7 @@ class ExecutionController:
         self._store.record_worker_checkout(run_id, stage.stage_id, worktree_id)
         if lane.base_sha is not None:
             return None
+        resolution: BaseResolution | None = None
         if before_dispatch:
             resolution = await self._git.resolve_base(worktree_id, lane.base_ref)
             await self._git.pin_base(worktree_id, resolution.base_sha)
@@ -2063,7 +2063,7 @@ class ExecutionController:
                 worktree_id, lane.base_ref
             )
         self._store.record_worker_checkout(run_id, stage.stage_id, worktree_id, base_sha)
-        return resolution if before_dispatch else None
+        return resolution
 
     def _placement(self, run_id: str, lane: LaneRecord, stage: StageRecord) -> WorkerPlacement:
         """Resolve the exact existing or isolated checkout for one role."""
@@ -2935,9 +2935,7 @@ class ExecutionController:
                 + len(_CONFLICT_HUNK_TRUNCATION_MARKER.encode())
             )
             if hunk_budget > 0:
-                conflict_context = self._fixer_conflict_context(
-                    finding, max_hunk_bytes=hunk_budget
-                )
+                conflict_context = self._fixer_conflict_context(finding, max_hunk_bytes=hunk_budget)
                 prefix = prefix_head + conflict_context + prefix_tail
             return await self._stage_spec_with_frozen_diff(
                 prefix, context, lane_record, stage, run_id
@@ -3403,9 +3401,7 @@ def _govern_validation_requirement(
             governed.append("--no-cov")
         governed.extend(("-p", "no:cacheprovider"))
     governed.extend(pytest_arguments)
-    return requirement.model_copy(
-        update={"command": shlex.join(governed), "baseline_result": None}
-    )
+    return requirement.model_copy(update={"command": shlex.join(governed), "baseline_result": None})
 
 
 def _pytest_arguments(arguments: list[str]) -> list[str] | None:
@@ -3485,9 +3481,7 @@ def _is_scoped_pytest(arguments: list[str]) -> bool:
         argument = arguments[index]
         if (
             argument in selectors
-            or argument.startswith(
-                ("-k=", "-m=", "--deselect=", "--ignore=", "--ignore-glob=")
-            )
+            or argument.startswith(("-k=", "-m=", "--deselect=", "--ignore=", "--ignore-glob="))
             or "::" in argument
         ):
             return True
@@ -3579,9 +3573,7 @@ def _validation_failure_fingerprint(output: str) -> str:
     """Remove pytest summary timing while preserving assertion evidence."""
 
     summary, separator, evidence = output.partition("\n")
-    stable_summary = _PYTEST_SUMMARY_DURATION.sub(
-        r"\g<prefix>in <duration>\g<suffix>", summary
-    )
+    stable_summary = _PYTEST_SUMMARY_DURATION.sub(r"\g<prefix>in <duration>\g<suffix>", summary)
     return separator.join((stable_summary, evidence)) if separator else stable_summary
 
 

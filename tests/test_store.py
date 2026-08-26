@@ -257,9 +257,7 @@ def test_reconcile_lane_head_reactivates_terminal_runs_and_is_idempotent(
         "integration_ids": ["integration-1"],
         "note": "recover legacy divergence",
     }
-    actions = [
-        event for event in store.events(run_id) if event["kind"] == "supervisor_hand_action"
-    ]
+    actions = [event for event in store.events(run_id) if event["kind"] == "supervisor_hand_action"]
     assert actions[-1]["payload"] == {
         "command": "reconcile-head",
         "target": lane.name,
@@ -277,12 +275,14 @@ def test_reconcile_lane_head_reactivates_terminal_runs_and_is_idempotent(
         note="idempotent retry",
     )
     assert repeated.integration_head_sha == "c" * 40
-    assert len(
-        [event for event in store.events(run_id) if event["kind"] == "lane_head_reconciled"]
-    ) == 1
-    assert len(
-        [event for event in store.events(run_id) if event["kind"] == "supervisor_hand_action"]
-    ) == 1
+    assert (
+        len([event for event in store.events(run_id) if event["kind"] == "lane_head_reconciled"])
+        == 1
+    )
+    assert (
+        len([event for event in store.events(run_id) if event["kind"] == "supervisor_hand_action"])
+        == 1
+    )
 
     with pytest.raises(ValueError, match="changed during reconciliation"):
         store.reconcile_lane_head(
@@ -326,9 +326,7 @@ def test_record_integration_head_enforces_reservation_and_base_and_records_atomi
         base_sha="b" * 40,
     )
 
-    store.record_integration_head(
-        run_id, first, base_sha="b" * 40, integrated_sha="c" * 40
-    )
+    store.record_integration_head(run_id, first, base_sha="b" * 40, integrated_sha="c" * 40)
     recorded = store.integration(first.finding_key, first.round)
     assert recorded is not None
     assert recorded.integration_id == first_receipt.integration_id
@@ -343,9 +341,7 @@ def test_record_integration_head_enforces_reservation_and_base_and_records_atomi
         validation_results=[],
     )
     with pytest.raises(ValueError, match="not reserved"):
-        store.record_integration_head(
-            run_id, first, base_sha="c" * 40, integrated_sha="d" * 40
-        )
+        store.record_integration_head(run_id, first, base_sha="c" * 40, integrated_sha="d" * 40)
 
     second_receipt = store.begin_integration(
         run_id,
@@ -357,9 +353,7 @@ def test_record_integration_head_enforces_reservation_and_base_and_records_atomi
     )
     assert second_receipt.status == "starting"
     with pytest.raises(ValueError, match="base changed"):
-        store.record_integration_head(
-            run_id, second, base_sha="b" * 40, integrated_sha="e" * 40
-        )
+        store.record_integration_head(run_id, second, base_sha="b" * 40, integrated_sha="e" * 40)
     unchanged = store.integration(second.finding_key, second.round)
     assert unchanged is not None
     assert unchanged.integrated_sha is None
@@ -636,9 +630,7 @@ def test_settling_a_finding_records_the_decision_and_retires_its_live_stage(
     assert not store.reserve_stage_start(
         run_id, retired, max_workers=4, max_lanes=4, max_lane_fixers=2
     )
-    action = [
-        item for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"
-    ][-1]
+    action = [item for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"][-1]
     assert action["payload"] == {
         "command": "settle",
         "target": finding.finding_id,
@@ -672,9 +664,7 @@ def test_recording_reap_actions_persists_terminal_and_run_outcomes(tmp_path: Pat
     )
 
     actions = [
-        item["payload"]
-        for item in store.events(run_id)
-        if item["kind"] == "supervisor_hand_action"
+        item["payload"] for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"
     ]
     assert actions == [
         {
@@ -1090,9 +1080,7 @@ def test_reopening_a_finding_that_settled_on_the_merits_needs_force(tmp_path: Pa
     assert isinstance(payload, dict)
     assert payload["from_phase"] == "resolved"
     assert payload["forced"] is True
-    action = [
-        item for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"
-    ][-1]
+    action = [item for item in store.events(run_id) if item["kind"] == "supervisor_hand_action"][-1]
     assert action["payload"] == {
         "command": "reopen",
         "target": finding.finding_id,

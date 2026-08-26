@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from orkastrator.runners import MAX_OUTPUT, condense
 
 PYTEST_PASS = """\
@@ -45,7 +47,7 @@ FAILED tests/test_overview_redraft.py::test_unanswered_email_has_no_missing_draf
 """
 
 
-def test_a_passing_pytest_run_condenses_to_its_counts():
+def test_a_passing_pytest_run_condenses_to_its_counts() -> None:
     """The dots and the warnings block say nothing the summary line does not."""
 
     result = condense(PYTEST_PASS, returncode=0, satisfied=True)
@@ -58,7 +60,7 @@ def test_a_passing_pytest_run_condenses_to_its_counts():
     assert len(result) < len(PYTEST_PASS) / 8
 
 
-def test_a_failing_pytest_run_keeps_the_assertion_that_failed():
+def test_a_failing_pytest_run_keeps_the_assertion_that_failed() -> None:
     """A fixer cannot act on a count alone, so the failure survives in full."""
 
     result = condense(PYTEST_FAIL, returncode=1, satisfied=False)
@@ -71,7 +73,7 @@ def test_a_failing_pytest_run_keeps_the_assertion_that_failed():
     assert "collected 3 items" not in result
 
 
-def test_an_absence_check_that_passes_by_failing_is_condensed_as_a_pass():
+def test_an_absence_check_that_passes_by_failing_is_condensed_as_a_pass() -> None:
     """`satisfied` is the supervisor's verdict, not a re-derivation of the exit code.
 
     `rg PATTERN path` exits 1 once the symbol is gone, which is exactly what a
@@ -84,7 +86,7 @@ def test_an_absence_check_that_passes_by_failing_is_condensed_as_a_pass():
     assert passing == "2855 passed, 26 skipped, 8 warnings, 81 subtests passed in 95.72s"
 
 
-def test_more_failures_than_fit_are_counted_rather_than_silently_dropped():
+def test_more_failures_than_fit_are_counted_rather_than_silently_dropped() -> None:
     blocks = "\n".join(
         f"_______________ test_case_{index} _______________\n"
         f">       assert {index} == 0\n"
@@ -101,7 +103,7 @@ def test_more_failures_than_fit_are_counted_rather_than_silently_dropped():
     assert "test_case_29" not in result
 
 
-def test_typescript_errors_survive_and_the_rest_does_not():
+def test_typescript_errors_survive_and_the_rest_does_not() -> None:
     output = """\
 > tsc -b
 
@@ -118,7 +120,7 @@ Found 2 errors in 2 files.
     assert "> tsc -b" not in result
 
 
-def test_a_node_test_runner_pass_condenses_to_its_tap_counts():
+def test_a_node_test_runner_pass_condenses_to_its_tap_counts() -> None:
     output = """\
 TAP version 13
 # Subtest: the Email row's send-back control follows the served disposition
@@ -143,7 +145,7 @@ ok 1 - the Email row's send-back control follows the served disposition
     assert "TAP version 13" not in result
 
 
-def test_a_node_test_runner_failure_keeps_the_failing_assertion_line():
+def test_a_node_test_runner_failure_keeps_the_failing_assertion_line() -> None:
     output = """\
 TAP version 13
 not ok 1 - the Email row's send-back control follows the served disposition
@@ -159,7 +161,7 @@ not ok 1 - the Email row's send-back control follows the served disposition
     assert "not ok 1 - the Email row's send-back control" in result
 
 
-def test_an_unrecognised_runner_keeps_both_ends_not_only_the_tail():
+def test_an_unrecognised_runner_keeps_both_ends_not_only_the_tail() -> None:
     """A tool that prints its fatal error first must not lose it to a tail.
 
     This is the whole reason the fallback is not `output[-8000:]`: the previous
@@ -177,23 +179,25 @@ def test_an_unrecognised_runner_keeps_both_ends_not_only_the_tail():
     assert len(result) <= MAX_OUTPUT
 
 
-def test_short_unrecognised_output_is_returned_whole():
+def test_short_unrecognised_output_is_returned_whole() -> None:
     output = "error: no such option: --locked\n"
 
     assert condense(output, returncode=2, satisfied=False) == output
 
 
-def test_empty_output_says_so_only_when_the_check_failed():
+def test_empty_output_says_so_only_when_the_check_failed() -> None:
     assert condense("", returncode=0, satisfied=True) == ""
     assert condense("   \n", returncode=3, satisfied=False) == "no output; exit status 3"
 
 
-def test_a_parser_that_raises_falls_back_instead_of_failing_the_validation(monkeypatch):
+def test_a_parser_that_raises_falls_back_instead_of_failing_the_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A bug in here must never be the thing that kills a monitor tick."""
 
     from orkastrator import runners
 
-    def explode(*_args, **_kwargs):
+    def explode(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("parser bug")
 
     monkeypatch.setattr(runners, "_condense", explode)
@@ -201,7 +205,7 @@ def test_a_parser_that_raises_falls_back_instead_of_failing_the_validation(monke
     assert runners.condense(PYTEST_PASS, returncode=0, satisfied=True) == PYTEST_PASS
 
 
-def test_condensed_output_never_exceeds_the_contract_field():
+def test_condensed_output_never_exceeds_the_contract_field() -> None:
     """`ValidationResult.output` caps at 8000, so nothing here may return more."""
 
     blocks = "\n".join(
@@ -221,7 +225,7 @@ def test_condensed_output_never_exceeds_the_contract_field():
 KASHH_QUIET_XDIST_PASS = "bringing up nodes...\nbringing up nodes...\n\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32mu\x1b[0m\x1b[32mu\x1b[0m\x1b[32mu\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\n.venv/lib/python3.12/site-packages/graphiti_core/driver/search_interface/search_interface.py:22\n  /home/kas/dev/kashh/.venv/lib/python3.12/site-packages/graphiti_core/driver/search_interface/search_interface.py:22: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/\n    class SearchInterface(BaseModel):\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n\x1b[33m\x1b[32m2859 passed\x1b[0m, \x1b[33m\x1b[1m26 skipped\x1b[0m, \x1b[33m\x1b[1m8 warnings\x1b[0m, \x1b[32m81 subtests passed\x1b[0m\x1b[33m in 93.89s (0:01:33)\x1b[0m\x1b[0m\n"  # noqa: E501
 
 
-def test_the_real_captured_kashh_run_condenses_to_one_line():
+def test_the_real_captured_kashh_run_condenses_to_one_line() -> None:
     result = condense(KASHH_QUIET_XDIST_PASS, returncode=0, satisfied=True)
 
     assert result == "2859 passed, 26 skipped, 8 warnings, 81 subtests passed in 93.89s (0:01:33)"
@@ -229,7 +233,7 @@ def test_the_real_captured_kashh_run_condenses_to_one_line():
     assert "warnings summary" not in result
 
 
-def test_colour_codes_do_not_defeat_the_parser():
+def test_colour_codes_do_not_defeat_the_parser() -> None:
     """Runners colour whenever they think a terminal is watching, and under `-n`
     pytest decides that from the parent rather than from the pipe it is writing
     to. A pattern that only matches uncoloured output matches nothing in practice.

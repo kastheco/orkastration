@@ -6,6 +6,7 @@ Its numbers get compared across runs, so the counting rules are pinned here.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from orkastrator.models import (
     AllowedWriteScope,
@@ -64,7 +65,7 @@ def _finding(
     round: int = 1,
     origin: str = "initial_review",
     paths: tuple[str, ...] = ("a.py",),
-):
+) -> FindingRecord:
     return FindingRecord(
         finding_key=f"{lane_id}:{finding_id}",
         lane_id=lane_id,
@@ -111,7 +112,7 @@ def _stage(
     )
 
 
-def test_only_per_finding_roles_count_against_dispatches_per_finding():
+def test_only_per_finding_roles_count_against_dispatches_per_finding() -> None:
     """A worker and an initial reviewer run once per lane however many findings land.
 
     Counting them per finding would make a lane that found one thing look twice
@@ -141,7 +142,7 @@ def test_only_per_finding_roles_count_against_dispatches_per_finding():
     assert report.dispatches_per_finding == 2.0
 
 
-def test_scheduling_the_same_work_twice_counts_as_a_repeat():
+def test_scheduling_the_same_work_twice_counts_as_a_repeat() -> None:
     """(lane, role, finding, round) identifies one unit of work.
 
     A second stage for that tuple exists because the first did not stick, and
@@ -169,8 +170,8 @@ def test_scheduling_the_same_work_twice_counts_as_a_repeat():
     assert report.findings[0].repeats == 1
 
 
-def test_escalations_are_grouped_by_reason_and_attributed_to_their_finding():
-    events = [
+def test_escalations_are_grouped_by_reason_and_attributed_to_their_finding() -> None:
+    events: list[dict[str, object]] = [
         {
             "kind": "escalation_recorded",
             "payload": {"finding_id": "finding-one", "reason": "ambiguous_result"},
@@ -201,10 +202,10 @@ def test_escalations_are_grouped_by_reason_and_attributed_to_their_finding():
     assert by_id["finding-two"].escalations == ("validation_failed",)
 
 
-def test_rejections_are_grouped_by_cause_not_by_message():
+def test_rejections_are_grouped_by_cause_not_by_message() -> None:
     """Rejection messages embed identifiers, so raw strings histogram to one each."""
 
-    events = [
+    events: list[dict[str, object]] = [
         {"kind": "stage_started", "payload": {}},
         {"kind": "stage_started", "payload": {}},
         {
@@ -232,7 +233,7 @@ def test_rejections_are_grouped_by_cause_not_by_message():
     assert report.rejection_rate == 1.0
 
 
-def test_rejections_separate_the_supervisor_own_faults_from_the_agent_ones():
+def test_rejections_separate_the_supervisor_own_faults_from_the_agent_ones() -> None:
     """Every reason shares one prefix, so matching it first hides eight causes."""
 
     reasons = [
@@ -245,7 +246,7 @@ def test_rejections_separate_the_supervisor_own_faults_from_the_agent_ones():
         "String should match pattern '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'",
         "invalid structured result: nothing recognisable at all",
     ]
-    events = [{"kind": "stage_started", "payload": {}} for _ in reasons]
+    events: list[dict[str, object]] = [{"kind": "stage_started", "payload": {}} for _ in reasons]
     events += [
         {"kind": "stage_result_rejected", "payload": {"reason": reason, "stage_id": f"s{index}"}}
         for index, reason in enumerate(reasons)
@@ -269,7 +270,7 @@ def test_rejections_separate_the_supervisor_own_faults_from_the_agent_ones():
     }
 
 
-def test_an_open_stage_is_measured_to_now_and_a_released_one_to_its_last_touch():
+def test_an_open_stage_is_measured_to_now_and_a_released_one_to_its_last_touch() -> None:
     """Every ratio above counts finished work, so only this line sees a stuck run."""
 
     start = datetime(2026, 8, 22, 6, 0, tzinfo=UTC)
@@ -309,7 +310,7 @@ def test_an_open_stage_is_measured_to_now_and_a_released_one_to_its_last_touch()
     assert "1 stages  median 360m" in rendered
 
 
-def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished():
+def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished() -> None:
     """Two reports of one settled run must be comparable, so `now` cannot leak in."""
 
     start = datetime(2026, 8, 22, 6, 0, tzinfo=UTC)
@@ -322,7 +323,7 @@ def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished():
             updated=datetime(2026, 8, 22, 7, 0, tzinfo=UTC),
         )
     ]
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "run_id": "run",
         "lanes": [_lane("lane", "demo")],
         "stages": stages,
@@ -340,10 +341,10 @@ def test_a_finished_run_reports_the_same_minutes_however_long_ago_it_finished():
     assert early.live_stages == late.live_stages == ()
 
 
-def test_late_stages_are_grouped_by_behaviour_not_by_the_ratio_that_proves_it():
+def test_late_stages_are_grouped_by_behaviour_not_by_the_ratio_that_proves_it() -> None:
     """A poll loop's ratio moves every observation; the histogram must not."""
 
-    events = [
+    events: list[dict[str, object]] = [
         {"kind": "stage_overdue", "payload": {"activity": "exec repeated 9/10 turns unchanged"}},
         {"kind": "stage_overdue", "payload": {"activity": "exec repeated 16/21 turns unchanged"}},
         {"kind": "stage_overdue", "payload": {"activity": "exec"}},
@@ -372,7 +373,7 @@ def test_late_stages_are_grouped_by_behaviour_not_by_the_ratio_that_proves_it():
     assert "9/10" not in rendered
 
 
-def test_a_run_with_no_late_stages_says_so_without_an_empty_histogram():
+def test_a_run_with_no_late_stages_says_so_without_an_empty_histogram() -> None:
     report = build_report(
         run_id="run",
         lanes=[],
@@ -387,7 +388,7 @@ def test_a_run_with_no_late_stages_says_so_without_an_empty_histogram():
     assert "overdue stages were doing" not in render(report)
 
 
-def test_escalations_are_attributed_to_the_lane_whose_reviewer_produced_them():
+def test_escalations_are_attributed_to_the_lane_whose_reviewer_produced_them() -> None:
     """Run-wide totals cannot say which reviewer is writing unactionable findings."""
 
     findings = [
@@ -395,7 +396,7 @@ def test_escalations_are_attributed_to_the_lane_whose_reviewer_produced_them():
         _finding("lane-b", "finding-two"),
         _finding("lane-b", "finding-three"),
     ]
-    events = [
+    events: list[dict[str, object]] = [
         {
             "kind": "escalation_recorded",
             "payload": {"finding_id": "finding-one", "reason": "ambiguous"},
@@ -434,7 +435,7 @@ def test_escalations_are_attributed_to_the_lane_whose_reviewer_produced_them():
     assert "escalated=ambiguousx2" in rendered
 
 
-def test_an_empty_run_reports_zeroes_rather_than_dividing_by_zero():
+def test_an_empty_run_reports_zeroes_rather_than_dividing_by_zero() -> None:
     report = build_report(
         run_id="run",
         lanes=[],
@@ -451,7 +452,7 @@ def test_an_empty_run_reports_zeroes_rather_than_dividing_by_zero():
     assert "run run" in render(report)
 
 
-def test_the_rendered_report_leads_with_the_two_numbers_that_must_fall():
+def test_the_rendered_report_leads_with_the_two_numbers_that_must_fall() -> None:
     report = build_report(
         run_id="run",
         lanes=[_lane("lane", "demo")],
@@ -473,7 +474,7 @@ def test_the_rendered_report_leads_with_the_two_numbers_that_must_fall():
     assert "finding-one" in text
 
 
-def test_a_file_argued_over_by_several_findings_is_named_once_not_per_finding():
+def test_a_file_argued_over_by_several_findings_is_named_once_not_per_finding() -> None:
     """The signature of a loop that cannot settle: same file, new finding id."""
 
     findings = [
@@ -523,7 +524,7 @@ def test_a_file_argued_over_by_several_findings_is_named_once_not_per_finding():
     assert "quiet.py" not in rendered
 
 
-def test_one_finding_citing_a_file_six_times_is_not_six_findings():
+def test_one_finding_citing_a_file_six_times_is_not_six_findings() -> None:
     """De-duplicated per finding, so a many-hunk finding cannot fake a dispute."""
 
     report = build_report(

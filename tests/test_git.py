@@ -331,6 +331,7 @@ async def test_conflicting_commit_aborts_without_resetting_prior_head(tmp_path: 
     assert conflict is not None
     assert conflict.conflicted_paths == ["src/shared.py"]
     assert conflict.cleanly_applied_paths == ["src/clean.py"]
+    assert conflict.conflicted_hunks is not None
     assert "<<<<<<< HEAD" in conflict.conflicted_hunks
     assert ">>>>>>>" in conflict.conflicted_hunks
     await git.abort_cherry_pick(lane_id)
@@ -370,6 +371,7 @@ async def test_conflict_context_preserves_non_ascii_paths(tmp_path: Path) -> Non
     assert conflict is not None
     assert conflict.conflicted_paths == [target_path]
     assert conflict.cleanly_applied_paths == ["src/clean.py"]
+    assert conflict.conflicted_hunks is not None
     assert "<<<<<<< HEAD" in conflict.conflicted_hunks
     assert ">>>>>>>" in conflict.conflicted_hunks
     await git.abort_cherry_pick(lane_id)

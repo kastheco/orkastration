@@ -1602,9 +1602,7 @@ class StateStore:
             )
 
     @staticmethod
-    def _owner_settle_is_sticky(
-        session: Session, run_id: str, finding: FindingRow
-    ) -> bool:
+    def _owner_settle_is_sticky(session: Session, run_id: str, finding: FindingRow) -> bool:
         """Keep the latest owner decision authoritative until an explicit reopen."""
 
         actions = session.exec(
@@ -1977,8 +1975,7 @@ class StateStore:
             {
                 "origin": origin,
                 "dropped": [
-                    {"finding_id": finding_id, "reason": reason}
-                    for finding_id, reason in dropped
+                    {"finding_id": finding_id, "reason": reason} for finding_id, reason in dropped
                 ],
             },
         )
@@ -2602,9 +2599,7 @@ class StateStore:
             return bool(self._recoverable_report_stage_ids(session, run_id, lane_id))
 
     @staticmethod
-    def _recoverable_report_stage_ids(
-        session: Session, run_id: str, lane_id: str
-    ) -> list[str]:
+    def _recoverable_report_stage_ids(session: Session, run_id: str, lane_id: str) -> list[str]:
         """Return live lane-level attempts rejected because their report was unreadable.
 
         The reason-prefix fallback recognizes rows written before KAS-686 added
@@ -2666,11 +2661,7 @@ class StateStore:
             if not isinstance(stage_id, str):
                 continue
             stage = session.get(WorkflowStageRow, stage_id)
-            if (
-                stage is not None
-                and stage.finding_id is None
-                and ":resumed" not in stage.stage_key
-            ):
+            if stage is not None and stage.finding_id is None and ":resumed" not in stage.stage_key:
                 stage_ids.append(stage_id)
         return stage_ids
 

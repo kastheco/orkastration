@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlmodel import Session, select
@@ -49,6 +50,14 @@ from tests.factories import (
     initial_review_report_json,
     review_finding_data,
 )
+
+
+def _payload(event: dict[str, object]) -> dict[str, Any]:
+    """Recorded event payloads are opaque JSON; tests index them structurally."""
+
+    payload = event["payload"]
+    assert isinstance(payload, dict)
+    return payload
 
 
 def config(
@@ -348,9 +357,7 @@ class FakeOrca:
                 return str(start["dispatch_id"]), str(start["worktree_id"])
         return None
 
-    def complete_dispatched(
-        self, body: str | None = None, *, outcome: str = "succeeded"
-    ) -> None:
+    def complete_dispatched(self, body: str | None = None, *, outcome: str = "succeeded") -> None:
         resolved_body = worker_result() if body is None else body
         for task_id, task in self.tasks_by_id.items():
             if task["status"] != "dispatched":
@@ -762,7 +769,7 @@ async def test_worker_validation_uses_the_base_frozen_when_its_lane_started(
     assert git.resolve_calls == [("repo::/tmp/issue", "main")]
     assert git.pin_calls == [("repo::/tmp/issue", "d" * 40)]
     started = next(event for event in store.events(run_id) if event["kind"] == "stage_started")
-    assert started["payload"]["base_resolution"] == {
+    assert _payload(started)["base_resolution"] == {
         "requested_ref": "main",
         "requested_sha": "a" * 40,
         "resolved_ref": "origin/main",
@@ -866,7 +873,7 @@ async def test_unrenderable_frozen_diff_does_not_abort_the_monitor_tick(
     )
     assert [launch.role for launch in result.started] == [StageKind.INITIAL_REVIEWER]
     failures = [
-        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+        _payload(event) for event in store.events(run_id) if event["kind"] == "stage_start_failed"
     ]
     assert failures
     assert failures[-1]["released"] is True
@@ -1157,7 +1164,9 @@ async def test_initial_review_normalizes_a_differently_computed_diff_digest(
 
     assert result.status == "active"
     assert [record.finding_id for record in result.findings] == ["finding-1"]
-    assert store.findings(run_id)[0].contract.review_revision.diff_sha256 == "c" * 64
+    revision = store.findings(run_id)[0].contract.review_revision
+    assert revision is not None
+    assert revision.diff_sha256 == "c" * 64
 
 
 async def test_initial_review_rejects_a_diff_the_lane_checkout_cannot_reproduce(
@@ -1433,9 +1442,7 @@ async def test_re_review_validation_that_dirties_the_fixer_checkout_is_rejected(
     orca.complete_dispatched(
         re_review(
             "regression_introduced_by_fix",
-            new_findings=[
-                {"origin": "introduced_by_fix", "finding": review_finding_data(2)}
-            ],
+            new_findings=[{"origin": "introduced_by_fix", "finding": review_finding_data(2)}],
         )
     )
 
@@ -1883,8 +1890,7 @@ async def test_two_failed_validations_keep_the_lane_head_on_the_checkout_and_pub
     assert git.heads["repo::/tmp/issue"] == receipts[-1].integrated_sha
     assert store.lanes(run_id)[0].integration_head_sha == receipts[-1].integrated_sha
     assert all(
-        finding.escalation_reason is FindingReason.VALIDATION_FAILED
-        for finding in result.findings
+        finding.escalation_reason is FindingReason.VALIDATION_FAILED for finding in result.findings
     )
 
     for finding in result.findings:
@@ -2364,6 +2370,7 @@ async def test_conflict_retry_receives_paths_and_conflicted_hunks(tmp_path: Path
     retry_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
     assert "Conflicted paths:\n- tests/test_overview.py" in retry_spec
     assert "Cleanly-applied paths:\n- src/actions.py\n- src/data.py" in retry_spec
+    assert git.conflicted_hunks is not None
     assert git.conflicted_hunks in retry_spec
     assert "no partial application was retained" in retry_spec
 
@@ -2407,9 +2414,10 @@ async def test_conflict_retry_excludes_unattempted_source_paths(tmp_path: Path) 
     result = await value.monitor(run_id)
     retry_spec = str(orca.tasks_by_id[result.started[0].task_id]["spec"])
     assert "Cleanly-applied paths:\n(none)" in retry_spec
-    assert "src/actions.py" not in retry_spec.split("Cleanly-applied paths:\n", 1)[1].split(
-        "Conflicted", 1
-    )[0]
+    assert (
+        "src/actions.py"
+        not in retry_spec.split("Cleanly-applied paths:\n", 1)[1].split("Conflicted", 1)[0]
+    )
     assert "Conflicted hunk content: none captured" in retry_spec
     assert "Conflicted hunks:" not in retry_spec
 
@@ -2515,9 +2523,7 @@ async def test_a_conflict_at_the_round_ceiling_rebases_before_blocking(
     assert blocked.dispatch_base_sha == advanced_head
     assert blocked.effective_contract.allowed_write_scope.paths == ["src/file1.py"]
     conflict_evidence = [
-        item
-        for item in blocked.effective_contract.evidence
-        if "still conflicts" in item.claim
+        item for item in blocked.effective_contract.evidence if "still conflicts" in item.claim
     ]
     assert [item.location.path for item in conflict_evidence] == ["src/file1.py"]
 
@@ -2580,7 +2586,7 @@ async def test_a_lane_taken_down_by_its_own_finding_says_so_once(tmp_path: Path)
 
     assert store.lanes(run_id)[0].phase is LanePhase.BLOCKED
     reasons = [
-        event["payload"]["reason"]
+        _payload(event)["reason"]
         for event in store.events(run_id)
         if event["kind"] == "lane_blocked"
     ]
@@ -2765,7 +2771,7 @@ async def test_a_stage_that_committed_before_dying_is_not_dispatched_again(
     assert held.result_json is None
     events = [item for item in store.events(run_id) if item["kind"] == "stage_unreported_work_held"]
     assert len(events) == 1
-    assert events[0]["payload"]["dispatch_id"] == dispatch_id
+    assert _payload(events[0])["dispatch_id"] == dispatch_id
 
     # Every tick re-observes the same ready Task. Saying so once is a record;
     # saying so forever buries the rest of the run's history.
@@ -2967,7 +2973,7 @@ async def test_one_stage_that_cannot_start_does_not_park_the_rest_of_the_wave(
     assert stages["task-1"].phase is StagePhase.READY
     assert stages["task-2"].phase is StagePhase.DISPATCHED
     failures = [
-        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+        _payload(event) for event in store.events(run_id) if event["kind"] == "stage_start_failed"
     ]
     # One event per attempt, and every one of them handed the slot back.
     assert failures and all(failure["released"] is True for failure in failures)
@@ -2989,9 +2995,7 @@ async def test_repeated_start_failures_block_the_lane_instead_of_redispatching(
     assert stage.phase is StagePhase.FAILED
     assert result.lanes[0].phase is LanePhase.BLOCKED
     assert result.status == "blocked"
-    failures = [
-        event for event in store.events(run_id) if event["kind"] == "stage_start_failed"
-    ]
+    failures = [event for event in store.events(run_id) if event["kind"] == "stage_start_failed"]
     assert len(failures) == 3
 
     await value.monitor(run_id)
@@ -3029,7 +3033,7 @@ async def test_store_refusal_discards_the_worker_worktree_created_for_that_start
     assert len(orca.created_worktrees) == 1
     assert orca.discarded_worktrees == ["repo::/tmp/issue"]
     failures = [
-        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+        _payload(event) for event in store.events(run_id) if event["kind"] == "stage_start_failed"
     ]
     assert "already has another checkout" in str(failures[-1]["detail"])
 
@@ -3057,7 +3061,7 @@ async def test_a_timed_out_start_keeps_its_reservation_and_is_adopted_next_tick(
     assert stages["task-1"].phase is StagePhase.STARTING
     assert stages["task-1"].orca_dispatch_id is None
     failures = [
-        event["payload"] for event in store.events(run_id) if event["kind"] == "stage_start_failed"
+        _payload(event) for event in store.events(run_id) if event["kind"] == "stage_start_failed"
     ]
     assert [failure["released"] for failure in failures] == [False]
 
@@ -3079,9 +3083,9 @@ async def test_recovered_dispatch_clears_the_start_failure_streak(
     run_id = value.propose(proposal()).run_id
 
     await value.accept(run_id)
-    assert len(
-        [event for event in store.events(run_id) if event["kind"] == "stage_start_failed"]
-    ) == 2
+    assert (
+        len([event for event in store.events(run_id) if event["kind"] == "stage_start_failed"]) == 2
+    )
 
     orca.refuse_starts.remove("task-1")
     orca.timeout_starts.add("task-1")
@@ -3091,8 +3095,8 @@ async def test_recovered_dispatch_clears_the_start_failure_streak(
     stage = store.stages(run_id)[0]
     assert any(
         event["kind"] == "stage_started"
-        and event["payload"].get("recovered") is True
-        and event["payload"].get("stage_id") == stage.stage_id
+        and _payload(event).get("recovered") is True
+        and _payload(event).get("stage_id") == stage.stage_id
         for event in store.events(run_id)
     )
     store.sync_stage(run_id, stage.stage_id, StagePhase.READY, None)
@@ -3103,7 +3107,7 @@ async def test_recovered_dispatch_clears_the_start_failure_streak(
     failures = [
         event
         for event in store.events(run_id)
-        if event["kind"] == "stage_start_failed" and event["payload"]["released"] is True
+        if event["kind"] == "stage_start_failed" and _payload(event)["released"] is True
     ]
     assert len(failures) == 3
     assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
@@ -3207,7 +3211,7 @@ async def test_a_lane_blocked_for_the_same_reason_is_recorded_once(tmp_path: Pat
     store.block_lane(run_id, lane.lane_id, "and now the checkout is gone too")
 
     reasons = [
-        event["payload"]["reason"]
+        _payload(event)["reason"]
         for event in store.events(run_id)
         if event["kind"] == "lane_blocked"
     ]
@@ -3543,7 +3547,7 @@ async def test_publication_refuses_and_records_a_checkout_ahead_of_the_ledger(
         "checkout_head_sha": checkout_head_sha,
     }
     blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
-    assert blocked[-1]["payload"]["reason"] == (
+    assert _payload(blocked[-1])["reason"] == (
         f"lane checkout HEAD {checkout_head_sha} does not match recorded integration head "
         f"{recorded_head_sha}; refusing publication"
     )
@@ -3565,9 +3569,7 @@ async def test_publication_with_an_agreeing_checkout_uses_the_recorded_head(
 
     assert result.status == "complete"
     assert publisher.publish_calls == [("b" * 40, None)]
-    assert not [
-        event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"
-    ]
+    assert not [event for event in store.events(run_id) if event["kind"] == "lane_head_diverged"]
 
 
 async def test_publication_refuses_a_dirty_lane_checkout(tmp_path: Path) -> None:
@@ -3610,7 +3612,7 @@ async def test_publication_refuses_a_dirty_lane_checkout(tmp_path: Path) -> None
         "checkout_head_sha": recorded_head_sha,
     }
     blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
-    assert blocked[-1]["payload"]["reason"] == (
+    assert _payload(blocked[-1])["reason"] == (
         f"lane checkout at recorded integration head {recorded_head_sha} carries "
         "uncommitted work; refusing publication"
     )
@@ -3747,9 +3749,7 @@ async def test_unreadable_worker_report_can_be_resumed_and_reconciled(
     value.resume(run_id, None, "re-report the committed worker result")
     resumed = await value.monitor(run_id)
 
-    retired = next(
-        stage for stage in resumed.stages if stage.stage_id == rejected_worker.stage_id
-    )
+    retired = next(stage for stage in resumed.stages if stage.stage_id == rejected_worker.stage_id)
     replacement = next(
         stage
         for stage in resumed.stages
@@ -3817,7 +3817,7 @@ async def test_legacy_work_failure_is_not_resumed_as_a_report_failure(
         row = next(
             row
             for row in rows
-            if json.loads(row.payload_json).get("stage_id") == rejection["payload"]["stage_id"]
+            if json.loads(row.payload_json).get("stage_id") == _payload(rejection)["stage_id"]
         )
         assert row is not None
         payload = json.loads(row.payload_json)
@@ -3950,9 +3950,7 @@ async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sh
     assert receipt.merge_sha == "e" * 40
     assert receipt.ci is not None
     assert receipt.ci.status == "passed"
-    assert [(check.name, check.status) for check in receipt.ci.checks] == [
-        ("pytest", "passed")
-    ]
+    assert [(check.name, check.status) for check in receipt.ci.checks] == [("pytest", "passed")]
 
 
 async def test_publication_reobserves_a_published_head_with_a_new_passing_rollup(
@@ -4043,7 +4041,7 @@ async def test_pending_ci_times_out_with_the_pull_request_left_open(
     assert receipt.landed is False
     assert receipt.ci is None
     blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
-    reason = blocked[-1]["payload"]["reason"]
+    reason = _payload(blocked[-1])["reason"]
     assert reason == (
         "final-gate timeout: required checks did not conclude within 60 seconds; "
         "pull request left open at https://github.com/example/repo/pull/1"
@@ -4226,9 +4224,7 @@ async def test_publication_conflict_without_deterministic_scope_blocks_the_lane(
     assert result.lanes[0].phase is LanePhase.BLOCKED
     blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
     assert blocked
-    assert (
-        blocked[-1]["payload"]["reason"] == "publication conflict has no deterministic lane scope"
-    )
+    assert _payload(blocked[-1])["reason"] == "publication conflict has no deterministic lane scope"
 
 
 class ArmedGit(FakeGit):
@@ -4285,7 +4281,7 @@ async def _blocked_reason_after_conflict(
 
     blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
     assert blocked, store.events(run_id)
-    reason = blocked[-1]["payload"]["reason"]
+    reason = _payload(blocked[-1])["reason"]
     assert isinstance(reason, str)
     return reason, result
 
@@ -4392,7 +4388,7 @@ async def test_a_resolved_finding_with_no_integrated_fix_blocks_instead_of_publi
     assert result.lanes[0].phase is LanePhase.BLOCKED
     assert publisher.publish_calls == []
     blocked = [item for item in store.events(run_id) if item["kind"] == "lane_blocked"]
-    assert blocked[-1]["payload"]["reason"] == (
+    assert _payload(blocked[-1])["reason"] == (
         f"lane is settled but {finding.finding_id} has no integrated fix"
     )
 
@@ -4573,7 +4569,7 @@ async def test_publication_survives_an_unreadable_lane_checkout(tmp_path: Path) 
     assert publisher.publish_calls == []
     blocked = [event for event in store.events(run_id) if event["kind"] == "lane_blocked"]
     assert blocked
-    reason = blocked[-1]["payload"]["reason"]
+    reason = _payload(blocked[-1])["reason"]
     assert "rev-parse failed: unreadable lane checkout" in reason
     assert "unchanged over 3 publication passes" in reason
 
@@ -4829,8 +4825,7 @@ async def test_supervisor_evidence_caps_optional_fixer_proof_at_contract_limit(
     await value.accept(run_id)
     await advance_to_fixer(value, orca, run_id, review_finding_data())
     extra = [
-        {"command": f"proof-{index}", "status": "passed", "output": "passed"}
-        for index in range(64)
+        {"command": f"proof-{index}", "status": "passed", "output": "passed"} for index in range(64)
     ]
     orca.complete_dispatched(fix_attempt(validation=extra))
 
@@ -4903,14 +4898,12 @@ async def test_one_unprovable_finding_does_not_discard_the_rest_of_the_review(
 
     assert [finding.finding_id for finding in result.findings] == ["finding-2"]
     # The review survived, so the stage was never rejected.
-    assert not [
-        event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"
-    ]
+    assert not [event for event in store.events(run_id) if event["kind"] == "stage_result_rejected"]
     dropped = [event for event in store.events(run_id) if event["kind"] == "findings_unprovable"]
     assert len(dropped) == 1
-    assert dropped[0]["payload"]["origin"] == "initial_review"
-    assert [item["finding_id"] for item in dropped[0]["payload"]["dropped"]] == ["finding-1"]
-    assert "without a shell" in dropped[0]["payload"]["dropped"][0]["reason"]
+    assert _payload(dropped[0])["origin"] == "initial_review"
+    assert [item["finding_id"] for item in _payload(dropped[0])["dropped"]] == ["finding-1"]
+    assert "without a shell" in _payload(dropped[0])["dropped"][0]["reason"]
 
 
 async def test_a_review_requiring_shell_syntax_is_rejected_at_the_reviewer(
@@ -5037,8 +5030,7 @@ async def test_supervisor_freezes_scoped_pytest_intent_as_a_runnable_command(
         "uv run --extra dev pytest -p no:warnings",
         "uv run --extra dev pytest -W error",
         "uv run --extra dev pytest --pastebin failed",
-        "uv run --extra dev pytest --no-cov -p no:cacheprovider "
-        "--deselect=tests/test_cli.py",
+        "uv run --extra dev pytest --no-cov -p no:cacheprovider --deselect=tests/test_cli.py",
         "uv run --extra dev pytest --no-cov -p no:cacheprovider --setup-only",
     ]
     assert all(item.baseline_result is not None for item in requirements)
@@ -5116,10 +5108,10 @@ async def test_validation_failure_identical_at_base_and_fix_head_does_not_spend_
             self.validation_calls.append([item.command for item in requirements])
             duration = "0.41s" if len(self.validation_calls) == 1 else "0.73s"
             return [
-                    ValidationResult(
-                        command=item.command,
-                        status="failed",
-                        output=f"1 failed, 19 passed in {duration}\ncoverage threshold not met",
+                ValidationResult(
+                    command=item.command,
+                    status="failed",
+                    output=f"1 failed, 19 passed in {duration}\ncoverage threshold not met",
                 )
                 for item in requirements
             ]
@@ -5134,18 +5126,16 @@ async def test_validation_failure_identical_at_base_and_fix_head_does_not_spend_
         {"command": "uv run pytest -q tests/test_execution.py", "expected": "passes"}
     ]
     await advance_to_fixer(value, orca, run_id, finding)
-    command = (
-        "uv run --extra dev pytest --no-cov -p no:cacheprovider -q tests/test_execution.py"
-    )
+    command = "uv run --extra dev pytest --no-cov -p no:cacheprovider -q tests/test_execution.py"
 
     orca.complete_dispatched(
         fix_attempt(
             validation=[
-                    {
-                        "command": command,
-                        "status": "failed",
-                        "output": "fixer-reported output is ignored",
-                    }
+                {
+                    "command": command,
+                    "status": "failed",
+                    "output": "fixer-reported output is ignored",
+                }
             ]
         )
     )
@@ -5260,11 +5250,7 @@ async def test_fixer_cannot_claim_the_base_failure_without_reproducing_it_at_hea
     command = "uv run --extra dev pytest"
 
     orca.complete_dispatched(
-        fix_attempt(
-            validation=[
-                {"command": command, "status": "failed", "output": "base failure"}
-            ]
-        )
+        fix_attempt(validation=[{"command": command, "status": "failed", "output": "base failure"}])
     )
     result = await value.monitor(run_id)
 
@@ -5301,9 +5287,7 @@ async def test_a_retired_reopened_failure_no_longer_latches_its_lane(tmp_path: P
     orca.complete_dispatched(fix_attempt())
     await value.monitor(run_id)
     failed_stage = next(
-        stage
-        for stage in store.stages(run_id)
-        if stage.role is StageKind.RE_REVIEWER
+        stage for stage in store.stages(run_id) if stage.role is StageKind.RE_REVIEWER
     )
     orca.fail_dispatched()
     await value.monitor(run_id)
@@ -5317,9 +5301,7 @@ async def test_a_retired_reopened_failure_no_longer_latches_its_lane(tmp_path: P
     )
     recovered = await value.monitor(run_id)
 
-    retired = next(
-        item for item in store.stages(run_id) if item.stage_id == failed_stage.stage_id
-    )
+    retired = next(item for item in store.stages(run_id) if item.stage_id == failed_stage.stage_id)
     assert retired.phase is StagePhase.FAILED
     assert ":reopened" in retired.stage_key
     assert recovered.status == "active"
@@ -5613,7 +5595,7 @@ async def test_a_rebased_retry_lands_and_the_round_slot_follows_it(tmp_path: Pat
     # is on the record rather than overwritten in silence.
     assert landed.fixer_commit_sha == fixer_sha("finding-2", 3)
     reopened = [item for item in store.events(run_id) if item["kind"] == "integration_reopened"]
-    assert reopened and reopened[-1]["payload"]["previous_commit_sha"] == fixer_sha("finding-2", 1)
+    assert reopened and _payload(reopened[-1])["previous_commit_sha"] == fixer_sha("finding-2", 1)
 
 
 async def test_resolving_the_last_blocked_finding_releases_publication_in_the_same_tick(
@@ -5854,7 +5836,7 @@ async def test_an_overdue_stage_reports_a_poll_loop_rather_than_only_minutes(
 
     assert [item.activity for item in result.overdue] == ["exec repeated 9/10 turns unchanged"]
     event = next(item for item in store.events(run_id) if item["kind"] == "stage_overdue")
-    assert event["payload"]["activity"] == "exec repeated 9/10 turns unchanged"
+    assert _payload(event)["activity"] == "exec repeated 9/10 turns unchanged"
 
 
 async def test_a_worker_that_cannot_be_read_reports_nothing_rather_than_idle(
@@ -6154,7 +6136,7 @@ async def test_a_run_accepted_before_the_policy_was_stored_says_so_rather_than_n
     recorded = [
         item for item in store.events(run_id) if item["kind"] == "supervisor_reauthorized_policy"
     ]
-    assert recorded[-1]["payload"]["changes"] == []
+    assert _payload(recorded[-1])["changes"] == []
 
 
 async def test_an_unchanged_run_records_the_policy_it_was_accepted_under(tmp_path: Path) -> None:

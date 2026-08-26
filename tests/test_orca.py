@@ -263,9 +263,7 @@ async def test_start_worker_uses_model_effort_and_new_worktree() -> None:
 
 
 async def test_create_worktree_pins_the_requested_base_before_worker_start() -> None:
-    runner = FakeRunner(
-        [{"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}}]
-    )
+    runner = FakeRunner([{"ok": True, "result": {"worktree": {"id": "repo::/tmp/issue-123"}}}])
     client = OrcaClient(runner)
 
     worktree_id, _ = await client.create_worktree(
@@ -309,9 +307,7 @@ async def test_start_worker_reuses_lane_worktree() -> None:
 
 
 async def test_start_worker_rejects_a_reported_failure() -> None:
-    runner = FakeRunner(
-        [{"ok": True, "result": {"state": "failed", "dispatchId": "dispatch-2"}}]
-    )
+    runner = FakeRunner([{"ok": True, "result": {"state": "failed", "dispatchId": "dispatch-2"}}])
 
     with pytest.raises(OrcaError, match="worker start reported failure"):
         await OrcaClient(runner).start_worker(

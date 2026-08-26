@@ -319,14 +319,10 @@ def test_settle_is_refused_while_a_monitor_holds_the_run(
             raise AssertionError("settle wrote while the monitor held the run")
 
     settings = SimpleNamespace(database_path=tmp_path / "state.sqlite3")
-    monkeypatch.setattr(
-        cli, "_components", lambda: (settings, StoreThatMustNotWrite(), FakeOrca())
-    )
+    monkeypatch.setattr(cli, "_components", lambda: (settings, StoreThatMustNotWrite(), FakeOrca()))
 
     with run_lock(settings.database_path, "run-1"):
-        refused = runner.invoke(
-            cli.app, ["settle", "run-1", "--finding", "finding-1", "--json"]
-        )
+        refused = runner.invoke(cli.app, ["settle", "run-1", "--finding", "finding-1", "--json"])
 
     assert refused.exit_code != 0
     assert "already being driven by" in json.loads(refused.stderr)["error"]
@@ -493,9 +489,7 @@ def test_watch_survives_a_terminal_lane_while_another_stage_is_dispatched(
         ),
     ]
 
-    result = runner.invoke(
-        cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"]
-    )
+    result = runner.invoke(cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"])
 
     assert result.exit_code == 1
     assert FakeController.monitor_results == []
@@ -541,9 +535,7 @@ def test_watch_survives_every_lane_terminal_while_a_stage_is_still_dispatched(
         ),
     ]
 
-    result = runner.invoke(
-        cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"]
-    )
+    result = runner.invoke(cli.app, ["monitor", "run-1", "--watch", "--interval", "0.25", "--json"])
 
     assert result.exit_code == 1
     # Every queued tick was consumed, so the watch did not stop on either of the
@@ -670,9 +662,7 @@ def test_record_external_merge_persists_the_observed_landing(
         def __init__(self, **_: object) -> None:
             pass
 
-        async def record_external_merge(
-            self, receipt: PublicationReceipt
-        ) -> PublicationReceipt:
+        async def record_external_merge(self, receipt: PublicationReceipt) -> PublicationReceipt:
             return receipt.model_copy(
                 update={
                     "landed": True,

@@ -64,7 +64,7 @@ def _terminals(*handles: str, complete: bool = True) -> OpenTerminals:
     return OpenTerminals(handles=frozenset(handles), complete=complete)
 
 
-def test_a_stage_still_in_flight_is_held_however_orca_describes_its_terminal():
+def test_a_stage_still_in_flight_is_held_however_orca_describes_its_terminal() -> None:
     """The predicate is the ledger, not the daemon: this is the whole safety rule."""
 
     stages = [
@@ -87,7 +87,7 @@ def test_a_stage_still_in_flight_is_held_however_orca_describes_its_terminal():
     assert plan.close[0].lane == "alpha"
 
 
-def test_a_pane_orca_no_longer_lists_counts_as_reclaimed_rather_than_missing():
+def test_a_pane_orca_no_longer_lists_counts_as_reclaimed_rather_than_missing() -> None:
     plan = build_plan(
         run_id="run",
         lanes=[_lane("lane", "alpha")],
@@ -104,7 +104,7 @@ def test_a_pane_orca_no_longer_lists_counts_as_reclaimed_rather_than_missing():
     assert plan.already_closed == 2
 
 
-def test_a_stage_that_was_never_dispatched_is_not_counted_at_all():
+def test_a_stage_that_was_never_dispatched_is_not_counted_at_all() -> None:
     plan = build_plan(
         run_id="run",
         lanes=[_lane("lane", "alpha")],
@@ -116,7 +116,7 @@ def test_a_stage_that_was_never_dispatched_is_not_counted_at_all():
     assert (plan.close, plan.held, plan.already_closed) == ((), 0, 0)
 
 
-def test_a_truncated_listing_is_reported_rather_than_quietly_under_reaping():
+def test_a_truncated_listing_is_reported_rather_than_quietly_under_reaping() -> None:
     plan = build_plan(
         run_id="run",
         lanes=[_lane("lane", "alpha")],
@@ -130,7 +130,7 @@ def test_a_truncated_listing_is_reported_rather_than_quietly_under_reaping():
     assert "truncated" in rendered
 
 
-def test_a_dry_run_says_it_closed_nothing_and_names_what_it_would():
+def test_a_dry_run_says_it_closed_nothing_and_names_what_it_would() -> None:
     plan = build_plan(
         run_id="run",
         lanes=[_lane("lane", "alpha")],
@@ -145,7 +145,7 @@ def test_a_dry_run_says_it_closed_nothing_and_names_what_it_would():
     assert "Re-run with --confirm to act." in rendered
 
 
-def test_a_completed_sweep_reports_what_it_closed_not_what_it_would_have():
+def test_a_completed_sweep_reports_what_it_closed_not_what_it_would_have() -> None:
     plan = build_plan(
         run_id="run",
         lanes=[_lane("lane", "alpha")],
