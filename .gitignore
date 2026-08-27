@@ -10,3 +10,4 @@ __pycache__/
 coverage.xml
 htmlcov/
 .worktrees/
+node_modules/
