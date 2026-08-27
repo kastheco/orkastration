@@ -797,6 +797,101 @@ async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> Non
         )
 
 
+async def test_a_terminal_check_conclusion_dominates_a_stale_in_progress_status() -> None:
+    sha = "b" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        result("[]", returncode=1),
+        result(
+            json.dumps(
+                [
+                    {
+                        "check_runs": [
+                            {
+                                "name": "Pi extension",
+                                "head_sha": sha,
+                                "status": "in_progress",
+                                "conclusion": "failure",
+                                "completed_at": "2026-08-26T22:17:43Z",
+                                "output": {"summary": "setup-node failed"},
+                            }
+                        ]
+                    }
+                ]
+            )
+        ),
+        result(json.dumps({"state": "pending", "statuses": []})),
+    )
+
+    observed = await GitHubPublisher(runner=runner).checks(receipt)
+
+    assert observed.status == "failed"
+    assert observed.checks[0].status == "failed"
+
+
+async def test_a_terminal_check_run_without_a_conclusion_fails_closed() -> None:
+    """Terminal evidence cannot remain pending just because its verdict is malformed.
+
+    GitHub has said the check is no longer live, so waiting for another status
+    transition can never settle the final gate. A missing verdict cannot pass.
+    """
+
+    sha = "b" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(json.dumps({"headRefOid": sha, "state": "OPEN", "isDraft": True})),
+        result("[]", returncode=1),
+        result(
+            json.dumps(
+                [
+                    {
+                        "check_runs": [
+                            {
+                                "name": "Pi extension",
+                                "head_sha": sha,
+                                "status": "in_progress",
+                                "conclusion": None,
+                                "completed_at": "2026-08-26T22:17:43Z",
+                            },
+                            {
+                                "name": "Rerun",
+                                "head_sha": sha,
+                                "status": "completed",
+                                "conclusion": None,
+                            },
+                        ]
+                    }
+                ]
+            )
+        ),
+        result(json.dumps({"state": "pending", "statuses": []})),
+    )
+
+    observed = await GitHubPublisher(runner=runner).checks(receipt)
+
+    assert [item.status for item in observed.checks] == ["failed", "failed"]
+    assert observed.status == "failed"
+
+
 async def test_a_merged_pull_request_is_the_lane_landing_not_a_failure(tmp_path: Path) -> None:
     """MERGED is the outcome the lane was working toward, not a reason to stop it.
 

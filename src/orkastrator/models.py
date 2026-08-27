@@ -68,6 +68,17 @@ whether a run still has work from having to restate which phases those are.
 """
 
 
+TERMINAL_FAILURE_STATUSES = frozenset(
+    {LanePhase.BLOCKED.value, LanePhase.FAILED.value, LanePhase.REPORT_FAILED.value}
+)
+"""Run statuses a watching caller must not read as success.
+
+`GraphResult.status` carries these strings, and a watch that exits zero on one
+of them tells a shell the run finished when the run stopped. Deriving them from
+the phases they come from keeps a renamed phase from silently restoring that.
+"""
+
+
 class StagePhase(StrEnum):
     """Locally observed Orca Task lifecycle."""
 
@@ -773,6 +784,7 @@ class FindingRecord(BaseModel):
         "ci_failure",
         "worker_blocked",
         "publication_conflict",
+        "recovery",
     ]
     contract: ReviewFinding
     effective_contract: ReviewFinding
@@ -784,6 +796,18 @@ class FindingRecord(BaseModel):
     dispatch_base_sha: GitObjectId | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RecoveryReceipt(BaseModel):
+    """Immutable operator authorization for a fresh finding at a lane head."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    lane: str
+    source_finding_id: FindingId
+    base_sha: GitObjectId
+    finding: FindingRecord
 
 
 class IntegrationConflictContext(BaseModel):

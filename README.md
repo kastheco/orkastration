@@ -86,10 +86,13 @@ checkout.
 
 Publication uses non-force deterministic branches and one GitHub PR per lane, opened as a draft and
 marked ready once the exact-SHA checks on the published head pass. Those checks are the gate before
-anything lands. An empty or still-running rollup remains pending. If required checks do not conclude
-within `final_gate.timeout_seconds`, the lane blocks and leaves the pull request open. Advisory checks
-are recorded but do not gate, and the concluded rollup is copied onto the publication receipt before
-an enabled merge runs.
+anything lands. An empty or still-running rollup remains pending. A check run that contradicts itself
+is read as terminal when it has a `conclusion`, a completed status, or a `completed_at`, regardless of
+a stale `in_progress` status. A missing conclusion on an otherwise terminal check fails closed: it
+cannot pass, and leaving it pending would wait forever for a check GitHub says already finished.
+If required checks do not conclude within `final_gate.timeout_seconds`, the lane blocks and leaves
+the pull request open. Advisory checks are recorded but do not gate, and the concluded rollup is
+copied onto the publication receipt before an enabled merge runs.
 
 A pull request has three states and each one gets its own answer. `OPEN` is the working case.
 `MERGED` means the lane's branch reached the base branch, which is the outcome the lane exists to
@@ -164,6 +167,10 @@ uv run --project /home/kas/dev/orkastrator orkas monitor \
   <run-id> --watch --interval 5 --json
 ```
 
+Watch mode exits zero for a complete graph or an unanswered operator question. A terminal `blocked`,
+`failed`, or `report_failed` graph is still emitted as JSON but exits nonzero, so shell supervision does
+not mistake a stopped run for successful completion.
+
 Inspect persisted state without touching Orca:
 
 ```bash
@@ -187,6 +194,30 @@ A finding that already settled on the merits - `resolved` or `deferred` - is ref
 undoes work an agent got right and sends another one to redo it. A `blocked` finding needs no force,
 because that is the case reopen exists for. The event records the phase it came from and whether the
 reopen was forced.
+
+When later evidence proves a different defect at the current lane head, do not force-reopen the old
+contract. Create a fresh recovery finding instead:
+
+```bash
+uv run --project /home/kas/dev/orkastrator orkas recover <run-id> \
+  --finding <historical-finding-id> --file <recovery-finding.yaml> \
+  --note "why the new current-head defect is authorized" --json
+uv run --project /home/kas/dev/orkastrator orkas monitor <run-id> --watch --json
+```
+
+The file is a `ReviewFinding` YAML or JSON object and must omit `review_revision`; orkastrator binds
+that revision to the lane's clean recorded integration head and records the validation baselines there.
+The new finding needs its own id and an exact allowed write scope, required outcome, evidence, and
+deterministic validation. A blocked historical finding becomes deferred, while all of its contracts,
+attempts, stages, verdicts, and integration receipts remain in the ledger. Any live historical stage is
+retired. The new finding then follows the ordinary fixer, re-review, serial integration, final-gate, and
+publication path, so a successful recovery creates a same-lane integration receipt rather than weakening
+`reconcile-head` or manufacturing authorization.
+
+Recovery refuses a dirty checkout, a checkout whose HEAD differs from the recorded integration head,
+a lane whose pull request has already landed, a source finding that is still in flight, a dependency
+on itself or on an unknown finding, a contract with no runnable validation, or a contract that
+supplies its own revision.
 
 Acceptance freezes the proposal and the graph configuration together, so editing
 `orkastrator.yaml` while a run is in flight fails every tick after it with `proposal or graph policy
@@ -223,6 +254,11 @@ wants a new proposal.
 A run accepted before the policy payload was stored has nothing to diff against. It says so rather
 than printing an empty change list, and records its policy the first time it is read while unchanged,
 so the next change is readable.
+
+A lane that went down only because one of its findings is blocked comes back on its own once that
+finding resolves. Any other standing cause, including a latched one like an exhausted CI fix round
+limit, keeps the lane blocked, because releasing on the newest cause alone would drop the ones
+underneath it.
 
 A lane can block with every one of its findings already settled, on a required-check query made a
 second after pushing its branch, or on a pull request somebody merged out from under it. `reopen` and

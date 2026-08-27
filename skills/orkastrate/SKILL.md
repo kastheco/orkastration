@@ -56,6 +56,9 @@ ORKASTRATOR_CONFIG=/home/kas/dev/orkastrator/orkastrator.yaml \
   <run-id> --watch --interval 5 --json
 ```
 
+A nonzero watch exit means a terminal blocked, failed, or report-failed run, not a broken command;
+read the emitted JSON and see the README for exact exit semantics.
+
 Use `orkas monitor <run-id> --json` for one reconciliation and `orkas show <run-id> --json` for
 read-only inspection. Explain current state and answer questions using the persisted proposal,
 finding, integration, publication, and CI evidence.
