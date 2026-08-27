@@ -87,12 +87,12 @@ checkout.
 Publication uses non-force deterministic branches and one GitHub PR per lane, opened as a draft and
 marked ready once the exact-SHA checks on the published head pass. Those checks are the gate before
 anything lands. An empty or still-running rollup remains pending. A check run that contradicts itself
-is read as terminal: a `conclusion` or a `completed_at` wins over a stale `in_progress` status, so a
-failure GitHub already decided becomes a real CI failure instead of a run that waits for it forever.
+is read from its `conclusion`: a concluded run settles whatever a stale `in_progress` status claims,
+so a failure GitHub already decided becomes a real CI failure instead of a run that waits for it
+forever. A run with no conclusion stays pending however complete its status or `completed_at` looks.
 If required checks do not conclude within `final_gate.timeout_seconds`, the lane blocks and leaves
-the pull request open. Advisory checks
-are recorded but do not gate, and the concluded rollup is copied onto the publication receipt before
-an enabled merge runs.
+the pull request open. Advisory checks are recorded but do not gate, and the concluded rollup is
+copied onto the publication receipt before an enabled merge runs.
 
 A pull request has three states and each one gets its own answer. `OPEN` is the working case.
 `MERGED` means the lane's branch reached the base branch, which is the outcome the lane exists to
@@ -215,7 +215,9 @@ publication path, so a successful recovery creates a same-lane integration recei
 `reconcile-head` or manufacturing authorization.
 
 Recovery refuses a dirty checkout, a checkout whose HEAD differs from the recorded integration head,
-an unknown dependency, or a contract that supplies its own revision.
+a lane whose pull request has already landed, a source finding that is still in flight, a dependency
+on itself or on an unknown finding, a contract with no runnable validation, or a contract that
+supplies its own revision.
 
 Acceptance freezes the proposal and the graph configuration together, so editing
 `orkastrator.yaml` while a run is in flight fails every tick after it with `proposal or graph policy
