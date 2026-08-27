@@ -3658,25 +3658,7 @@ async def test_resumed_worker_reports_the_frozen_lane_base(tmp_path: Path) -> No
     assert settled_replacement.processed is True
 
 
-async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(
-    tmp_path: Path,
-) -> None:
-    orca = FakeOrca()
-    publisher = FakePublisher()
-    value, store = controller(tmp_path, orca, publisher=publisher)
-    run_id = value.propose(proposal()).run_id
-    await value.accept(run_id)
-    await advance_to_initial_review(value, orca, run_id)
-    orca.complete_dispatched(initial_review_report_json())
-
-    result = await value.monitor(run_id)
-
-    assert result.status == "complete"
-    assert publisher.land_calls == []
-    assert store.publications(run_id)[-1].landed is False
-
-
-async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sha(
+async def test_publication_merge_discards_candidate_after_the_final_gate(
     tmp_path: Path,
 ) -> None:
     orca = FakeOrca()
@@ -4062,6 +4044,45 @@ async def test_merge_fixer_scope_is_lane_local_and_integrates_cleanly(tmp_path: 
         and item.escalation_reason is FindingReason.INTEGRATION_CONFLICT
         for item in result.findings
     )
+
+
+async def test_publication_merge_disabled_leaves_the_ready_pull_request_unlanded(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete"
+    assert publisher.land_calls == []
+    assert store.publications(run_id)[-1].landed is False
+
+
+async def test_publication_merge_lands_after_the_final_gate_and_records_merge_sha(
+    tmp_path: Path,
+) -> None:
+    orca = FakeOrca()
+    publisher = FakePublisher()
+    value, store = controller(tmp_path, orca, graph_config=config(merge=True), publisher=publisher)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    result = await value.monitor(run_id)
+
+    assert result.status == "complete", store.events(run_id)
+    assert publisher.ready_calls == ["b" * 40]
+    assert publisher.land_calls == ["b" * 40]
+    receipt = store.publications(run_id)[-1]
+    assert receipt.landed is True
+    assert receipt.merge_sha == "e" * 40
 
 
 async def test_publication_conflict_routes_to_lane_escalation_without_failing_run(
