@@ -39,18 +39,16 @@ from orkastrator.models import (
     ValidationResult,
 )
 from orkastrator.orca import MAX_TASK_SPEC_BYTES, JsonObject, OrcaError, OrcaTimeout
-from orkastrator.publication import (
-    IntegrationConflict,
-    PublicationContent,
-    PublicationError,
-    PullRequestLanded,
-)
+from orkastrator.publication import IntegrationConflict, PublicationError, PullRequestLanded
 from orkastrator.store import StateStore
 from tests.factories import (
     graph_config_data,
     initial_review_report_json,
     review_finding_data,
 )
+
+# isort: split
+from orkastrator.publication import PublicationContent
 
 
 def config(

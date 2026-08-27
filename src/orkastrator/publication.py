@@ -539,7 +539,7 @@ def _pull_request_body(run_id: str, content: PublicationContent) -> str:
         ),
     ]
 
-    checks = [
+    checks: list[tuple[str, str, str]] = [
         (result.command, result.status, result.output) for result in content.validation_results
     ]
     if content.ci is not None:
@@ -605,7 +605,8 @@ def _pull_request_body(run_id: str, content: PublicationContent) -> str:
             rendered_items.append(rendered)
             if title != "## Traceability":
                 budget_index += 1
-        rendered_sections.append(title + ("\n\n" + joiner.join(rendered_items) if rendered_items else ""))
+        rendered_content = "\n\n" + joiner.join(rendered_items) if rendered_items else ""
+        rendered_sections.append(title + rendered_content)
     return "\n\n".join(rendered_sections)
 
 
@@ -619,13 +620,15 @@ def _allocate_budgets(lengths: list[int], total: int) -> list[int]:
     minimum = min(128, total // len(lengths))
     budgets = [min(length, minimum) for length in lengths]
     remaining = total - sum(budgets)
-    deficits = [max(0, length - budget) for length, budget in zip(lengths, budgets)]
+    deficits = [
+        max(0, length - budget) for length, budget in zip(lengths, budgets, strict=True)
+    ]
     deficit_total = sum(deficits)
     if remaining and deficit_total:
         for index, deficit in enumerate(deficits):
             budgets[index] += min(deficit, remaining * deficit // deficit_total)
         remaining = total - sum(budgets)
-        for index, deficit in enumerate(deficits):
+        for index, _deficit in enumerate(deficits):
             if not remaining:
                 break
             if budgets[index] < lengths[index]:

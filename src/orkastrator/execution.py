@@ -1,4 +1,5 @@
 """Dynamic finding scheduling and Orca lifecycle reconciliation."""
+# ruff: noqa: I001
 
 from __future__ import annotations
 
@@ -59,10 +60,11 @@ from orkastrator.publication import (
     GitHubPublisher,
     IntegrationConflict,
     LanePublisher,
-    PublicationContent,
     PublicationError,
     PullRequestLanded,
 )
+# isort: split
+from orkastrator.publication import PublicationContent
 from orkastrator.scope import path_allowed
 from orkastrator.store import IntegrationBusyError, StateStore
 
@@ -721,6 +723,35 @@ class ExecutionController:
                 raise ValueError("validation runner returned an incomplete result")
             observed.append(result[0])
         return observed
+
+    def _publication_content(
+        self,
+        run_id: str,
+        lane: LaneRecord,
+        proposal: LaneProposal,
+        *,
+        ci: CiReceipt | None,
+    ) -> PublicationContent:
+        """Assemble provider-neutral PR content from persisted lane evidence."""
+
+        worker = self._store.worker_result(lane.lane_id)
+        review = self._store.initial_review(lane.lane_id)
+        unresolved = tuple(
+            finding.effective_contract.failure_mode
+            for finding in self._store.findings(run_id, lane.lane_id)
+            if finding.phase is not FindingPhase.RESOLVED
+        )
+        return PublicationContent(
+            issue_id=lane.issue_id,
+            accepted_scope=proposal.prompt,
+            stop_condition=proposal.stop_condition,
+            implementation_summary=worker.summary,
+            validation_results=tuple(worker.validation_results),
+            review_summary=review.summary if review is not None else None,
+            unresolved_findings=unresolved,
+            published_head=lane.integration_head_sha or worker.commit_sha,
+            ci=ci,
+        )
 
     @staticmethod
     def _bind_revision(finding: FindingRecord, contract: ReviewFinding) -> ReviewFinding:
@@ -2393,35 +2424,6 @@ class ExecutionController:
                         lane.lane_id,
                         f"{exc} (unchanged over {attempts} publication passes)",
                     )
-
-    def _publication_content(
-        self,
-        run_id: str,
-        lane: LaneRecord,
-        proposal: LaneProposal,
-        *,
-        ci: CiReceipt | None,
-    ) -> PublicationContent:
-        """Assemble provider-neutral PR content from persisted lane evidence."""
-
-        worker = self._store.worker_result(lane.lane_id)
-        review = self._store.initial_review(lane.lane_id)
-        unresolved = tuple(
-            finding.effective_contract.failure_mode
-            for finding in self._store.findings(run_id, lane.lane_id)
-            if finding.phase is not FindingPhase.RESOLVED
-        )
-        return PublicationContent(
-            issue_id=lane.issue_id,
-            accepted_scope=proposal.prompt,
-            stop_condition=proposal.stop_condition,
-            implementation_summary=worker.summary,
-            validation_results=tuple(worker.validation_results),
-            review_summary=review.summary if review is not None else None,
-            unresolved_findings=unresolved,
-            published_head=lane.integration_head_sha or worker.commit_sha,
-            ci=ci,
-        )
 
     @staticmethod
     def _live_failed_stages(

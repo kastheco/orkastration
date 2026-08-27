@@ -1,4 +1,5 @@
 """GitHub publication adapter tests."""
+# ruff: noqa: I001
 
 from __future__ import annotations
 
@@ -20,7 +21,6 @@ from orkastrator.publication import (
     CommandResult,
     GitHubPublisher,
     IntegrationConflict,
-    PublicationContent,
     PublicationError,
     PullRequestLanded,
     _github_repository,
@@ -28,6 +28,8 @@ from orkastrator.publication import (
     _pull_request_body,
     _raise_if_integration_conflict,
 )
+# isort: split
+from orkastrator.publication import PublicationContent
 
 
 class QueueRunner:
