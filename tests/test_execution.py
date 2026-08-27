@@ -6036,3 +6036,4 @@ async def test_publication_reobserves_a_published_head_with_a_new_passing_rollup
 
     assert second.status == "complete"
     assert store.publications(run_id)[-1].landed is True
+    assert publisher.check_calls == 2
