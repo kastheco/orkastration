@@ -839,11 +839,11 @@ async def test_a_terminal_check_conclusion_dominates_a_stale_in_progress_status(
     assert observed.checks[0].status == "failed"
 
 
-async def test_a_check_run_without_a_conclusion_is_still_pending() -> None:
-    """No conclusion is no verdict, whatever the run's status fields claim.
+async def test_a_terminal_check_run_without_a_conclusion_fails_closed() -> None:
+    """Terminal evidence cannot remain pending just because its verdict is malformed.
 
-    Reading an absent conclusion as a failure invents a CI result GitHub never
-    reported and blocks the lane on it.
+    GitHub has said the check is no longer live, so waiting for another status
+    transition can never settle the final gate. A missing verdict cannot pass.
     """
 
     sha = "b" * 40
@@ -888,8 +888,8 @@ async def test_a_check_run_without_a_conclusion_is_still_pending() -> None:
 
     observed = await GitHubPublisher(runner=runner).checks(receipt)
 
-    assert [item.status for item in observed.checks] == ["pending", "pending"]
-    assert observed.status == "pending"
+    assert [item.status for item in observed.checks] == ["failed", "failed"]
+    assert observed.status == "failed"
 
 
 async def test_a_merged_pull_request_is_the_lane_landing_not_a_failure(tmp_path: Path) -> None:

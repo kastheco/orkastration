@@ -87,9 +87,9 @@ checkout.
 Publication uses non-force deterministic branches and one GitHub PR per lane, opened as a draft and
 marked ready once the exact-SHA checks on the published head pass. Those checks are the gate before
 anything lands. An empty or still-running rollup remains pending. A check run that contradicts itself
-is read from its `conclusion`: a concluded run settles whatever a stale `in_progress` status claims,
-so a failure GitHub already decided becomes a real CI failure instead of a run that waits for it
-forever. A run with no conclusion stays pending however complete its status or `completed_at` looks.
+is read as terminal when it has a `conclusion`, a completed status, or a `completed_at`, regardless of
+a stale `in_progress` status. A missing conclusion on an otherwise terminal check fails closed: it
+cannot pass, and leaving it pending would wait forever for a check GitHub says already finished.
 If required checks do not conclude within `final_gate.timeout_seconds`, the lane blocks and leaves
 the pull request open. Advisory checks are recorded but do not gate, and the concluded rollup is
 copied onto the publication receipt before an enabled merge runs.
