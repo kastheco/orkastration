@@ -60,6 +60,7 @@ from orkastrator.publication import (
     GitHubPublisher,
     IntegrationConflict,
     LanePublisher,
+    MergeCandidate,
     PublicationError,
     PullRequestLanded,
 )
@@ -2346,7 +2347,60 @@ class ExecutionController:
                         raise PublicationError("provider did not mark the exact pull request ready")
                     self._store.record_publication(run_id, lane.lane_id, ready)
                     if self._config.publication.merge:
-                        landed = await self._publisher.land(ready)
+                        if lane.worktree_id is None:
+                            raise IntegrationConflict(
+                                "merge verification has no integrated lane checkout"
+                            )
+                        lane_worktree_id = lane.worktree_id
+                        candidate = await self._publisher.prepare_merge(
+                            ready, worktree_id=lane_worktree_id
+                        )
+                        retain_candidate = False
+                        try:
+                            requirements = await self._merge_validation_requirements(
+                                lane, candidate.worktree_id
+                            )
+                            if not requirements:
+                                self._store.block_lane(
+                                    run_id,
+                                    lane.lane_id,
+                                    "merge verification has no runnable passed worker "
+                                    "validation evidence",
+                                )
+                                self._store.note_publication_progress(run_id, lane.lane_id)
+                                continue
+                            baseline = await self._observe_validation_requirements(
+                                lane_worktree_id, requirements
+                            )
+                            validation = await self._observe_validation_requirements(
+                                candidate.worktree_id, requirements
+                            )
+                            regressions = [
+                                (requirement, base, merged)
+                                for requirement, base, merged in zip(
+                                    requirements, baseline, validation, strict=True
+                                )
+                                if base.status == "passed" and merged.status == "failed"
+                            ]
+                            if regressions:
+                                retain_candidate = True
+                                await self._record_merge_validation_failure(
+                                    run_id,
+                                    lane,
+                                    candidate,
+                                    [
+                                        requirement.model_copy(update={"baseline_result": base})
+                                        for requirement, base, _ in regressions
+                                    ],
+                                    [merged for _, _, merged in regressions],
+                                )
+                                self._store.note_publication_progress(run_id, lane.lane_id)
+                                continue
+                            landed = await self._publisher.land(ready, candidate=candidate)
+                        finally:
+                            await self._publisher.discard_merge(
+                                candidate, retain_revision=retain_candidate
+                            )
                         if (
                             landed.head_sha != ready.head_sha
                             or not landed.landed
@@ -2391,6 +2445,125 @@ class ExecutionController:
                         lane.lane_id,
                         f"{exc} (unchanged over {attempts} publication passes)",
                     )
+
+    async def _merge_validation_requirements(
+        self, lane: LaneRecord, worktree_id: str
+    ) -> list[ValidationRequirement]:
+        """Replay the commands that passed at the lane head on its merge candidate."""
+
+        worker = self._store.worker_result(lane.lane_id)
+        coverage_configured = await self._git.pytest_coverage_configured(worktree_id)
+        requirements: list[ValidationRequirement] = []
+        seen: set[str] = set()
+        for result in worker.validation_results:
+            if result.status != "passed":
+                continue
+            if _unrunnable_validation_reason(result.command, "merge validation"):
+                continue
+            governed = _govern_validation_requirement(
+                ValidationRequirement(
+                    command=result.command,
+                    expected="passes on the merge candidate",
+                ),
+                coverage_configured=coverage_configured,
+            )
+            if _unrunnable_validation_reason(governed.command, "merge validation"):
+                continue
+            if governed.command in seen:
+                continue
+            seen.add(governed.command)
+            requirements.append(governed)
+        return requirements
+
+    async def _record_merge_validation_failure(
+        self,
+        run_id: str,
+        lane: LaneRecord,
+        candidate: MergeCandidate,
+        requirements: list[ValidationRequirement],
+        validation: list[ValidationResult],
+    ) -> None:
+        """Freeze a merge-origin finding without blaming the passing lane head."""
+
+        worker = self._store.worker_result(lane.lane_id)
+        base_sha = candidate.target_sha
+        # A merge-origin fixer runs on the merge candidate, but its one commit
+        # is integrated by cherry-picking into this lane's checkout. Keep the
+        # contract to paths this lane actually carries; the other lanes' paths
+        # exist in the candidate only and can never reach this branch through a
+        # clean cherry-pick.
+        paths = sorted(set(self._worker_changed_paths(lane)))
+        if not paths:
+            try:
+                if lane.worktree_id is None or lane.integration_head_sha is None:
+                    raise GitError("merge validation scope has no lane checkout")
+                paths = await self._git.changed_paths(
+                    lane.worktree_id,
+                    worker.review_revision.base_sha,
+                    lane.integration_head_sha,
+                )
+            except GitError as exc:
+                self._store.block_lane(
+                    run_id, lane.lane_id, f"merge validation scope unavailable: {exc}"
+                )
+                return
+        if not paths:
+            self._store.block_lane(
+                run_id, lane.lane_id, "merge validation failure has no deterministic scope"
+            )
+            return
+        try:
+            diff_sha256 = await self._git.diff_sha256(
+                candidate.worktree_id, base_sha, candidate.merge_sha
+            )
+        except GitError as exc:
+            self._store.block_lane(
+                run_id, lane.lane_id, f"merge validation scope unavailable: {exc}"
+            )
+            return
+        review_revision = ReviewRevision(
+            base_sha=base_sha, head_sha=candidate.merge_sha, diff_sha256=diff_sha256
+        )
+        failed = [item for item in validation if item.status == "failed"]
+        contract = ReviewFinding(
+            id=f"publication-conflict-merge-validation-{candidate.merge_sha[:12]}",
+            review_revision=review_revision,
+            evidence=[
+                FindingEvidence(
+                    location=FindingLocation(
+                        path=paths[index % len(paths)], start_line=1, end_line=1
+                    ),
+                    claim=(
+                        f"{result.command} passed at lane head {worker.commit_sha} but failed "
+                        f"on merge {candidate.merge_sha}:\n{result.output}"
+                    )[:4_000],
+                )
+                for index, result in enumerate(failed[:64])
+            ],
+            failure_mode=(
+                f"The lane head passed its stop checks, but merging it with target "
+                f"{candidate.target_sha} produced {candidate.merge_sha}, where "
+                f"{len(failed)} check(s) failed."
+            ),
+            required_outcome=(
+                "Make the same merge candidate pass every frozen stop check while preserving "
+                "the accepted changes already present in the target and lane heads. This fixer "
+                "runs on the merge candidate, but its single commit is cherry-picked into this "
+                "lane, so edit only paths already present in this lane head, not target-only "
+                "paths or hunks."
+            ),
+            allowed_write_scope=AllowedWriteScope(paths=paths[:128]),
+            validation=requirements,
+        )
+        self._store.add_finding(run_id, lane.lane_id, contract, origin="publication_conflict")
+
+    def _worker_changed_paths(self, lane: LaneRecord) -> list[str]:
+        """Return one wave lane's frozen paths when its worker has reported."""
+
+        try:
+            return self._store.worker_result(lane.lane_id).changed_paths
+        except KeyError:
+            return []
 
     @staticmethod
     def _live_failed_stages(
@@ -3324,13 +3497,22 @@ def _unrunnable_finding_reason(finding: ReviewFinding) -> str | None:
     """
 
     for requirement in finding.validation:
-        found = sorted({token for token in SHELL_OPERATORS if token in requirement.command})
-        if found:
-            return (
-                f"finding {finding.id} requires a validation command using shell syntax "
-                f"({', '.join(found)}), but validation runs without a shell: give one "
-                "executable per requirement and set workdir instead of `cd`"
-            )
+        reason = _unrunnable_validation_reason(requirement.command, finding.id)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _unrunnable_validation_reason(command: str, finding_id: str) -> str | None:
+    """Say why one shell-free validation command cannot run."""
+
+    found = sorted({token for token in SHELL_OPERATORS if token in command})
+    if found:
+        return (
+            f"finding {finding_id} requires a validation command using shell syntax "
+            f"({', '.join(found)}), but validation runs without a shell: give one "
+            "executable per requirement and set workdir instead of `cd`"
+        )
     return None
 
 
