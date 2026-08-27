@@ -1,4 +1,5 @@
 """GitHub publication adapter tests."""
+# ruff: noqa: I001
 
 from __future__ import annotations
 
@@ -8,7 +9,14 @@ from pathlib import Path
 import pytest
 
 from orkastrator.git import GitError, worktree_path
-from orkastrator.models import LanePhase, LaneRecord, PublicationReceipt
+from orkastrator.models import (
+    CiCheckResult,
+    CiReceipt,
+    LanePhase,
+    LaneRecord,
+    PublicationReceipt,
+    ValidationResult,
+)
 from orkastrator.publication import (
     CommandResult,
     GitHubPublisher,
@@ -17,8 +25,12 @@ from orkastrator.publication import (
     PublicationError,
     PullRequestLanded,
     _github_repository,
+    _PULL_REQUEST_BODY_LIMIT,
+    _pull_request_body,
     _raise_if_integration_conflict,
 )
+# isort: split
+from orkastrator.publication import PublicationContent
 
 
 class QueueRunner:
@@ -55,6 +67,239 @@ def lane(tmp_path: Path) -> LaneRecord:
     )
 
 
+def publication_content(
+    *, ci: CiReceipt | None = None, unresolved_findings: tuple[str, ...] = ()
+) -> PublicationContent:
+    return PublicationContent(
+        issue_id="ISSUE-123",
+        accepted_scope="Replace metadata-only PR copy with frozen workflow evidence.",
+        stop_condition="Create and reconcile paths preserve exact-head evidence.",
+        implementation_summary="Publish useful pull request titles and bodies.",
+        validation_results=(
+            ValidationResult(command="uv run pytest", status="passed", output="42 passed"),
+        ),
+        review_summary="Independent review found the publication content complete.",
+        unresolved_findings=unresolved_findings,
+        published_head="b" * 40,
+        ci=ci,
+    )
+
+
+async def test_reconcile_skips_the_edit_when_the_pull_request_is_already_current() -> None:
+    sha = "b" * 40
+    run_id = "run-1234567890"
+    receipt = PublicationReceipt(
+        run_id=run_id,
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    content = publication_content()
+    body = _pull_request_body(run_id, content)
+    state = json.dumps(
+        {"headRefOid": sha, "state": "OPEN", "isDraft": True, "body": body}
+    )
+    ci = CiReceipt(
+        provider="github",
+        head_sha=sha,
+        status="pending",
+        checks=(CiCheckResult(name="pytest", status="pending", output="queued"),),
+    )
+    runner = QueueRunner(result(state), result(state), result(state), result())
+    publisher = GitHubPublisher(runner=runner)
+
+    await publisher.reconcile(receipt, content)
+    await publisher.reconcile(receipt, content)
+    assert len(runner.calls) == 2
+    assert all(call[:3] == ("gh", "pr", "view") for call in runner.calls)
+
+    await publisher.reconcile(receipt, publication_content(ci=ci))
+    assert len(runner.calls) == 4
+    assert runner.calls[-1][:3] == ("gh", "pr", "edit")
+
+
+async def test_create_and_reconcile_publish_structured_evidence(tmp_path: Path) -> None:
+    sha = "b" * 40
+    run_id = "run-1234567890"
+    pr_url = "https://github.com/owner/repo/pull/7"
+    create_runner = QueueRunner(
+        result("git@github.com:owner/repo.git\n"),
+        result(json.dumps({"defaultBranchRef": {"name": "main"}})),
+        result("[]"),
+        result(),
+        result(),
+        result(f"{pr_url}\n"),
+    )
+    publisher = GitHubPublisher(runner=create_runner)
+
+    receipt = await publisher.publish(
+        run_id=run_id,
+        lane=lane(tmp_path),
+        head_sha=sha,
+        previous=None,
+        content=publication_content(unresolved_findings=("Document the remaining edge case.",)),
+    )
+
+    create_call = create_runner.calls[-1]
+    title = create_call[create_call.index("--title") + 1]
+    body = create_call[create_call.index("--body") + 1]
+    assert title == "Publish useful pull request titles and bodies"
+    assert "issue 123" not in title.lower()
+    assert "## What changed" in body
+    assert "## Scope" in body
+    assert "`uv run pytest` - passed\n  - 42 passed" in body
+    assert "## Review" in body
+    assert "Unresolved findings:\n- Document the remaining edge case." in body
+    assert f"Published head: `{sha}`" in body
+    assert f"orkastrator run: `{run_id}`" in body
+    assert "Lane:" not in body
+    assert "remains draft" not in body
+
+    ci = CiReceipt(
+        provider="github",
+        head_sha=sha,
+        status="pending",
+        checks=(CiCheckResult(name="pytest", status="pending", output="queued"),),
+    )
+    reconcile_runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": sha,
+                    "state": "OPEN",
+                    "isDraft": True,
+                    "body": body,
+                }
+            )
+        ),
+        result(),
+    )
+    reconciler = GitHubPublisher(runner=reconcile_runner)
+    await reconciler.reconcile(receipt, publication_content(ci=ci))
+    edit_call = reconcile_runner.calls[-1]
+    reconciled_body = edit_call[edit_call.index("--body") + 1]
+    assert "CI for exact head" in reconciled_body
+    assert "`pytest` - pending\n  - queued" in reconciled_body
+    assert f"orkastrator run: `{run_id}`" in reconciled_body
+
+    foreign_runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": sha,
+                    "state": "OPEN",
+                    "isDraft": True,
+                    "body": "human-authored pull request",
+                }
+            )
+        )
+    )
+    with pytest.raises(PublicationError, match="not owned"):
+        await GitHubPublisher(runner=foreign_runner).reconcile(receipt, publication_content(ci=ci))
+
+
+async def test_reconcile_preserves_the_merge_commit_when_the_pull_request_landed() -> None:
+    sha = "b" * 40
+    merge_sha = "c" * 40
+    receipt = PublicationReceipt(
+        run_id="run-1234567890",
+        lane="issue-123",
+        remote_url="git@github.com:owner/repo.git",
+        base_branch="main",
+        branch="orkastrator/run-12345678/issue-123",
+        pull_request_url="https://github.com/owner/repo/pull/7",
+        head_sha=sha,
+        draft=True,
+    )
+    runner = QueueRunner(
+        result(
+            json.dumps(
+                {
+                    "headRefOid": sha,
+                    "state": "MERGED",
+                    "isDraft": False,
+                    "body": "orkastrator run: `run-1234567890`",
+                    "mergeCommit": {"oid": merge_sha},
+                }
+            )
+        )
+    )
+
+    with pytest.raises(PullRequestLanded) as landed:
+        await GitHubPublisher(runner=runner).reconcile(receipt, publication_content())
+
+    assert landed.value.receipt.landed is True
+    assert landed.value.receipt.merged_head_sha == sha
+    assert landed.value.receipt.merge_sha == merge_sha
+
+
+def test_pull_request_body_omits_missing_optional_evidence() -> None:
+    body = _pull_request_body(
+        "run-1234567890",
+        PublicationContent(
+            issue_id="ISSUE-123",
+            accepted_scope="Publish the accepted change.",
+            stop_condition="The focused regression passes.",
+            implementation_summary="Publish useful pull request content.",
+            validation_results=(),
+            review_summary=None,
+            unresolved_findings=(),
+            published_head="b" * 40,
+            ci=None,
+        ),
+    )
+
+    assert "## Checks" not in body
+    assert "## Review" not in body
+    assert "CI for exact head" not in body
+    assert "unresolved" not in body.lower()
+
+
+def test_pull_request_body_stays_within_the_github_limit() -> None:
+    head_sha = "b" * 40
+    content = PublicationContent(
+        issue_id="ISSUE-123",
+        accepted_scope="s" * 12_000,
+        stop_condition="stop",
+        implementation_summary="i" * 8_000,
+        validation_results=tuple(
+            ValidationResult(
+                command=f"validation-{index}",
+                status="passed",
+                output="v" * 8_000,
+            )
+            for index in range(64)
+        ),
+        review_summary="r" * 8_000,
+        unresolved_findings=tuple("f" * 8_000 for _ in range(128)),
+        published_head=head_sha,
+        ci=CiReceipt(
+            provider="github",
+            head_sha=head_sha,
+            status="passed",
+            checks=[
+                CiCheckResult(
+                    name=f"check-{index}",
+                    status="passed",
+                    output="c" * 8_000,
+                )
+                for index in range(256)
+            ],
+        ),
+    )
+
+    body = _pull_request_body("run-1234567890", content)
+
+    assert len(body) <= _PULL_REQUEST_BODY_LIMIT
+    assert f"Published head: `{head_sha}`" in body
+    assert "orkastrator run: `run-1234567890`" in body
+    assert "[truncated]" in body
+
+
 async def test_create_draft_pr_observe_exact_checks_and_mark_ready(tmp_path: Path) -> None:
     sha = "b" * 40
     runner = QueueRunner(
@@ -83,7 +328,11 @@ async def test_create_draft_pr_observe_exact_checks_and_mark_ready(tmp_path: Pat
     publisher = GitHubPublisher(runner=runner)
 
     receipt = await publisher.publish(
-        run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+        run_id="run-1234567890",
+        lane=lane(tmp_path),
+        head_sha=sha,
+        previous=None,
+        content=publication_content(),
     )
     checks = await publisher.checks(receipt)
     ready = await publisher.mark_ready(receipt)
@@ -440,6 +689,7 @@ async def test_update_owned_branch_and_existing_pr(tmp_path: Path) -> None:
         lane=lane(tmp_path),
         head_sha=new_sha,
         previous=previous,
+        content=publication_content(),
     )
 
     assert receipt.head_sha == new_sha
@@ -472,6 +722,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
             lane=lane(tmp_path),
             head_sha="b" * 40,
             previous=previous,
+            content=publication_content(),
         )
 
     unowned = QueueRunner(
@@ -486,6 +737,7 @@ async def test_refuses_divergence_existing_unowned_branch_and_non_github_remote(
             lane=lane(tmp_path),
             head_sha="b" * 40,
             previous=None,
+            content=publication_content(),
         )
 
     assert _github_repository("https://github.com/owner/repo") == "owner/repo"
@@ -518,7 +770,11 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
     )
 
     receipt = await GitHubPublisher(runner=runner).publish(
-        run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+        run_id="run-1234567890",
+        lane=lane(tmp_path),
+        head_sha=sha,
+        previous=None,
+        content=publication_content(),
     )
 
     assert receipt.head_sha == sha
@@ -549,6 +805,7 @@ async def test_recovers_push_and_pr_created_before_local_receipt(tmp_path: Path)
         lane=lane(tmp_path),
         head_sha=sha,
         previous=previous,
+        content=publication_content(),
     )
     assert recovered_update.head_sha == sha
     assert not any(call[:2] == ("git", "push") for call in update_runner.calls)
@@ -807,7 +1064,11 @@ async def test_closed_lane_pr_blocks_instead_of_creating_another(tmp_path: Path)
 
     with pytest.raises(PublicationError, match="closed without merging"):
         await GitHubPublisher(runner=runner).publish(
-            run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+            run_id="run-1234567890",
+            lane=lane(tmp_path),
+            head_sha=sha,
+            previous=None,
+            content=publication_content(),
         )
 
 
@@ -896,6 +1157,7 @@ async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> Non
             lane=lane(tmp_path),
             head_sha=sha,
             previous=None,
+            content=publication_content(),
         )
 
     missing = lane(tmp_path).model_copy(update={"worktree_id": None})
@@ -909,6 +1171,7 @@ async def test_check_mapping_and_adapter_error_boundaries(tmp_path: Path) -> Non
             lane=lane(tmp_path),
             head_sha=sha,
             previous=None,
+            content=publication_content(),
         )
 
 
@@ -1036,7 +1299,11 @@ async def test_a_merged_pull_request_is_the_lane_landing_not_a_failure(tmp_path:
     )
 
     receipt = await GitHubPublisher(runner=runner).publish(
-        run_id="run-1234567890", lane=lane(tmp_path), head_sha=sha, previous=None
+        run_id="run-1234567890",
+        lane=lane(tmp_path),
+        head_sha=sha,
+        previous=None,
+        content=publication_content(),
     )
 
     assert receipt.landed is True
@@ -1072,7 +1339,11 @@ async def test_a_pull_request_merged_at_another_head_is_refused(tmp_path: Path) 
 
     with pytest.raises(PublicationError, match="which is not this lane's integrated head"):
         await GitHubPublisher(runner=runner).publish(
-            run_id="run-1234567890", lane=lane(tmp_path), head_sha="b" * 40, previous=None
+            run_id="run-1234567890",
+            lane=lane(tmp_path),
+            head_sha="b" * 40,
+            previous=None,
+            content=publication_content(),
         )
 
 

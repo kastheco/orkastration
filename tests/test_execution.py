@@ -55,6 +55,9 @@ from tests.factories import (
     review_finding_data,
 )
 
+# isort: split
+from orkastrator.publication import PublicationContent
+
 
 def config(
     *,
@@ -648,6 +651,7 @@ class FakePublisher:
     def __init__(self, statuses: list[str] | None = None) -> None:
         self.statuses = list(statuses or ["passed"])
         self.publish_calls: list[tuple[str, str | None]] = []
+        self.reconcile_calls: list[PublicationContent] = []
         self.ready_calls: list[str] = []
         self.land_calls: list[str] = []
         self.merge_candidates: list[MergeCandidate] = []
@@ -660,6 +664,7 @@ class FakePublisher:
         lane: LaneRecord,
         head_sha: str,
         previous: PublicationReceipt | None,
+        content: PublicationContent,
     ) -> PublicationReceipt:
         self.publish_calls.append((head_sha, previous.head_sha if previous else None))
         return PublicationReceipt(
@@ -672,6 +677,10 @@ class FakePublisher:
             head_sha=head_sha,
             draft=True,
         )
+
+    async def reconcile(self, receipt: PublicationReceipt, content: PublicationContent) -> None:
+        assert receipt.head_sha == content.published_head
+        self.reconcile_calls.append(content)
 
     async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
@@ -3560,6 +3569,20 @@ async def test_publication_is_idempotent_and_exact_pending_head_stays_active(
 
     assert first.status == second.status == "active"
     assert publisher.publish_calls == [("b" * 40, None)]
+    assert len(publisher.reconcile_calls) == 2
+    assert publisher.reconcile_calls[0] == publisher.reconcile_calls[1]
+    content = publisher.reconcile_calls[-1]
+    assert content.accepted_scope == "Implement ISSUE-100."
+    assert content.stop_condition == "Tests pass."
+    assert content.implementation_summary == "Implemented and verified."
+    assert [(item.command, item.status, item.output) for item in content.validation_results] == [
+        ("pytest", "passed", "passed")
+    ]
+    assert content.review_summary == "Reviewed."
+    assert content.published_head == "b" * 40
+    assert content.ci is not None
+    assert content.ci.head_sha == "b" * 40
+    assert content.ci.status == "pending"
     assert store.publications(run_id)[0].draft
     assert store.ci_receipts(run_id)[0].head_sha == "b" * 40
 
@@ -4974,6 +4997,7 @@ async def test_stale_ci_sha_and_publication_errors_block_the_lane_once_they_pers
             lane: LaneRecord,
             head_sha: str,
             previous: PublicationReceipt | None,
+            content: PublicationContent,
         ) -> PublicationReceipt:
             raise PublicationError("authentication failed")
 
@@ -6658,9 +6682,14 @@ async def test_a_lane_published_onto_a_merged_pull_request_never_asks_for_checks
             lane: LaneRecord,
             head_sha: str,
             previous: PublicationReceipt | None,
+            content: PublicationContent,
         ) -> PublicationReceipt:
             receipt = await super().publish(
-                run_id=run_id, lane=lane, head_sha=head_sha, previous=previous
+                run_id=run_id,
+                lane=lane,
+                head_sha=head_sha,
+                previous=previous,
+                content=content,
             )
             return receipt.model_copy(update={"draft": False, "landed": True})
 

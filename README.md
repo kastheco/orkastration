@@ -297,6 +297,13 @@ an event and a supervisor hand-action receipt.
 Close out a finding no further agent round can settle. This is the owner's decision, not the graph's,
 so it is a separate command from `reopen` and it records the note as evidence:
 
+### KAS-706 pull-request content
+
+Pull-request content comes from the accepted lane scope, worker summary and validation, independent
+review, exact published head, and the latest exact-head CI rollup. The GitHub adapter receives that
+evidence through a typed content boundary and reconciles the same owned draft as CI changes; absent
+optional evidence is omitted rather than replaced with generic copy.
+
 ```bash
 uv run --project /home/kas/dev/orkastrator orkas settle <run-id> \
   --finding <finding-id> --phase deferred --note "why" --json
