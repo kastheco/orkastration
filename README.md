@@ -255,6 +255,11 @@ A run accepted before the policy payload was stored has nothing to diff against.
 than printing an empty change list, and records its policy the first time it is read while unchanged,
 so the next change is readable.
 
+A lane that went down only because one of its findings is blocked comes back on its own once that
+finding resolves. Any other standing cause, including a latched one like an exhausted CI fix round
+limit, keeps the lane blocked, because releasing on the newest cause alone would drop the ones
+underneath it.
+
 A lane can block with every one of its findings already settled, on a required-check query made a
 second after pushing its branch, or on a pull request somebody merged out from under it. `reopen` and
 `settle` both act on findings, so neither reaches that lane. `resume` does:
