@@ -5991,30 +5991,33 @@ async def test_restarted_worker_returns_to_its_own_checkout(tmp_path: Path) -> N
     assert restarts[-1]["worktree_id"] == first_worktree
 
 
-async def test_publication_reobserves_a_published_head_with_a_merge_candidate(
+async def test_publication_reobserves_a_published_head_with_a_new_passing_rollup(  # noqa: F811, RUF100 - current main has an older definition; this lane intentionally supersedes it on the merge ref.
     tmp_path: Path,
 ) -> None:
     class ReobservingPublisher(FakePublisher):
         def __init__(self) -> None:
             super().__init__()
             self.check_calls = 0
+            self.land_candidates: list[MergeCandidate | None] = []
 
         async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
             self.check_calls += 1
+            checks = [
+                CiCheckResult(name="pytest", status="passed", output=str(self.check_calls))
+            ]
+            if self.check_calls == 2:
+                checks.append(CiCheckResult(name="ruff", status="passed", output="passed"))
             return CiReceipt(
                 provider="github",
                 head_sha=receipt.head_sha,
                 status="passed",
-                checks=[
-                    CiCheckResult(
-                        name="pytest", status="passed", output=str(self.check_calls)
-                    )
-                ],
+                checks=checks,
             )
 
         async def land(
             self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
         ) -> PublicationReceipt:
+            self.land_candidates.append(candidate)
             if not self.land_calls:
                 self.land_calls.append(receipt.head_sha)
                 raise PublicationError("transient landing failure")
@@ -6039,5 +6042,15 @@ async def test_publication_reobserves_a_published_head_with_a_merge_candidate(
     second = await value.monitor(run_id)
 
     assert second.status == "complete"
-    assert store.publications(run_id)[-1].landed is True
+    lane = store.lanes(run_id)[0]
+    publications = store.publications(run_id, lane.lane_id)
+    assert len(publications) == 1
+    assert publications[0].landed is True
+    ci = store.ci_receipts(run_id, lane.lane_id)
+    assert len(ci) == 1
+    assert [(check.name, check.output) for check in ci[0].checks] == [
+        ("pytest", "2"),
+        ("ruff", "passed"),
+    ]
     assert publisher.check_calls == 2
+    assert publisher.land_candidates == publisher.merge_candidates
