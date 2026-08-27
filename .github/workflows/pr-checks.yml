@@ -76,7 +76,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.19.0"
-          cache: npm
       - run: npm install --ignore-scripts
       - name: typecheck
         run: npm run typecheck
