@@ -5989,3 +5989,55 @@ async def test_restarted_worker_returns_to_its_own_checkout(tmp_path: Path) -> N
     restarts = [start for start in orca.starts if start["task_id"] == worker.orca_task_id]
     assert len(restarts) == 2
     assert restarts[-1]["worktree_id"] == first_worktree
+
+
+async def test_publication_reobserves_a_published_head_with_a_merge_candidate(
+    tmp_path: Path,
+) -> None:
+    class ReobservingPublisher(FakePublisher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.check_calls = 0
+
+        async def checks(self, receipt: PublicationReceipt) -> CiReceipt:
+            self.check_calls += 1
+            return CiReceipt(
+                provider="github",
+                head_sha=receipt.head_sha,
+                status="passed",
+                checks=[
+                    CiCheckResult(
+                        name="pytest", status="passed", output=str(self.check_calls)
+                    )
+                ],
+            )
+
+        async def land(
+            self, receipt: PublicationReceipt, *, candidate: MergeCandidate | None = None
+        ) -> PublicationReceipt:
+            if not self.land_calls:
+                self.land_calls.append(receipt.head_sha)
+                raise PublicationError("transient landing failure")
+            return await super().land(receipt, candidate=candidate)
+
+    orca = FakeOrca()
+    publisher = ReobservingPublisher()
+    value, store = controller(
+        tmp_path,
+        orca,
+        graph_config=config(merge=True),
+        publisher=publisher,
+    )
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_initial_review(value, orca, run_id)
+    orca.complete_dispatched(initial_review_report_json())
+
+    first = await value.monitor(run_id)
+    assert first.status == "active"
+
+    second = await value.monitor(run_id)
+
+    assert second.status == "complete"
+    assert store.publications(run_id)[-1].landed is True
+    assert publisher.check_calls == 2
