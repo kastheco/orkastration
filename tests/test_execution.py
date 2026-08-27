@@ -6005,7 +6005,11 @@ async def test_publication_reobserves_a_published_head_with_a_new_passing_rollup
                 provider="github",
                 head_sha=receipt.head_sha,
                 status="passed",
-                checks=[CiCheckResult(name="pytest", status="passed", output=str(self.check_calls))],
+                checks=[
+                    CiCheckResult(
+                        name="pytest", status="passed", output=str(self.check_calls)
+                    )
+                ],
             )
 
         async def land(
