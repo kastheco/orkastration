@@ -2615,6 +2615,7 @@ class ExecutionController:
         if len(matches) != 1:
             raise ValueError(f"run {run_id} has no unique finding {source_finding_id}")
         source = matches[0]
+        self._store.assert_recovery_allowed(run_id, source_finding_id, finding.id)
         lane = next(item for item in self._store.lanes(run_id) if item.lane_id == source.lane_id)
         if lane.worktree_id is None or lane.integration_head_sha is None:
             raise ValueError(f"lane {lane.name} has no integration checkout and recorded head")

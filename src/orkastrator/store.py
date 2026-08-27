@@ -1180,6 +1180,58 @@ class StateStore:
             ).one()
             return _finding(row)
 
+    def assert_recovery_allowed(self, run_id: str, source_finding_id: str, finding_id: str) -> None:
+        """Refuse an impossible recovery before anything runs against the checkout.
+
+        The same refusals stand inside `record_recovery_finding`, which is where
+        they are authoritative; this is the read-only rehearsal so a recovery
+        aimed at a merged lane or an in-flight source finding does not execute
+        validation commands in the lane worktree only to be turned away after.
+        """
+
+        with self._session() as session:
+            self._recovery_preconditions(session, run_id, source_finding_id, finding_id)
+
+    def _recovery_preconditions(
+        self,
+        session: Session,
+        run_id: str,
+        source_finding_id: str,
+        finding_id: str,
+    ) -> tuple[FindingRow, LaneRow, FindingPhase]:
+        source = session.exec(
+            select(FindingRow)
+            .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
+            .where(LaneRow.run_id == run_id, FindingRow.finding_id == source_finding_id)
+        ).first()
+        if source is None:
+            raise KeyError(f"run {run_id} has no finding {source_finding_id}")
+        source_phase = FindingPhase(source.phase)
+        if source_phase not in {
+            FindingPhase.BLOCKED,
+            FindingPhase.RESOLVED,
+            FindingPhase.DEFERRED,
+        }:
+            raise ValueError(
+                f"finding {source_finding_id} is {source_phase.value}, not settled or blocked"
+            )
+        if finding_id == source_finding_id:
+            raise ValueError("a recovery finding needs a new finding id")
+        lane = session.get(LaneRow, source.lane_id)
+        if lane is None:
+            raise KeyError(f"unknown lane {source.lane_id}")
+        published = session.exec(
+            select(PublicationRow).where(PublicationRow.lane_id == source.lane_id)
+        ).all()
+        if any(
+            PublicationReceipt.model_validate_json(row.payload_json).landed for row in published
+        ):
+            raise ValueError(
+                f"lane {lane.name} has already landed its pull request; a recovery finding "
+                "cannot be integrated into a merged lane"
+            )
+        return source, lane, source_phase
+
     def record_recovery_finding(
         self,
         run_id: str,
@@ -1191,37 +1243,9 @@ class StateStore:
         """Freeze a new finding beside its historical source without rewriting either."""
 
         with self._session() as session:
-            source = session.exec(
-                select(FindingRow)
-                .join(LaneRow, col(LaneRow.lane_id) == col(FindingRow.lane_id))
-                .where(LaneRow.run_id == run_id, FindingRow.finding_id == source_finding_id)
-            ).first()
-            if source is None:
-                raise KeyError(f"run {run_id} has no finding {source_finding_id}")
-            source_phase = FindingPhase(source.phase)
-            if source_phase not in {
-                FindingPhase.BLOCKED,
-                FindingPhase.RESOLVED,
-                FindingPhase.DEFERRED,
-            }:
-                raise ValueError(
-                    f"finding {source_finding_id} is {source_phase.value}, not settled or blocked"
-                )
-            if finding.id == source_finding_id:
-                raise ValueError("a recovery finding needs a new finding id")
-            lane = session.get(LaneRow, source.lane_id)
-            if lane is None:
-                raise KeyError(f"unknown lane {source.lane_id}")
-            published = session.exec(
-                select(PublicationRow).where(PublicationRow.lane_id == source.lane_id)
-            ).all()
-            if any(
-                PublicationReceipt.model_validate_json(row.payload_json).landed for row in published
-            ):
-                raise ValueError(
-                    f"lane {lane.name} has already landed its pull request; a recovery finding "
-                    "cannot be integrated into a merged lane"
-                )
+            source, lane, source_phase = self._recovery_preconditions(
+                session, run_id, source_finding_id, finding.id
+            )
             created = self._insert_finding(
                 session,
                 source.lane_id,
@@ -2349,28 +2373,15 @@ class StateStore:
             ).first()
             if blocking is not None:
                 return False
-            event = session.exec(
-                select(EventRow)
-                .where(
-                    EventRow.run_id == run_id,
-                    EventRow.lane_id == lane_id,
-                    EventRow.kind == "lane_blocked",
-                )
-                .order_by(col(EventRow.created_at).desc(), col(EventRow.event_id).desc())
-            ).first()
-            if event is None:
+            causes = self._standing_block_causes(session, run_id, lane_id)
+            if not causes or not all(self._is_finding_block(payload) for payload in causes):
+                # A lane can be down for more than one thing at a time. Releasing
+                # on the newest cause alone drops the ones underneath it, and a
+                # cause that is latched rather than re-derived every tick - the
+                # exhausted CI fix round limit is one - never comes back, leaving
+                # the lane ACTIVE in front of a gate that can no longer pass.
                 return False
-            payload = json.loads(event.payload_json)
-            if not isinstance(payload, dict):
-                return False
-            reason = payload.get("reason")
-            legacy_finding_block = (
-                isinstance(reason, str)
-                and reason.startswith("finding ")
-                and reason.endswith(": the lane cannot converge while it stands")
-            )
-            if payload.get("source") != "finding" and not legacy_finding_block:
-                return False
+            reason = causes[-1].get("reason")
             lane.phase = LanePhase.ACTIVE.value
             lane.updated_at = _now()
             run = session.get(SupervisorRunRow, run_id)
@@ -2385,6 +2396,49 @@ class StateStore:
                 {"previous_reason": reason},
             )
             return True
+
+    @staticmethod
+    def _standing_block_causes(
+        session: Session, run_id: str, lane_id: str
+    ) -> list[dict[str, object]]:
+        """Every cause recorded since this lane last went down, oldest first.
+
+        A lane enters BLOCKED once and then collects a `lane_blocked` row per
+        distinct cause, so the causes that still stand are the ones written after
+        the most recent transition into BLOCKED. Anything older belongs to an
+        earlier episode the lane has already come out of.
+        """
+
+        rows = session.exec(
+            select(EventRow)
+            .where(
+                EventRow.run_id == run_id,
+                EventRow.lane_id == lane_id,
+                col(EventRow.kind).in_(["lane_blocked", "lane_transitioned"]),
+            )
+            .order_by(col(EventRow.created_at), col(EventRow.event_id))
+        ).all()
+        causes: list[dict[str, object]] = []
+        for row in rows:
+            payload = json.loads(row.payload_json)
+            if not isinstance(payload, dict):
+                continue
+            if row.kind == "lane_transitioned":
+                if payload.get("phase") == LanePhase.BLOCKED.value:
+                    causes = []
+                continue
+            causes.append(payload)
+        return causes
+
+    @staticmethod
+    def _is_finding_block(payload: dict[str, object]) -> bool:
+        reason = payload.get("reason")
+        legacy_finding_block = (
+            isinstance(reason, str)
+            and reason.startswith("finding ")
+            and reason.endswith(": the lane cannot converge while it stands")
+        )
+        return payload.get("source") == "finding" or legacy_finding_block
 
     @staticmethod
     def _latest_block_reason(session: Session, run_id: str, lane_id: str) -> str | None:

@@ -3218,6 +3218,43 @@ async def test_a_lane_blocked_for_the_same_reason_is_recorded_once(tmp_path: Pat
     assert len([item for item in store.events(run_id) if item["kind"] == "lane_blocked"]) == 3
 
 
+async def test_releasing_a_finding_block_leaves_another_standing_cause_in_place(
+    tmp_path: Path,
+) -> None:
+    """A lane down for two things is not back up when one of them clears.
+
+    The exhausted CI fix round limit is recorded once and never re-derived,
+    because the failure is already on file for that published head. Releasing
+    the newest block without looking underneath it drops that cause, and the
+    lane goes ACTIVE in front of a gate that can no longer pass.
+    """
+
+    orca = FakeOrca()
+    value, store = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    lane = store.lanes(run_id)[0]
+    finding_block = (
+        "finding finding-1 is blocked at round 1: the lane cannot converge while it stands"
+    )
+    store.block_lane(run_id, lane.lane_id, "CI fix round limit exhausted")
+    store.block_lane(run_id, lane.lane_id, finding_block, source="finding")
+    store.set_terminal_status(run_id, "blocked")
+
+    assert store.release_finding_block(run_id, lane.lane_id) is False
+    assert store.lanes(run_id)[0].phase is LanePhase.BLOCKED
+    assert store.run(run_id).status == "blocked"
+
+    # The block a finding owns on its own still releases.
+    value.resume(run_id, lane.name, "the CI failure was cleared by hand")
+    store.block_lane(run_id, lane.lane_id, finding_block, source="finding")
+    store.set_terminal_status(run_id, "blocked")
+
+    assert store.release_finding_block(run_id, lane.lane_id) is True
+    assert store.lanes(run_id)[0].phase is LanePhase.ACTIVE
+    assert store.run(run_id).status == "active"
+
+
 async def test_resuming_a_run_with_nothing_blocked_is_refused(tmp_path: Path) -> None:
     orca = FakeOrca()
     value, _ = controller(tmp_path, orca)
@@ -5556,6 +5593,73 @@ async def test_recovery_refuses_a_lane_whose_pull_request_already_landed(tmp_pat
 
     assert [item.finding_id for item in store.findings(run_id)] == [source.finding_id]
     assert store.lanes(run_id)[0].phase is LanePhase.COMPLETE
+
+
+async def test_a_refused_recovery_runs_nothing_in_the_lane_checkout(tmp_path: Path) -> None:
+    """Refuse first, then touch the worktree - never the other way round.
+
+    A recovery aimed at a source finding that is still in flight has a fixer of
+    its own working in that checkout, and one aimed at a merged lane has nowhere
+    to put a fix at all. Freezing validation baselines first runs the contract's
+    commands there before either refusal is reached.
+    """
+
+    orca = FakeOrca()
+    git = FakeGit()
+    value, store = controller(tmp_path, orca, git=git)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+    source = store.findings(run_id)[0]
+    assert source.phase not in {
+        FindingPhase.BLOCKED,
+        FindingPhase.RESOLVED,
+        FindingPhase.DEFERRED,
+    }
+    recovery_data = review_finding_data(2)
+    recovery_data.pop("review_revision")
+    before = len(git.validation_calls)
+
+    with pytest.raises(ValueError, match="not settled or blocked"):
+        await value.recover_finding(
+            run_id,
+            source.finding_id,
+            ReviewFinding.model_validate(recovery_data),
+            "CI failed while the fixer was still working",
+        )
+
+    assert len(git.validation_calls) == before
+
+    store.set_finding_state(run_id, source.finding_key, phase=FindingPhase.RESOLVED)
+    lane = store.lanes(run_id)[0]
+    assert lane.integration_head_sha is not None
+    store.record_publication(
+        run_id,
+        lane.lane_id,
+        PublicationReceipt(
+            run_id=run_id,
+            lane=lane.name,
+            remote_url="git@github.com:example/repo.git",
+            base_branch="main",
+            branch=f"orkastrator/{run_id[:12]}/{lane.name}",
+            pull_request_url="https://github.com/example/repo/pull/1",
+            head_sha=lane.integration_head_sha,
+            draft=False,
+            landed=True,
+            merge_sha="e" * 40,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="already landed its pull request"):
+        await value.recover_finding(
+            run_id,
+            source.finding_id,
+            ReviewFinding.model_validate(recovery_data),
+            "CI failed after the lane merged",
+        )
+
+    assert len(git.validation_calls) == before
+    assert [item.finding_id for item in store.findings(run_id)] == [source.finding_id]
 
 
 async def test_a_conflict_retry_is_rebuilt_on_the_lane_head_it_has_to_land_on(
