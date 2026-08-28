@@ -86,6 +86,16 @@ def config(
         "strength": "high",
         "trigger": "capability_mismatch",
     }
+    re_reviewer = roles["re_reviewer"]
+    assert isinstance(re_reviewer, dict)
+    re_reviewer = dict(re_reviewer)
+    roles["re_reviewer"] = re_reviewer
+    re_reviewer["fallback"] = {
+        "agent": "claude",
+        "model": "sonnet-fallback",
+        "strength": "low",
+        "trigger": "capability_mismatch",
+    }
     publication = raw["publication"]
     assert isinstance(publication, dict)
     publication["merge"] = merge
@@ -1339,6 +1349,29 @@ async def test_capability_mismatch_uses_fallback_without_consuming_round(tmp_pat
     profile = orca.starts[-1]["profile"]
     assert isinstance(profile, AgentProfile)
     assert profile.model == "gpt-fallback"
+
+
+async def test_blocked_re_review_uses_fallback_without_consuming_round(tmp_path: Path) -> None:
+    orca = FakeOrca()
+    value, _ = controller(tmp_path, orca)
+    run_id = value.propose(proposal()).run_id
+    await value.accept(run_id)
+    await advance_to_fixer(value, orca, run_id, review_finding_data())
+
+    orca.complete_dispatched(fix_attempt())
+    await value.monitor(run_id)
+    orca.complete_dispatched(re_review("blocked"))
+    result = await value.monitor(run_id)
+
+    assert result.findings[0].round == 1
+    assert result.started[0].role is StageKind.RE_REVIEWER
+    profile = orca.starts[-1]["profile"]
+    assert isinstance(profile, AgentProfile)
+    assert profile.model == "sonnet-fallback"
+
+    orca.complete_dispatched(re_review("resolved"))
+    result = await value.monitor(run_id)
+    assert result.status == "complete"
 
 
 async def test_scope_block_routes_to_escalation(tmp_path: Path) -> None:

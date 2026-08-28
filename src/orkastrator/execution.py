@@ -961,6 +961,17 @@ class ExecutionController:
                 self._store.set_finding_state(
                     run_id, finding.finding_key, phase=FindingPhase.PENDING_COMPOSITE
                 )
+        elif (
+            result.verdict == "blocked"
+            and stage.attempt_kind is AttemptKind.PRIMARY
+            and self._config.roles.re_reviewer.fallback is not None
+        ):
+            self._store.set_finding_state(
+                run_id,
+                finding.finding_key,
+                phase=FindingPhase.PENDING_RE_REVIEW,
+                escalation_reason=FindingReason.CAPABILITY_FALLBACK,
+            )
         else:
             self._escalate(run_id, finding, FindingReason.AMBIGUOUS_RESULT)
 
@@ -1645,7 +1656,15 @@ class ExecutionController:
                         attempt_kind=attempt_kind,
                     )
                 elif finding.phase is FindingPhase.PENDING_RE_REVIEW:
-                    base = f"{lane.lane_id}:{finding.finding_id}:re-review:{finding.round}"
+                    attempt_kind = (
+                        AttemptKind.FALLBACK
+                        if finding.escalation_reason is FindingReason.CAPABILITY_FALLBACK
+                        else AttemptKind.PRIMARY
+                    )
+                    base = (
+                        f"{lane.lane_id}:{finding.finding_id}:re-review:"
+                        f"{finding.round}:{attempt_kind.value}"
+                    )
                     self._store.ensure_stage(
                         run_id,
                         lane.lane_id,
@@ -1654,6 +1673,7 @@ class ExecutionController:
                         finding_key=finding.finding_key,
                         finding_id=finding.finding_id,
                         round=finding.round,
+                        attempt_kind=attempt_kind,
                     )
                 elif finding.phase is FindingPhase.PENDING_ESCALATION:
                     reason = finding.escalation_reason or FindingReason.AMBIGUOUS_RESULT
@@ -3071,12 +3091,19 @@ class ExecutionController:
     def _profile(self, stage: StageRecord) -> AgentProfile:
         if stage.role is StageKind.ESCALATION:
             return self._config.review_cycle.escalation
-        if stage.role is StageKind.FIXER and stage.attempt_kind is AttemptKind.FALLBACK:
+        profile = cast(AgentProfile, getattr(self._config.roles, stage.role.value))
+        if stage.attempt_kind is AttemptKind.FALLBACK:
+            if stage.role not in {StageKind.FIXER, StageKind.RE_REVIEWER}:
+                raise ValueError(f"{stage.role.value} stage cannot use a fallback profile")
             fallback = self._config.roles.fixer.fallback
+            if stage.role is StageKind.RE_REVIEWER:
+                fallback = self._config.roles.re_reviewer.fallback
             if fallback is None:
-                raise ValueError("fallback fixer stage has no configured fallback")
+                raise ValueError(
+                    f"fallback {stage.role.value} stage has no configured fallback"
+                )
             return fallback
-        return cast(AgentProfile, getattr(self._config.roles, stage.role.value))
+        return profile
 
     async def _stage_spec(
         self,
