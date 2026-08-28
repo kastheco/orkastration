@@ -1,0 +1,992 @@
+import { spawnSync } from "node:child_process";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+
+import {
+  type AwaitOwnerInput,
+  type CreateRunInput,
+  type JsonObject,
+  type OwnerAnswerInput,
+  type OwnershipInput,
+  RUN_STATES,
+  type RunActor,
+  type RunEvent,
+  type RunLoadResult,
+  type RunRecord,
+  type RunState,
+  TERMINAL_RUN_STATES,
+  type TransitionInput,
+} from "./types.ts";
+
+const MAX_POLICY_BYTES = 1_048_576;
+const MAX_OBJECTIVE_CHARS = 8_000;
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const RUN_STATE_SET = new Set<string>(RUN_STATES);
+const RUN_ACTOR_SET = new Set<string>([
+  "owner",
+  "extension",
+  "supervisor",
+  "worker",
+  "system",
+]);
+
+export class LedgerError extends Error {}
+export class LedgerCorruptionError extends LedgerError {}
+export class ActiveRunError extends LedgerError {}
+export class RebindConflictError extends LedgerError {}
+
+export function ownershipFingerprint(
+  record: Pick<RunRecord, "ownedProcesses" | "worktrees">,
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      ownedProcesses: record.ownedProcesses,
+      worktrees: record.worktrees,
+    }))
+    .digest("hex");
+}
+
+export interface RunLedgerOptions {
+  root?: string;
+  now?: () => Date;
+  randomId?: () => string;
+}
+
+interface EventInput {
+  type: string;
+  ruleId: string;
+  actor: RunActor;
+  evidence?: JsonObject;
+  fromState?: RunState;
+  toState?: RunState;
+}
+
+interface ParsedEvents {
+  events: RunEvent[];
+  droppedBytes: number;
+  completeBytes: Buffer;
+}
+
+export class RunLedger {
+  readonly root: string;
+  readonly #now: () => Date;
+  readonly #randomId: () => string;
+  #lockDepth = 0;
+
+  constructor(options: RunLedgerOptions = {}) {
+    const requestedRoot = resolve(
+      options.root ?? join(homedir(), ".local", "state", "orkastrator", "runs"),
+    );
+    this.#now = options.now ?? (() => new Date());
+    this.#randomId = options.randomId ?? randomUUID;
+    mkdirSync(requestedRoot, { recursive: true, mode: 0o700 });
+    this.root = realpathSync(requestedRoot);
+    this.#fsyncDirectory(this.root);
+    this.#fsyncDirectory(dirname(this.root));
+  }
+
+  createRun(input: CreateRunInput): RunRecord {
+    return this.#withWriterLock(() => this.#createRun(input));
+  }
+
+  #createRun(input: CreateRunInput): RunRecord {
+    const objective = input.objective.trim();
+    if (objective.length === 0 || objective.length > MAX_OBJECTIVE_CHARS) {
+      throw new LedgerError(`objective must contain 1-${MAX_OBJECTIVE_CHARS} characters`);
+    }
+    if (input.supervisorSessionId.trim().length === 0) {
+      throw new LedgerError("supervisor session ID is required");
+    }
+    if (!isAbsolute(input.repositoryRoot)) {
+      throw new LedgerError("repository root must be absolute");
+    }
+    const policyBytes = Buffer.byteLength(input.policySnapshot, "utf8");
+    if (policyBytes === 0 || policyBytes > MAX_POLICY_BYTES) {
+      throw new LedgerError(`policy snapshot must contain 1-${MAX_POLICY_BYTES} bytes`);
+    }
+    const active = this.activeRunsForSession(input.supervisorSessionId);
+    if (active.length > 0) {
+      throw new ActiveRunError(
+        `session ${input.supervisorSessionId} already owns active run ${active[0]?.runId}`,
+      );
+    }
+
+    const runId = this.#randomId();
+    const directory = this.runDirectory(runId);
+    mkdirSync(directory, { mode: 0o700 });
+    this.#assertSafeRunDirectory(directory);
+    let eventAppendStarted = false;
+    try {
+      this.#fsyncDirectory(this.root);
+      this.#writeDurable(join(directory, "policy.yaml"), input.policySnapshot);
+      const timestamp = this.#timestamp();
+      const record: RunRecord = {
+        schemaVersion: 1,
+        runId,
+        objective,
+        supervisorSessionId: input.supervisorSessionId,
+        repositoryRoot: resolve(input.repositoryRoot),
+        policyHash: createHash("sha256").update(input.policySnapshot).digest("hex"),
+        policyFile: "policy.yaml",
+        generation: 1,
+        hostPid: input.hostPid ?? process.pid,
+        sequence: 1,
+        state: "submitted",
+        reason: "run_created",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        ownedProcesses: [],
+        worktrees: [],
+      };
+      const event: RunEvent = {
+        schemaVersion: 1,
+        eventId: this.#randomId(),
+        runId,
+        sequence: 1,
+        timestamp,
+        type: "run_created",
+        toState: "submitted",
+        ruleId: "run.create",
+        actor: "owner",
+        evidence: {
+          repositoryRoot: record.repositoryRoot,
+          policyHash: record.policyHash,
+        },
+        projection: record,
+      };
+      eventAppendStarted = true;
+      this.#appendEvent(directory, event);
+      this.#writeState(directory, record);
+      return record;
+    } catch (error) {
+      if (!eventAppendStarted) {
+        rmSync(directory, { recursive: true, force: true });
+        this.#fsyncDirectory(this.root);
+      }
+      throw error;
+    }
+  }
+
+  loadRun(runId: string): RunLoadResult {
+    const directory = this.runDirectory(runId);
+    this.#assertSafeRunDirectory(directory);
+    const parsed = this.#readEvents(directory);
+    if (parsed.droppedBytes > 0 && this.#lockDepth === 0) {
+      return this.#withWriterLock(() => this.loadRun(runId));
+    }
+    const last = parsed.events.at(-1);
+    if (last === undefined) throw new LedgerCorruptionError(`run ${runId} has no ledger events`);
+    let record = last.projection;
+    this.#assertRecord(record, runId);
+    const policyPath = join(directory, record.policyFile);
+    this.#assertRegularFile(policyPath, "policy snapshot");
+    const policyHash = createHash("sha256")
+      .update(readFileSync(policyPath))
+      .digest("hex");
+    if (policyHash !== record.policyHash) {
+      throw new LedgerCorruptionError(`run ${runId} policy snapshot hash does not match`);
+    }
+
+    const statePath = join(directory, "state.json");
+    let stateNeedsRepair = true;
+    if (existsSync(statePath)) {
+      this.#assertRegularFile(statePath, "state projection");
+      try {
+        const projected = JSON.parse(readFileSync(statePath, "utf8")) as unknown;
+        if (
+          isObject(projected) &&
+          typeof projected.sequence === "number" &&
+          projected.sequence > record.sequence
+        ) {
+          throw new LedgerCorruptionError(
+            `run ${runId} state sequence ${projected.sequence} exceeds event sequence ${record.sequence}`,
+          );
+        }
+        this.#assertRecord(projected, runId);
+        stateNeedsRepair = JSON.stringify(projected) !== JSON.stringify(record);
+      } catch (error) {
+        if (error instanceof LedgerCorruptionError && /exceeds event sequence/u.test(error.message)) {
+          throw error;
+        }
+      }
+    }
+    if (parsed.droppedBytes === 0) {
+      if (stateNeedsRepair && this.#lockDepth === 0) {
+        return this.#withWriterLock(() => this.loadRun(runId));
+      }
+      if (stateNeedsRepair) this.#writeState(directory, record);
+      return { record };
+    }
+    const previousSequence = record.sequence;
+    const recovered = this.#nextEvent(record, record, {
+      type: "ledger_tail_recovered",
+      ruleId: "ledger.recover_truncated_tail",
+      actor: "system",
+      evidence: { droppedBytes: parsed.droppedBytes, previousSequence },
+    });
+    this.#replaceEventLog(directory, parsed.completeBytes, recovered.event);
+    this.#writeState(directory, recovered.record);
+    record = recovered.record;
+    return {
+      record,
+      recovery: { droppedBytes: parsed.droppedBytes, previousSequence },
+    };
+  }
+
+  events(runId: string): RunEvent[] {
+    this.loadRun(runId);
+    return this.#readEvents(this.runDirectory(runId)).events;
+  }
+
+  policySnapshot(runId: string): string {
+    this.loadRun(runId);
+    return readFileSync(join(this.runDirectory(runId), "policy.yaml"), "utf8");
+  }
+
+  scanNonterminal(): RunRecord[] {
+    const records: RunRecord[] = [];
+    for (const entry of readdirSync(this.root, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      if (!RUN_ID_PATTERN.test(entry.name)) continue;
+      if (!entry.isDirectory()) {
+        throw new LedgerCorruptionError(`run entry is not a real directory: ${entry.name}`);
+      }
+      const eventsPath = join(this.root, entry.name, "events.jsonl");
+      if (!existsSync(eventsPath)) {
+        throw new LedgerCorruptionError(`run ${entry.name} has no event ledger`);
+      }
+      const record = this.loadRun(entry.name).record;
+      if (!TERMINAL_RUN_STATES.has(record.state)) records.push(record);
+    }
+    return records;
+  }
+
+  activeRunsForSession(sessionId: string): RunRecord[] {
+    return this.scanNonterminal().filter((record) => record.supervisorSessionId === sessionId);
+  }
+
+  transition(runId: string, input: TransitionInput): RunRecord {
+    return this.#withWriterLock(() => this.#transition(runId, input));
+  }
+
+  #transition(runId: string, input: TransitionInput): RunRecord {
+    const current = this.loadRun(runId).record;
+    if (TERMINAL_RUN_STATES.has(current.state)) {
+      throw new LedgerError(`terminal run ${runId} cannot transition from ${current.state}`);
+    }
+    const { reload: _reload, ...withoutReload } = current;
+    const next: RunRecord = TERMINAL_RUN_STATES.has(input.state)
+      ? { ...withoutReload, state: input.state, reason: input.reason }
+      : { ...current, state: input.state, reason: input.reason };
+    return this.#commit(current, next, {
+      type: "run_state_transitioned",
+      fromState: current.state,
+      toState: input.state,
+      ruleId: input.ruleId,
+      actor: input.actor,
+      ...(input.evidence === undefined ? {} : { evidence: input.evidence }),
+    });
+  }
+
+  recordOwnership(runId: string, input: OwnershipInput): RunRecord {
+    return this.#withWriterLock(() => this.#recordOwnership(runId, input));
+  }
+
+  #recordOwnership(runId: string, input: OwnershipInput): RunRecord {
+    const current = this.loadRun(runId).record;
+    if (TERMINAL_RUN_STATES.has(current.state)) {
+      throw new LedgerError(`terminal run ${runId} cannot bind ownership`);
+    }
+    for (const processIdentity of input.ownedProcesses) {
+      if (
+        !Number.isInteger(processIdentity.pid) ||
+        processIdentity.pid < 2 ||
+        !Number.isInteger(processIdentity.processGroupId) ||
+        processIdentity.processGroupId < 2 ||
+        !isAbsolute(processIdentity.sessionFile) ||
+        processIdentity.attemptToken.length === 0
+      ) {
+        throw new LedgerError("owned process identity is incomplete");
+      }
+    }
+    for (const worktree of input.worktrees) {
+      if (
+        !isAbsolute(worktree.repositoryRoot) ||
+        !isAbsolute(worktree.path) ||
+        worktree.branch.length === 0 ||
+        !/^[0-9a-f]{40}$/u.test(worktree.headSha)
+      ) {
+        throw new LedgerError("worktree identity is incomplete");
+      }
+    }
+    return this.#commit(
+      current,
+      {
+        ...current,
+        ownedProcesses: input.ownedProcesses.map((identity) => ({ ...identity })),
+        worktrees: input.worktrees.map((identity) => ({ ...identity })),
+      },
+      {
+        type: "run_ownership_recorded",
+        ruleId: "lifecycle.record_ownership",
+        actor: "extension",
+        evidence: {
+          ownedProcessCount: input.ownedProcesses.length,
+          worktreeCount: input.worktrees.length,
+        },
+      },
+    );
+  }
+
+  prepareReload(
+    runId: string,
+    sessionId: string,
+    repositoryRoot: string,
+    hostPid = process.pid,
+  ): RunRecord {
+    return this.#withWriterLock(() =>
+      this.#prepareReload(runId, sessionId, repositoryRoot, hostPid),
+    );
+  }
+
+  #prepareReload(
+    runId: string,
+    sessionId: string,
+    repositoryRoot: string,
+    hostPid: number,
+  ): RunRecord {
+    const current = this.loadRun(runId).record;
+    this.#assertOwnedBy(current, sessionId);
+    if (TERMINAL_RUN_STATES.has(current.state)) return current;
+    if (resolve(repositoryRoot) !== current.repositoryRoot) {
+      throw new LedgerError(`run ${runId} repository identity changed before reload`);
+    }
+    if (
+      current.reload?.sessionId === sessionId &&
+      current.reload.generation === current.generation &&
+      current.reload.hostPid === hostPid &&
+      current.reload.repositoryRoot === current.repositoryRoot
+    ) {
+      return current;
+    }
+    const marker = {
+      sessionId,
+      generation: current.generation,
+      hostPid,
+      repositoryRoot: current.repositoryRoot,
+      requestedAt: this.#timestamp(),
+    };
+    return this.#commit(
+      current,
+      { ...current, reason: "reload_pending", reload: marker },
+      {
+        type: "session_reload_pending",
+        ruleId: "lifecycle.reload_prepare",
+        actor: "extension",
+        evidence: {
+          sessionId,
+          generation: current.generation,
+          hostPid,
+          repositoryRoot: current.repositoryRoot,
+        },
+      },
+    );
+  }
+
+  rebind(
+    runId: string,
+    sessionId: string,
+    repositoryRoot: string,
+    expectedSequence: number,
+    expectedOwnershipFingerprint: string,
+    hostPid = process.pid,
+  ): RunRecord {
+    return this.#withWriterLock(() =>
+      this.#rebind(
+        runId,
+        sessionId,
+        repositoryRoot,
+        expectedSequence,
+        expectedOwnershipFingerprint,
+        hostPid,
+      ),
+    );
+  }
+
+  #rebind(
+    runId: string,
+    sessionId: string,
+    repositoryRoot: string,
+    expectedSequence: number,
+    expectedOwnershipFingerprint: string,
+    hostPid: number,
+  ): RunRecord {
+    const current = this.loadRun(runId).record;
+    this.#assertOwnedBy(current, sessionId);
+    const marker = current.reload;
+    if (
+      current.sequence !== expectedSequence ||
+      ownershipFingerprint(current) !== expectedOwnershipFingerprint
+    ) {
+      throw new RebindConflictError(`run ${runId} identity changed after reload verification`);
+    }
+    if (
+      marker === undefined ||
+      marker.sessionId !== sessionId ||
+      marker.generation !== current.generation ||
+      marker.hostPid !== hostPid ||
+      current.hostPid !== hostPid ||
+      marker.repositoryRoot !== current.repositoryRoot ||
+      resolve(repositoryRoot) !== current.repositoryRoot
+    ) {
+      throw new LedgerError(`run ${runId} does not have a continuous reload proof`);
+    }
+    const { reload: _reload, ...withoutReload } = current;
+    const next: RunRecord = {
+      ...withoutReload,
+      generation: current.generation + 1,
+      hostPid,
+      reason: "reload_rebound",
+    };
+    return this.#commit(current, next, {
+      type: "session_reload_rebound",
+      ruleId: "lifecycle.reload_rebind",
+      actor: "extension",
+      evidence: {
+        sessionId,
+        previousGeneration: current.generation,
+        generation: next.generation,
+        hostPid,
+        repositoryRoot: current.repositoryRoot,
+      },
+    });
+  }
+
+  beginAwaitingOwner(runId: string, input: AwaitOwnerInput): RunRecord {
+    return this.#withWriterLock(() => this.#beginAwaitingOwner(runId, input));
+  }
+
+  #beginAwaitingOwner(runId: string, input: AwaitOwnerInput): RunRecord {
+    const current = this.loadRun(runId).record;
+    if (TERMINAL_RUN_STATES.has(current.state) || current.state === "awaiting_owner") {
+      throw new LedgerError(`run ${runId} cannot wait for owner from ${current.state}`);
+    }
+    if (input.resumeState !== current.state) {
+      throw new LedgerError("owner wait resume state must equal the current run state");
+    }
+    const allowedDecisions = [...new Set(input.allowedDecisions.map((item) => item.trim()))].filter(
+      Boolean,
+    );
+    if (allowedDecisions.length === 0) throw new LedgerError("owner wait requires a decision set");
+    const ownerWait = {
+      ruleId: input.ruleId,
+      evidence: input.evidence,
+      allowedDecisions,
+      startedAt: this.#timestamp(),
+      resumeState: input.resumeState,
+    };
+    return this.#commit(
+      current,
+      {
+        ...current,
+        state: "awaiting_owner",
+        reason: input.ruleId,
+        ownerWait,
+      },
+      {
+        type: "owner_wait_started",
+        fromState: current.state,
+        toState: "awaiting_owner",
+        ruleId: input.ruleId,
+        actor: "supervisor",
+        evidence: {
+          ...input.evidence,
+          allowedDecisions,
+          resumeState: input.resumeState,
+        },
+      },
+    );
+  }
+
+  answerOwner(runId: string, input: OwnerAnswerInput): RunRecord {
+    return this.#withWriterLock(() => this.#answerOwner(runId, input));
+  }
+
+  #answerOwner(runId: string, input: OwnerAnswerInput): RunRecord {
+    if (input.rationale.trim().length === 0) {
+      throw new LedgerError("owner answer rationale is required");
+    }
+    const current = this.loadRun(runId).record;
+    const wait = current.ownerWait;
+    if (current.state !== "awaiting_owner" || wait === undefined) {
+      throw new LedgerError(`run ${runId} is not awaiting an owner answer`);
+    }
+    if (!wait.allowedDecisions.includes(input.decision)) {
+      throw new LedgerError(`owner decision ${input.decision} is not allowed`);
+    }
+    const answeredAt = this.#timestamp();
+    const ownerWait = {
+      ...wait,
+      response: {
+        decision: input.decision,
+        rationale: input.rationale,
+        answeredAt,
+      },
+    };
+    return this.#commit(
+      current,
+      {
+        ...current,
+        state: wait.resumeState,
+        reason: "owner_answered",
+        ownerWait,
+      },
+      {
+        type: "owner_answered",
+        fromState: "awaiting_owner",
+        toState: wait.resumeState,
+        ruleId: wait.ruleId,
+        actor: "owner",
+        evidence: {
+          decision: input.decision,
+          rationale: input.rationale,
+          waitStartedAt: wait.startedAt,
+          answeredAt,
+        },
+      },
+    );
+  }
+
+  runDirectory(runId: string): string {
+    if (!RUN_ID_PATTERN.test(runId)) {
+      throw new LedgerError(`invalid run ID: ${runId}`);
+    }
+    const directory = resolve(this.root, runId);
+    if (dirname(directory) !== this.root) throw new LedgerError(`run ID escapes ledger root: ${runId}`);
+    if (existsSync(directory)) this.#assertSafeRunDirectory(directory);
+    return directory;
+  }
+
+  #commit(current: RunRecord, candidate: RunRecord, input: EventInput): RunRecord {
+    const next = this.#nextEvent(current, candidate, input);
+    const directory = this.runDirectory(current.runId);
+    this.#appendEvent(directory, next.event);
+    this.#writeState(directory, next.record);
+    return next.record;
+  }
+
+  #nextEvent(
+    current: RunRecord,
+    candidate: RunRecord,
+    input: EventInput,
+  ): { record: RunRecord; event: RunEvent } {
+    const timestamp = this.#timestamp();
+    const record: RunRecord = {
+      ...candidate,
+      sequence: current.sequence + 1,
+      updatedAt: timestamp,
+    };
+    const event: RunEvent = {
+      schemaVersion: 1,
+      eventId: this.#randomId(),
+      runId: current.runId,
+      sequence: record.sequence,
+      timestamp,
+      type: input.type,
+      ruleId: input.ruleId,
+      actor: input.actor,
+      evidence: input.evidence ?? {},
+      projection: record,
+      ...(input.fromState === undefined ? {} : { fromState: input.fromState }),
+      ...(input.toState === undefined ? {} : { toState: input.toState }),
+    };
+    return { record, event };
+  }
+
+  #readEvents(directory: string): ParsedEvents {
+    const path = join(directory, "events.jsonl");
+    this.#assertRegularFile(path, "event ledger");
+    const bytes = readFileSync(path);
+    const finalLf = bytes.lastIndexOf(0x0a);
+    const retainedBytes = finalLf + 1;
+    const droppedBytes = bytes.length - retainedBytes;
+    const completeBytes = bytes.subarray(0, retainedBytes);
+    const complete = completeBytes.toString("utf8");
+    const events: RunEvent[] = [];
+    const expectedRunId = basename(directory);
+    for (const [index, line] of complete.split("\n").entries()) {
+      if (line.length === 0) continue;
+      try {
+        const event = JSON.parse(line) as unknown;
+        this.#assertEvent(event, index + 1);
+        if (event.runId !== expectedRunId) {
+          throw new LedgerCorruptionError(`event ${index + 1} belongs to another run`);
+        }
+        if (event.sequence !== events.length + 1) {
+          throw new LedgerCorruptionError(`event ${index + 1} breaks sequence continuity`);
+        }
+        events.push(event);
+      } catch (error) {
+        throw new LedgerCorruptionError(
+          `invalid ledger event at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return { events, droppedBytes, completeBytes };
+  }
+
+  #appendEvent(directory: string, event: RunEvent): void {
+    const path = join(directory, "events.jsonl");
+    if (existsSync(path)) this.#assertRegularFile(path, "event ledger");
+    const descriptor = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      this.#writeAll(descriptor, Buffer.from(`${JSON.stringify(event)}\n`, "utf8"));
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  #replaceEventLog(directory: string, completeBytes: Buffer, recovery: RunEvent): void {
+    const path = join(directory, "events.jsonl");
+    const temporary = `${path}.${this.#randomId()}.tmp`;
+    const descriptor = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      0o600,
+    );
+    let renamed = false;
+    try {
+      this.#writeAll(descriptor, completeBytes);
+      this.#writeAll(descriptor, Buffer.from(`${JSON.stringify(recovery)}\n`, "utf8"));
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      renameSync(temporary, path);
+      renamed = true;
+      this.#fsyncDirectory(directory);
+    } finally {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // The descriptor was already closed before the atomic rename.
+      }
+      if (!renamed) rmSync(temporary, { force: true });
+    }
+  }
+
+  #writeAll(descriptor: number, bytes: Buffer): void {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = writeSync(descriptor, bytes, offset, bytes.length - offset, null);
+      if (written <= 0) throw new LedgerError("filesystem made no progress writing ledger bytes");
+      offset += written;
+    }
+  }
+
+  #writeState(directory: string, record: RunRecord): void {
+    this.#writeDurable(join(directory, "state.json"), `${JSON.stringify(record, null, 2)}\n`);
+  }
+
+  #writeDurable(path: string, contents: string): void {
+    const temporary = `${path}.${this.#randomId()}.tmp`;
+    const descriptor = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      0o600,
+    );
+    let renamed = false;
+    try {
+      writeFileSync(descriptor, contents, "utf8");
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      renameSync(temporary, path);
+      renamed = true;
+      this.#fsyncDirectory(dirname(path));
+    } finally {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // The descriptor was already closed before the atomic rename.
+      }
+      if (!renamed) rmSync(temporary, { force: true });
+    }
+  }
+
+  #fsyncDirectory(path: string): void {
+    const descriptor = openSync(path, constants.O_RDONLY);
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  #withWriterLock<T>(operation: () => T): T {
+    if (this.#lockDepth > 0) return operation();
+
+    const lockPath = join(this.root, ".writer-lock");
+    const existed = existsSync(lockPath);
+    const descriptor = openSync(
+      lockPath,
+      constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW,
+      0o600,
+    );
+    if (!existed) this.#fsyncDirectory(this.root);
+    const acquired = spawnSync("flock", ["--exclusive", "3"], {
+      stdio: ["ignore", "pipe", "pipe", descriptor],
+    });
+    if (acquired.error !== undefined) {
+      closeSync(descriptor);
+      throw new LedgerError(`failed to invoke flock: ${acquired.error.message}`);
+    }
+    if (acquired.status !== 0) {
+      closeSync(descriptor);
+      throw new LedgerError(
+        `failed to lock the Orkastrator ledger: ${acquired.stderr.toString("utf8").trim()}`,
+      );
+    }
+
+    this.#lockDepth = 1;
+    try {
+      return operation();
+    } finally {
+      this.#lockDepth = 0;
+      closeSync(descriptor);
+    }
+  }
+
+  #timestamp(): string {
+    return this.#now().toISOString();
+  }
+
+  #assertSafeRunDirectory(directory: string): void {
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new LedgerCorruptionError(`run path is not a real directory: ${directory}`);
+    }
+    const canonical = realpathSync(directory);
+    if (dirname(canonical) !== this.root) {
+      throw new LedgerCorruptionError(`run directory escapes ledger root: ${directory}`);
+    }
+  }
+
+  #assertRegularFile(path: string, label: string): void {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new LedgerCorruptionError(`${label} is not a regular file: ${path}`);
+    }
+    if (dirname(realpathSync(path)) !== dirname(path)) {
+      throw new LedgerCorruptionError(`${label} escapes its run directory: ${path}`);
+    }
+  }
+
+  #assertOwnedBy(record: RunRecord, sessionId: string): void {
+    if (record.supervisorSessionId !== sessionId) {
+      throw new LedgerError(`run ${record.runId} is owned by another supervisor session`);
+    }
+  }
+
+  #assertEvent(value: unknown, line: number): asserts value is RunEvent {
+    if (!isObject(value)) throw new LedgerCorruptionError(`event ${line} is not an object`);
+    if (
+      value.schemaVersion !== 1 ||
+      typeof value.eventId !== "string" ||
+      !RUN_ID_PATTERN.test(value.eventId) ||
+      typeof value.runId !== "string" ||
+      typeof value.timestamp !== "string" ||
+      !isIsoTimestamp(value.timestamp) ||
+      typeof value.type !== "string" ||
+      value.type.length === 0 ||
+      typeof value.ruleId !== "string" ||
+      value.ruleId.length === 0 ||
+      typeof value.actor !== "string" ||
+      !RUN_ACTOR_SET.has(value.actor) ||
+      !isObject(value.evidence) ||
+      (value.fromState !== undefined &&
+        (typeof value.fromState !== "string" || !RUN_STATE_SET.has(value.fromState))) ||
+      (value.toState !== undefined &&
+        (typeof value.toState !== "string" || !RUN_STATE_SET.has(value.toState)))
+    ) {
+      throw new LedgerCorruptionError(`event ${line} has an unsupported schema`);
+    }
+    if (!Number.isInteger(value.sequence) || !isObject(value.projection)) {
+      throw new LedgerCorruptionError(`event ${line} has no valid projection`);
+    }
+    this.#assertRecord(value.projection, String(value.runId));
+    if (
+      value.projection.sequence !== value.sequence ||
+      value.projection.updatedAt !== value.timestamp
+    ) {
+      throw new LedgerCorruptionError(`event ${line} projection metadata does not match`);
+    }
+  }
+
+  #assertRecord(value: unknown, expectedRunId: string): asserts value is RunRecord {
+    if (!isObject(value)) throw new LedgerCorruptionError("run state is not an object");
+    if (
+      value.schemaVersion !== 1 ||
+      value.runId !== expectedRunId ||
+      typeof value.objective !== "string" ||
+      value.objective.trim().length === 0 ||
+      value.objective.length > MAX_OBJECTIVE_CHARS ||
+      typeof value.supervisorSessionId !== "string" ||
+      value.supervisorSessionId.trim().length === 0 ||
+      typeof value.repositoryRoot !== "string" ||
+      !isAbsolute(value.repositoryRoot) ||
+      typeof value.policyHash !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(value.policyHash) ||
+      value.policyFile !== "policy.yaml" ||
+      typeof value.generation !== "number" ||
+      !Number.isInteger(value.generation) ||
+      value.generation < 1 ||
+      typeof value.hostPid !== "number" ||
+      !Number.isInteger(value.hostPid) ||
+      value.hostPid < 2 ||
+      typeof value.sequence !== "number" ||
+      !Number.isInteger(value.sequence) ||
+      value.sequence < 1 ||
+      !Array.isArray(value.ownedProcesses) ||
+      !Array.isArray(value.worktrees) ||
+      typeof value.state !== "string" ||
+      !RUN_STATE_SET.has(value.state) ||
+      typeof value.reason !== "string" ||
+      value.reason.length === 0 ||
+      typeof value.createdAt !== "string" ||
+      !isIsoTimestamp(value.createdAt) ||
+      typeof value.updatedAt !== "string" ||
+      !isIsoTimestamp(value.updatedAt)
+    ) {
+      throw new LedgerCorruptionError(`run ${expectedRunId} has invalid projected state`);
+    }
+    if (
+      !value.ownedProcesses.every(isOwnedProcessIdentity) ||
+      !value.worktrees.every(isWorktreeIdentity) ||
+      (value.reload !== undefined &&
+        !isReloadMarker(
+          value.reload,
+          value.supervisorSessionId,
+          value.generation,
+          value.hostPid,
+          value.repositoryRoot,
+        )) ||
+      (value.ownerWait !== undefined && !isOwnerWait(value.ownerWait)) ||
+      (value.state === "awaiting_owner" &&
+        (value.ownerWait === undefined ||
+          (isObject(value.ownerWait) && value.ownerWait.response !== undefined)))
+    ) {
+      throw new LedgerCorruptionError(`run ${expectedRunId} has invalid nested identity evidence`);
+    }
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOwnedProcessIdentity(value: unknown): boolean {
+  return (
+    isObject(value) &&
+    typeof value.pid === "number" &&
+    Number.isInteger(value.pid) &&
+    value.pid >= 2 &&
+    typeof value.processGroupId === "number" &&
+    Number.isInteger(value.processGroupId) &&
+    value.processGroupId >= 2 &&
+    typeof value.sessionFile === "string" &&
+    isAbsolute(value.sessionFile) &&
+    typeof value.attemptToken === "string" &&
+    value.attemptToken.length > 0
+  );
+}
+
+function isWorktreeIdentity(value: unknown): boolean {
+  return (
+    isObject(value) &&
+    typeof value.repositoryRoot === "string" &&
+    isAbsolute(value.repositoryRoot) &&
+    typeof value.path === "string" &&
+    isAbsolute(value.path) &&
+    typeof value.branch === "string" &&
+    value.branch.length > 0 &&
+    typeof value.headSha === "string" &&
+    /^[0-9a-f]{40}$/u.test(value.headSha)
+  );
+}
+
+function isReloadMarker(
+  value: unknown,
+  sessionId: string,
+  generation: number,
+  hostPid: number,
+  repositoryRoot: string,
+): boolean {
+  return (
+    isObject(value) &&
+    value.sessionId === sessionId &&
+    value.generation === generation &&
+    value.hostPid === hostPid &&
+    value.repositoryRoot === repositoryRoot &&
+    typeof value.requestedAt === "string" &&
+    isIsoTimestamp(value.requestedAt)
+  );
+}
+
+function isOwnerWait(value: unknown): boolean {
+  if (
+    !isObject(value) ||
+    typeof value.ruleId !== "string" ||
+    value.ruleId.length === 0 ||
+    !isObject(value.evidence) ||
+    !Array.isArray(value.allowedDecisions) ||
+    value.allowedDecisions.length === 0 ||
+    !value.allowedDecisions.every(
+      (decision) => typeof decision === "string" && decision.trim().length > 0,
+    ) ||
+    new Set(value.allowedDecisions).size !== value.allowedDecisions.length ||
+    typeof value.startedAt !== "string" ||
+    !isIsoTimestamp(value.startedAt) ||
+    typeof value.resumeState !== "string" ||
+    !RUN_STATE_SET.has(value.resumeState) ||
+    value.resumeState === "awaiting_owner"
+  ) {
+    return false;
+  }
+  if (value.response === undefined) return true;
+  return (
+    isObject(value.response) &&
+    typeof value.response.decision === "string" &&
+    value.allowedDecisions.includes(value.response.decision) &&
+    typeof value.response.rationale === "string" &&
+    value.response.rationale.trim().length > 0 &&
+    typeof value.response.answeredAt === "string" &&
+    isIsoTimestamp(value.response.answeredAt)
+  );
+}
+
+function isIsoTimestamp(value: string): boolean {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}

@@ -15,6 +15,6 @@
   },
   "include": [
     "extensions/orkastrator-monitors/**/*.ts",
-    "extensions/orkastrator-vnext/**/*.ts"
+    "extensions/orkastrator/**/*.ts"
   ]
 }

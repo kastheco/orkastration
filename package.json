@@ -1,8 +1,8 @@
 {
-  "name": "orkastrator-pi-monitors",
+  "name": "orkastrator-pi",
   "version": "0.1.0",
   "private": true,
-  "description": "Pi footer status for live orkastrator monitor tasks",
+  "description": "Pi extensions for Orkastrator monitoring and lifecycle ownership",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -11,27 +11,31 @@
   ],
   "files": [
     "extensions/orkastrator-monitors",
+    "extensions/orkastrator",
     "README.md"
   ],
   "engines": {
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.3"
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "typebox": "*"
   },
   "pi": {
     "extensions": [
-      "./extensions/orkastrator-monitors/index.ts"
+      "./extensions/orkastrator-monitors/index.ts",
+      "./extensions/orkastrator/index.ts"
     ]
   },
   "scripts": {
-    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts extensions/orkastrator-vnext/tests/*.test.ts",
-    "test:vnext-contracts": "node --experimental-strip-types --test extensions/orkastrator-vnext/tests/*.test.ts",
+    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts extensions/orkastrator/tests/*.test.ts",
+    "test:orkastrator": "node --experimental-strip-types --test extensions/orkastrator/tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
     "@types/node": "^22.20.1",
+    "typebox": "1.3.7",
     "typescript": "^7.0.2"
   }
 }

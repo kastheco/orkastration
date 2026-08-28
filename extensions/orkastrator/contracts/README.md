@@ -1,6 +1,6 @@
-# Orkastrator vNext external contracts
+# Orkastrator v1 external contracts
 
-These fixtures pin the external behavior used by the vNext implementation. They are evidence from live local runs, not guessed API descriptions.
+These fixtures pin the external behavior used by the Pi-native Orkastrator v1 implementation. They are evidence from live local runs, not guessed API descriptions.
 
 ## Baseline
 
@@ -82,8 +82,8 @@ KAS-739 proves the Worktrunk hook and command envelopes. KAS-742 owns the reposi
 Default tests validate the pinned fixtures without mutating Git or spending model tokens. Live probes are explicit:
 
 ```text
-ORKASTRATOR_LIVE_WORKTRUNK=1 npm run test:vnext-contracts -- --test-name-pattern='Worktrunk 0.75.0 exposes'
-ORKASTRATOR_LIVE_PI_RPC=1 npm run test:vnext-contracts -- --test-name-pattern='Pi 0.84.3 accepts'
+ORKASTRATOR_LIVE_WORKTRUNK=1 npm run test:orkastrator -- --test-name-pattern='Worktrunk 0.75.0 exposes'
+ORKASTRATOR_LIVE_PI_RPC=1 npm run test:orkastrator -- --test-name-pattern='Pi 0.84.3 accepts'
 ```
 
 The Worktrunk probe creates and destroys temporary repositories and detached processes. The Pi probe makes a small real model call, then starts and aborts a second call. Neither runs in ordinary CI.

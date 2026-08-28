@@ -112,6 +112,22 @@ Pi users can install the optional [orkastrator monitor extension](extensions/ork
 to show live `orkas monitor --watch` background tasks in Pi's footer and inspect their recorded
 details with `/orkastrator-monitors`.
 
+The [Pi-native Orkastrator extension](extensions/orkastrator/README.md) is the product's v1 path. The
+Python/Orca controller documented below is legacy pre-v1 code retained during migration. Product v1
+is unrelated to the legacy YAML `version: 2` workflow schema.
+
+The repository-local `.pi/extensions/orkastrator.ts` entrypoint is auto-discovered after Pi trusts
+the checkout. From a merged checkout:
+
+```bash
+npm install
+pi --approve
+```
+
+Use `/reload` after source changes and `/orkastrator-runs` to inspect active and preserved runs. The
+current KAS-740 slice owns lifecycle and durable ledger evidence only; worker RPC, policy reduction,
+and Worktrunk mutation land in follow-up issues.
+
 A finding can settle wrongly - most often because the supervisor lacked a word for what an
 adjudicator meant. `orkas reopen` sends it back to an earlier phase, retires the settled stages at
 and after that round, and drops the frozen contracts the reopened phase supersedes. It keeps a
