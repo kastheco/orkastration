@@ -54,9 +54,9 @@ roles:
     strength: medium
     fast: true
     fallback:
-      agent: codex
-      model: gpt-5.6-luna
-      strength: high
+      agent: claude
+      model: opus
+      strength: low
       fast: true
       trigger: capability_mismatch
 
@@ -64,6 +64,12 @@ roles:
     agent: claude
     model: sonnet
     strength: medium
+    fallback:
+      agent: codex
+      model: gpt-5.6-sol
+      strength: low
+      fast: true
+      trigger: capability_mismatch
 
 publication:
   authorized_by: graph_acceptance
