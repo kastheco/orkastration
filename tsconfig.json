@@ -13,5 +13,8 @@
     "target": "ES2022",
     "types": ["node"]
   },
-  "include": ["extensions/orkastrator-monitors/**/*.ts"]
+  "include": [
+    "extensions/orkastrator-monitors/**/*.ts",
+    "extensions/orkastrator-vnext/**/*.ts"
+  ]
 }

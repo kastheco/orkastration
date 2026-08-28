@@ -17,7 +17,7 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.0"
+    "@earendil-works/pi-coding-agent": "0.84.3"
   },
   "pi": {
     "extensions": [
@@ -25,11 +25,12 @@
     ]
   },
   "scripts": {
-    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts",
+    "test:extension": "node --experimental-strip-types --test extensions/orkastrator-monitors/tests/*.test.ts extensions/orkastrator-vnext/tests/*.test.ts",
+    "test:vnext-contracts": "node --experimental-strip-types --test extensions/orkastrator-vnext/tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
     "@types/node": "^22.20.1",
     "typescript": "^7.0.2"
   }
