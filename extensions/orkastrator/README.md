@@ -13,7 +13,7 @@ pi --approve
 
 Use `/reload` after editing extension source. `/kas-runs` confirms that the extension loaded. The private package manifest also exposes the extension for local `pi install <path>` development, but there is no published package yet.
 
-## KAS-740 and KAS-741 slice
+## KAS-740, KAS-741, and KAS-742 stage 1
 
 The extension owns session lifecycle, durable local run evidence, and one fresh owned Pi RPC worker attempt:
 
@@ -32,6 +32,12 @@ The extension owns session lifecycle, durable local run evidence, and one fresh 
 - shutdown waits for worker reap and durable ownership clear before recording interruption.
 
 The worker currently runs in the trusted repository checkout. KAS-743 adds an isolated Worktrunk checkout and destructive-action identity checks. This slice does not implement policy reduction, review/fix waves, recovery, publication, merge, or ClickClack.
+
+## Reduced v1 policy
+
+`orkastrator.v1.yaml` is the checked-in v1-specific example. `parsePolicyV1(bytes)` accepts only the complete reduced policy: four exact role model/thinking/fast settings, review caps, total limits, closed supervision events, `repo-default` validation, and manual completion requirements. Missing, unknown, duplicate, malformed, unsupported, or out-of-range settings fail with a policy path. Returned policy objects are deeply frozen.
+
+Pi fast mode is explicit. `fast: true` is accepted only for `openai-codex/*` roles. Pi 0.84.3 does not implement ambient `--fast` under `--no-extensions`; that flag belongs to a user-installed extension and would be ignored by an owned worker. Fast attempts therefore keep `--no-extensions` and load only the repository-pinned `rpc/openai-fast.ts`, whose documented `before_provider_request` hook sets `service_tier: priority`. Standard attempts load no extension. Process ownership, framing, and reap behavior are fixed implementation invariants and are not policy fields. Stage 2 will resolve this policy before run creation; the current tool retains its temporary caller-supplied snapshot seam until then.
 
 ## Ledger layout
 

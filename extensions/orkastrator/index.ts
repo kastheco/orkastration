@@ -288,6 +288,8 @@ export function installOrkastrator(
           prompt: record.objective,
           model: `${ctx.model.provider}/${ctx.model.id}`,
           thinking: ctx.thinkingLevel ?? "off",
+          // Stage 2 resolves this from the validated worker role before run creation.
+          fast: false,
           journalOwnership: (identity) => {
             ledger.journalOwnedProcess(record.runId, attemptToken, identity ?? undefined);
             // runOwnedPiAttempt clears only after proving process-group absence.

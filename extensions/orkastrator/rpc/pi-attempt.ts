@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 
 import type { OwnedProcessIdentity } from "../ledger/types.ts";
 import { serializeJsonLine } from "./jsonl.ts";
@@ -12,6 +13,7 @@ const MAX_EVENT_TEXT_CHARS = 4_000;
 const TERM_GRACE_MS = 2_000;
 const KILL_GRACE_MS = 2_000;
 const POLL_MS = 25;
+const OPENAI_FAST_EXTENSION = fileURLToPath(new URL("./openai-fast.ts", import.meta.url));
 
 export type PiAttemptEvent =
   | { type: "started"; identity: OwnedProcessIdentity }
@@ -32,6 +34,7 @@ export interface PiAttemptSpec {
   prompt: string;
   model: string;
   thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  fast: boolean;
   journalOwnership(identity: OwnedProcessIdentity | null): Promise<void> | void;
   recordEvent(event: PiAttemptEvent): Promise<void> | void;
 }
@@ -108,16 +111,18 @@ export async function runOwnedPiAttempt(
   mkdirSync(dirname(spec.sessionFile), { recursive: true, mode: 0o700 });
   if (existsSync(spec.sessionFile)) throw new Error("Pi attempt session file already exists");
 
+  const argv = [
+    "--mode", "rpc",
+    "--session", spec.sessionFile,
+    "--no-extensions",
+    "--approve",
+    "--model", spec.model,
+    "--thinking", spec.thinking,
+    ...(spec.fast ? ["--extension", OPENAI_FAST_EXTENSION] : []),
+  ];
   const child = spawn(
     spec.executable,
-    [
-      "--mode", "rpc",
-      "--session", spec.sessionFile,
-      "--no-extensions",
-      "--approve",
-      "--model", spec.model,
-      "--thinking", spec.thinking,
-    ],
+    argv,
     { cwd: spec.cwd, detached: true, stdio: ["pipe", "pipe", "pipe"] },
   );
   const pid = child.pid;
@@ -329,6 +334,9 @@ function validateSpec(spec: PiAttemptSpec): void {
   if (!isAbsolute(spec.sessionFile)) throw new Error("Pi session file must be absolute");
   if (spec.attemptToken.length === 0 || spec.prompt.trim().length === 0 || spec.model.length === 0) {
     throw new Error("Pi attempt identity, prompt, and model are required");
+  }
+  if (spec.fast && !spec.model.startsWith("openai-codex/")) {
+    throw new Error("Pi fast mode is supported only for openai-codex models");
   }
 }
 

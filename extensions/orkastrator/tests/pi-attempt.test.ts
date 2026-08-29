@@ -36,6 +36,7 @@ function settledBody(options: {
   ignoreTerm?: boolean;
   promptMarker?: string;
   readyMarker?: string;
+  argvMarker?: string;
 } = {}): string {
   return `
 const fs = require("node:fs");
@@ -43,6 +44,7 @@ const cp = require("node:child_process");
 ${options.ignoreTerm ? 'process.on("SIGTERM", () => {});' : ""}
 ${options.readyMarker ? `fs.writeFileSync(${JSON.stringify(options.readyMarker)}, "ready\\n");` : ""}
 const args = process.argv.slice(2);
+${options.argvMarker ? `fs.writeFileSync(${JSON.stringify(options.argvMarker)}, JSON.stringify(args));` : ""}
 const session = args[args.indexOf("--session") + 1];
 fs.writeFileSync(session, "preserved\\n");
 ${options.stderr ? `process.stderr.write("x".repeat(${options.stderr}));` : ""}
@@ -82,6 +84,8 @@ async function run(
   journal?: (bound: boolean) => Promise<void> | void,
   options: {
     prompt?: string;
+    model?: string;
+    fast?: boolean;
     recordEvent?: (event: PiAttemptEvent) => Promise<void> | void;
   } = {},
 ) {
@@ -91,8 +95,9 @@ async function run(
     sessionFile: value.sessionFile,
     attemptToken: "attempt-1",
     prompt: options.prompt ?? "do one thing",
-    model: "provider/model",
+    model: options.model ?? "provider/model",
     thinking: "low",
+    fast: options.fast ?? false,
     journalOwnership: async (identity) => journal?.(identity !== null),
     recordEvent: async (event) => {
       events.push(event);
@@ -151,6 +156,34 @@ test("durable ownership gates prompt, split frames settle, and agent_end is not 
     rmSync(promptMarker, { force: true });
     rmSync(readyMarker, { force: true });
     value.cleanup();
+  }
+});
+
+test("Pi launch argv loads only the pinned fast extension when requested", async () => {
+  const token = `${process.pid}-${Date.now()}`;
+  const fastMarker = join(tmpdir(), `orkastrator-fast-argv-${token}`);
+  const standardMarker = join(tmpdir(), `orkastrator-standard-argv-${token}`);
+  const fast = fixture(settledBody({ argvMarker: fastMarker }));
+  const standard = fixture(settledBody({ argvMarker: standardMarker }));
+  try {
+    assert.equal((await run(fast, [], undefined, undefined, {
+      fast: true,
+      model: "openai-codex/gpt-5.6-sol",
+    })).status, "settled");
+    assert.equal((await run(standard, [], undefined, undefined, { fast: false })).status, "settled");
+    const fastArgv = JSON.parse(readFileSync(fastMarker, "utf8")) as string[];
+    const standardArgv = JSON.parse(readFileSync(standardMarker, "utf8")) as string[];
+    assert.equal(fastArgv.includes("--fast"), false);
+    assert.equal(standardArgv.includes("--fast"), false);
+    assert.equal(fastArgv.filter((argument) => argument === "--extension").length, 1);
+    const extensionIndex = fastArgv.indexOf("--extension");
+    assert.match(fastArgv[extensionIndex + 1] ?? "", /\/rpc\/openai-fast\.ts$/u);
+    assert.equal(standardArgv.includes("--extension"), false);
+  } finally {
+    rmSync(fastMarker, { force: true });
+    rmSync(standardMarker, { force: true });
+    fast.cleanup();
+    standard.cleanup();
   }
 });
 

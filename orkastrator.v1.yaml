@@ -1,0 +1,44 @@
+version: 1
+
+roles:
+  worker:
+    model: openai-codex/gpt-5.6-sol
+    thinking: medium
+    fast: true
+  initial_reviewer:
+    model: anthropic/claude-opus-5
+    thinking: medium
+    fast: false
+  fixer:
+    model: openai-codex/gpt-5.6-terra
+    thinking: medium
+    fast: true
+  re_reviewer:
+    model: anthropic/claude-sonnet-5
+    thinking: medium
+    fast: false
+
+review:
+  blocking: [correctness, security, data_loss, scope, acceptance]
+  max_fix_rounds_per_finding: 2
+  max_parallel_fixer_groups: 3
+
+limits:
+  wall_clock_minutes: 60
+  max_worker_attempts: 2
+  total_tokens: 120000
+  total_cost_usd: 10
+
+supervision:
+  wake_on: [worker_blocked, review_bound_reached, fix_scope_escape, validation_failed, policy_limit_reached, identity_mismatch, integration_conflict]
+  require_human_on: [cleanup_unverified, integration_conflict_unresolved, policy_override]
+  human_wait: resumable
+
+validation:
+  profile: repo-default
+
+completion:
+  require_commit: true
+  require_clean_worktree: true
+  require_review_acceptance: true
+  integration: manual
