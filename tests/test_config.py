@@ -46,7 +46,15 @@ roles:
       model: gpt-fallback
       strength: high
       trigger: capability_mismatch
-  re_reviewer: {{agent: codex, model: gpt-test, strength: xhigh}}
+  re_reviewer:
+    agent: codex
+    model: gpt-test
+    strength: xhigh
+    fallback:
+      agent: claude
+      model: sonnet-fallback
+      strength: low
+      trigger: capability_mismatch
 publication:
   authorized_by: graph_acceptance
   scope: accepted_run
@@ -92,6 +100,8 @@ def test_settings_load_yaml_and_explicit_orca_command(
     assert settings.graph.roles.fixer.fallback.model == "gpt-fallback"
     assert settings.graph.roles.initial_reviewer.fast is False
     assert settings.graph.roles.re_reviewer.strength == "xhigh"
+    assert settings.graph.roles.re_reviewer.fallback is not None
+    assert settings.graph.roles.re_reviewer.fallback.model == "sonnet-fallback"
     assert settings.graph.review_cycle.max_fix_rounds_per_finding == 2
     assert settings.graph.frozen_diff_budget_bytes == 65_536
     assert settings.graph.publication.branch.force_push is False
@@ -134,6 +144,21 @@ def test_current_repository_config_is_valid() -> None:
     config = load_graph_config(Path("orkastrator.yaml"))
     assert config.version == 2
     assert config.roles.worker.model == "gpt-5.6-sol"
+    assert config.roles.re_reviewer.fallback is not None
+    assert config.roles.re_reviewer.fallback.model == "gpt-5.6-sol"
+
+
+def test_re_reviewer_fallback_rejects_unknown_fields(tmp_path: Path) -> None:
+    path = tmp_path / "graph.yaml"
+    write_config(path)
+    path.write_text(
+        path.read_text().replace(
+            "model: sonnet-fallback", "model: sonnet-fallback\n      unknown: true"
+        )
+    )
+
+    with pytest.raises(ConfigError, match="unknown"):
+        load_graph_config(path)
 
 
 def test_parallel_fixer_limit_cannot_exceed_global_limit(tmp_path: Path) -> None:

@@ -102,7 +102,7 @@ class StageKind(StrEnum):
 
 
 class AttemptKind(StrEnum):
-    """Which configured profile owns a fixer attempt."""
+    """Which configured profile owns a fallback-capable stage attempt."""
 
     PRIMARY = "primary"
     FALLBACK = "fallback"

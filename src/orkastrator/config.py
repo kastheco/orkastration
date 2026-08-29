@@ -38,8 +38,8 @@ class FallbackProfile(AgentProfile):
     trigger: Literal["capability_mismatch"]
 
 
-class FixerProfile(AgentProfile):
-    """Primary fixer profile plus its optional capability fallback."""
+class FallbackAgentProfile(AgentProfile):
+    """Primary role profile plus its optional capability fallback."""
 
     fallback: FallbackProfile | None = None
 
@@ -51,8 +51,8 @@ class RoleProfiles(BaseModel):
 
     worker: AgentProfile
     initial_reviewer: AgentProfile
-    fixer: FixerProfile
-    re_reviewer: AgentProfile
+    fixer: FallbackAgentProfile
+    re_reviewer: FallbackAgentProfile
 
 
 class StageBudget(BaseModel):

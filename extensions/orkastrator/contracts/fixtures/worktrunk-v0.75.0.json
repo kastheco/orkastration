@@ -1,0 +1,169 @@
+{
+  "fixture_version": 1,
+  "tool": {
+    "name": "worktrunk",
+    "version": "0.75.0",
+    "executable": "/home/kas/.local/bin/wt",
+    "executable_sha256": "d1e561fb68e060d48a6829b9308d58521e45674584f0771d5cc0ebc7d74bb152",
+    "platform": "x86_64-unknown-linux-musl"
+  },
+  "observations": {
+    "create": {
+      "exit_code": 0,
+      "stdout": {
+        "action": "created",
+        "branch": "contract-create",
+        "path": "<repo>.contract-create",
+        "created_branch": true,
+        "base_branch": "main"
+      },
+      "stderr_contains": [
+        "Created branch contract-create from main"
+      ]
+    },
+    "list_schema_2": {
+      "exit_code": 0,
+      "stdout": {
+        "schema": 2,
+        "repo": {
+          "default_branch": "main"
+        },
+        "collected": {
+          "ci": false,
+          "summary": false
+        },
+        "sample_item": {
+          "branch": "contract-create",
+          "head": {
+            "sha": "<sha>",
+            "short_sha": "<short-sha>",
+            "subject": "base",
+            "committed_at": "<timestamp>"
+          },
+          "worktree": {
+            "path": "<repo>.contract-create",
+            "main": false,
+            "current": false,
+            "previous": false,
+            "detached": false,
+            "branch_mismatch": false,
+            "duplicate_branch": false,
+            "changes": {
+              "staged": false,
+              "modified": false,
+              "untracked": false,
+              "renamed": false,
+              "deleted": false,
+              "conflicted": false,
+              "diff": {
+                "added": 0,
+                "deleted": 0
+              }
+            }
+          },
+          "default_branch": {
+            "ahead": 0,
+            "behind": 0,
+            "diff": {
+              "added": 0,
+              "deleted": 0
+            },
+            "orphan": false,
+            "integration": {
+              "reason": "same_commit"
+            },
+            "merge_conflicts": false
+          },
+          "display": {
+            "state": "empty",
+            "symbols": "_"
+          }
+        }
+      },
+      "stderr": ""
+    },
+    "blocking_hook_failure": {
+      "exit_code": 23,
+      "stdout": "",
+      "stdout_is_json": false,
+      "stderr_contains": [
+        "Running pre-merge project hook",
+        "hook-out",
+        "hook-err",
+        "pre-merge command failed: exit status: 23"
+      ],
+      "post_failure_identity": {
+        "branch": "hook-fail",
+        "head_sha_present": true,
+        "worktree": {
+          "detached": false,
+          "branch_mismatch": false,
+          "operation_present": false,
+          "changes": {
+            "conflicted": false
+          }
+        }
+      }
+    },
+    "merge_conflict": {
+      "exit_code": 1,
+      "stdout": "",
+      "stdout_is_json": false,
+      "stderr_contains": [
+        "Rebase onto main incomplete",
+        "CONFLICT (content): Merge conflict in conflict.txt"
+      ],
+      "list_schema_2": {
+        "branch": "conflict-feature",
+        "worktree": {
+          "detached": true,
+          "operation": "rebase",
+          "changes": {
+            "conflicted": true
+          }
+        },
+        "default_branch": {
+          "merge_conflicts": true
+        },
+        "display": {
+          "state": "would_conflict"
+        }
+      }
+    },
+    "foreground_remove": {
+      "exit_code": 0,
+      "stdout": [
+        {
+          "branch": "contract-create",
+          "branch_checked_out_at": null,
+          "branch_outcome": "deleted",
+          "kind": "worktree",
+          "path": "<repo>.contract-create"
+        }
+      ],
+      "stderr_contains": [
+        "Removed contract-create worktree & branch"
+      ]
+    },
+    "process_reap": {
+      "exit_code": 0,
+      "process_alive_before": true,
+      "process_alive_after": false,
+      "process_exit_signal": "SIGTERM",
+      "stdout": [
+        {
+          "branch": "reap-feature",
+          "branch_checked_out_at": null,
+          "branch_outcome": "deleted",
+          "kind": "worktree",
+          "path": "<repo>.reap-feature"
+        }
+      ],
+      "stderr_contains": [
+        "Reaping 1 process under reap-feature worktree",
+        "Reaped 0 of 1 process; 1 ignored SIGTERM & SIGKILL"
+      ],
+      "reporting_gap": "The detached sleep process exited on SIGTERM even though stderr reported it as ignored. Process liveness is authoritative for the fixture."
+    }
+  }
+}
