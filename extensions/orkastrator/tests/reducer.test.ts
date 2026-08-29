@@ -122,7 +122,17 @@ test("start requires sequence one and exact zero finite observation totals", () 
   }), /sequence must equal 1/u);
 
   for (const field of ["elapsedMs", "totalTokens", "totalCostMicros"] as const) {
-    for (const value of [1, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    for (const value of [
+      1,
+      -1,
+      0.5,
+      -0.5,
+      Number.MAX_SAFE_INTEGER + 1,
+      Number.MIN_SAFE_INTEGER - 1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ]) {
       assert.throws(() => reducePolicy({
         policy,
         checkpoint: null,
@@ -132,13 +142,63 @@ test("start requires sequence one and exact zero finite observation totals", () 
   }
 });
 
-test("start is closed and is legal only with a null checkpoint", () => {
-  assert.throws(() => reducePolicy({
-    policy,
-    checkpoint: null,
-    event: { type: "worker_completed", sequence: 1, observation: observation() },
-  }), /null checkpoint requires a started event/u);
+test("start rejects malformed observation shapes, nested extras, and nonnumeric field values", () => {
+  for (const malformed of [
+    null,
+    [],
+    "zero",
+    {},
+    { elapsedMs: 0, totalTokens: 0 },
+    { elapsedMs: 0, totalTokens: 0, totalCostMicros: 0, extra: true },
+  ]) {
+    const event = { ...startedEvent(), observation: malformed } as unknown as PolicyEvent;
+    assert.throws(() => reducePolicy({ policy, checkpoint: null, event }), /observation/u);
+  }
 
+  for (const field of ["elapsedMs", "totalTokens", "totalCostMicros"] as const) {
+    for (const malformed of [null, false, "0", {}, []]) {
+      const event = {
+        ...startedEvent(),
+        observation: { ...startedEvent().observation, [field]: malformed },
+      } as unknown as PolicyEvent;
+      assert.throws(() => reducePolicy({ policy, checkpoint: null, event }), new RegExp(`started observation ${field} must be zero`, "u"));
+    }
+  }
+});
+
+test("every non-start event rejects a null checkpoint", () => {
+  type NonStartEvent = Exclude<PolicyEvent, { type: "started" }>;
+  const zero = startedEvent().observation;
+  const events = {
+    worker_completed: { type: "worker_completed", sequence: 1, observation: zero },
+    worker_retryable_failure: { type: "worker_retryable_failure", sequence: 1, observation: zero },
+    worker_blocked: { type: "worker_blocked", sequence: 1, observation: zero },
+    initial_review_completed: { type: "initial_review_completed", sequence: 1, observation: zero, findings: [] },
+    fix_batch_completed: { type: "fix_batch_completed", sequence: 1, observation: zero, groups: [] },
+    re_review_completed: { type: "re_review_completed", sequence: 1, observation: zero, groups: [] },
+    validation_completed: {
+      type: "validation_completed",
+      sequence: 1,
+      observation: zero,
+      passed: true,
+      commitPresent: true,
+      cleanWorktree: true,
+      reviewAccepted: true,
+    },
+    incident: { type: "incident", sequence: 1, observation: zero, incident: "worker_blocked" },
+    decision: { type: "decision", sequence: 1, observation: zero, target: "supervisor", decision: "resume" },
+  } satisfies { [Type in NonStartEvent["type"]]: Extract<NonStartEvent, { type: Type }> };
+
+  for (const event of Object.values(events)) {
+    assert.throws(
+      () => reducePolicy({ policy, checkpoint: null, event }),
+      /null checkpoint requires a started event/u,
+      event.type,
+    );
+  }
+});
+
+test("start is closed and is legal only with a null checkpoint", () => {
   const started = reducePolicy({ policy, checkpoint: null, event: startedEvent() });
   assert.throws(() => reducePolicy({ policy, checkpoint: started.checkpoint, event: startedEvent() }), /requires a null checkpoint/u);
   assert.throws(() => reducePolicy({
