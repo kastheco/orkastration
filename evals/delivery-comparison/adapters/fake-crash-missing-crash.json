@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "crash-missing-crash",
   "comparison_mode": "tuned-primary",
-  "config_digest": "9bd8ee37551df5e95a617152131f019ed3a2885d5a7e11dc249b165714691f17",
+  "config_digest": "d2092a28bd96f31b8bfbe6eb463e91165a3aa4a75fc3ffd68385fb73238c7eff",
   "containment": {
     "backend": "none",
     "evidence": "Calibration protocol stub is not eligible for live use.",
@@ -26,7 +26,6 @@
   "description": "Calibration-only crash-missing-crash protocol stub",
   "environment": {},
   "id": "fake-crash-missing-crash",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

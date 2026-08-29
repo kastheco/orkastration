@@ -12,7 +12,7 @@
   },
   "calibration_scenario": "infrastructure-failure",
   "comparison_mode": "tuned-primary",
-  "config_digest": "6617f7ee7abee913e82d99aec2d1be9dd9006b3fa90cea68f4187ad14d841ac3",
+  "config_digest": "4a868bc7216c5f024b8395b139b8830e049e417cbe3f4a7b664c4753912038cd",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -21,7 +21,6 @@
   "description": "Nonexistent executable calibrates launch failure",
   "environment": {},
   "id": "fake-infrastructure-failure",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

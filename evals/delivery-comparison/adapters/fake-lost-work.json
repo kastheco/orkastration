@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "lost-work",
   "comparison_mode": "tuned-primary",
-  "config_digest": "1ff76377c71d86f7ef948100074a857f599e8ce3cb9cce01d24cfbe6a1ff6639",
+  "config_digest": "f7cd80fd27c6b236ccf5072e6712a95f96477a0fc8ecc3bcbf06a610587e2878",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -26,7 +26,6 @@
   "description": "Calibration-only lost-work fake",
   "environment": {},
   "id": "fake-lost-work",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

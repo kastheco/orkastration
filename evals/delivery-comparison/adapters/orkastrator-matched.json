@@ -10,7 +10,7 @@
   },
   "calibration_scenario": null,
   "comparison_mode": "matched-role-ablation",
-  "config_digest": "5bea5a1cbee5267c423dcf08f6e98b01e027c79cda3f5524f5ff7a3dd5865bf4",
+  "config_digest": "8485a771f6c8d0401c3e0298b63619806a49c2389106bab908e3e2c578b22e9d",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -19,7 +19,6 @@
   "description": "Pi-native production Orkastrator boundary (matched-role ablation)",
   "environment": {},
   "id": "orkastrator-matched",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "fixer": {
       "model": "owner-approved-model-pending",

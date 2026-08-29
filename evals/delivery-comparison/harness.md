@@ -1,43 +1,49 @@
 # Harness contract
 
-## Adapter invocation and containment
+## Live gate and containment
 
-Adapters are launched as argv arrays without a shell. The runner appends absolute isolated repo, copied public manifest, output bundle, trial ID, optional fault point, and crash delivery phase arguments. Processes start in detached process groups with closed stdin, bounded stdout/stderr, hard timeout, group kill, and leader reap.
+Adapters are launched only as argv arrays with bounded output, hard timeouts, detached process groups, group kill, and reap. Live execution is currently impossible: the harness-owned containment-launcher allowlist is empty, `ContainmentSpec` accepts only `backend=none`, and `AdapterManifest` rejects every `ready=true` value. Editing readiness, argv, isolation booleans, or prose evidence cannot enable execution. All production manifests retain `ready=false` and empty argv.
 
-A live-ready manifest must declare `external-verified` filesystem containment, `filesystem_isolation=true`, and bounded evidence. No checked-in live manifest does so. The harness does not implement or claim an OS sandbox today, and all live manifests remain unready. Calibration protocol stubs are non-live, copied alone into the trial root, and have no accepted implementations; accepted calibration mutations stay in harness-side control and their path/content is absent from adapter argv, environment, cwd, and public manifest.
+A future implementation must add and test a harness-owned launcher that exposes only the isolated repo, copied public manifest/instruction, output path, and required executable/runtime. No manifest self-attestation can substitute for that code. This harness makes no OS-sandbox claim.
 
-## Frozen configuration contract
+Calibration stubs are copied alone into each trial root and contain no accepted implementation. Hidden verifier, hashes, accepted source, and calibration control are absent from argv, environment, cwd, and public manifest.
 
-Every manifest records:
+## Frozen comparison contract
 
-- comparison mode (`tuned-primary`, `matched-role-ablation`, or diagnostic);
-- role→model map and thinking level (`off`, `low`, `medium`, `high`);
-- allowed model pool;
-- total token, USD cost, and wall-clock ceilings;
-- equal pre-evaluation tuning budget;
-- SHA-256 digest over the manifest configuration;
-- containment capability and evidence.
+Every load and live preflight recomputes the SHA-256 configuration digest. Runtime drift fails before fixture creation. Peers must share comparison mode, model pool, token/cost/wall budget, and tuning budget. `matched-role-ablation` additionally requires identical role/model/thinking maps. `tuned-primary` intentionally permits each production system's best supported role routing. `sol-high-diagnostic` requires every role to use model `sol` with high thinking and remains non-primary.
 
-The runner requires peers to share mode, model pool, resource budget, and tuning budget. Their tuned primary role maps may differ. Reports retain the mode, routes, pool, budget, and digest for every trial and aggregate.
+The effective subprocess timeout is the smaller of the CLI timeout and frozen wall budget; crash recovery receives only the remaining time. Reported input+output tokens and cost above frozen caps fail the trial. Reports preserve mode, maps, pool, budget, digest, bundle status, and budget violations.
 
-## Exact result and telemetry protocol
+## Exact result and telemetry
 
-`result.json` and `events.jsonl` use schema version `1` and reject unknown fields. Every telemetry event carries exact trial, adapter, and task identity. Sequence numbers must be contiguous and monotonic from the required phase start. Dispatch, action/effect, crash, redelivery, commit, and acknowledgement events require a nonempty action ID. Missing, extra, or mismatched identities; missing/duplicate sequences; or absent action IDs are protocol failures. Missing IDs are never discarded from duplicate analysis because schema validation fails first.
+`result.json` and `events.jsonl` reject unknown fields. Every event carries exact trial/adapter/task identity, contiguous sequence, and bounded detail. Dispatch, effect/action, crash, redelivery, commit, ack, and lost-work events require nonempty action IDs. Missing, extra, mismatched, duplicate-sequence, or whitespace-only identities fail as bounded protocol evidence.
 
-Adapter infrastructure reporting is closed and bounded. `infrastructure.code` is one of service unavailable, rate limited, authentication unavailable, quota exhausted, containment failure, or worktree failure; evidence is nonempty and at most 500 characters. It is classified as infrastructure only when process stdout/stderr contains the exact marker `ORK_EVAL_INFRA:<code>` **and** the independently observed exit code is in that adapter configuration's frozen per-code allowlist. All three facts must agree. Allowlists may explicitly cover zero or nonzero exits. Free-text summaries and uncorroborated structured claims cannot erase candidate failures. Runner launch and verifier launch failures remain independently observed infrastructure failures.
+Success requires process exit zero **and** `bundle.status=completed`. Exit-zero `failed` and `crashed` bundles cannot succeed.
 
-## Harness-controlled crash/redelivery
+## Harness-owned crash/effect observation
 
-For the crash task the runner starts an initial delivery phase. The adapter must publish an exact identity/action handshake while remaining alive. The harness observes that live state, kills the detached process group, and records dispatch and crash events itself. It then launches a separate recovery process. Success requires exactly this ordered action-stable chain:
+The crash task does not trust adapter-authored effect or commit events:
 
-```text
-dispatch → harness kill/crash → restart/redelivery → one external action/effect → one commit → ack
-```
+1. Initial process atomically publishes a bounded dispatch handshake and remains alive.
+2. Harness validates and strips the action ID, then kills that live process group and records dispatch/crash itself.
+3. Recovery process publishes a bounded redelivery checkpoint.
+4. In calibration only, harness control applies the accepted external repository effect keyed by the dispatch action ID and creates a real Git commit. It independently records effect count, commit count, and commit SHA before releasing recovery.
+5. Recovery publishes ack only after the harness release; harness validates the post-effect ack and stable action ID.
 
-All six events use the same nonempty action ID. Missing crash, missing redelivery, changed ID, duplicate effect, lost work, or unordered events fail even if repository behavior and hashes pass. Crash recovery cannot be self-awarded by writing fabricated crash event names.
+Success requires exactly one harness-owned effect and one commit, stable action ID, and ack after commit. Event-only fabricated chains, missing/duplicate effects, wrong IDs, ack-before-effect, and lost committed state fail even when adapter telemetry claims success.
 
-## Correctness and evidence
+The current protocol has no genuine production-independent effect/ack observer. For `calibration_scenario=None`, recovery fails closed with `production independent effect/ack contract is not implemented`. This missing production adapter contract is an explicit blocker alongside containment; the harness does not pretend calibration control proves live delivery.
 
-After process completion, the runner compares the complete accepted tree, detects protected/out-of-scope writes, and invokes a hidden behavior verifier. Adapter claims, model metrics, and summaries are diagnostic. A success requires valid protocol, successful independently observed final behavior/tree, no scope violation, no duplicate/lost work, and—on the crash task—the validated chain.
+## Infrastructure classification
 
-Calibration covers correct/wrong trees, protected escape, timeout/process-group kill, real harness fault injection/restart, six invalid crash chains, malformed protocol, duplicate/lost actions, launch infrastructure, corroborated service infrastructure at zero and nonzero exits, false infrastructure claims, and bounded output. No live adapter or model is selected.
+Adapter bundle infrastructure fields and adapter stdout/stderr are one untrusted source and never determine infrastructure classification. Only harness/host observations use the closed codes:
+
+- `adapter_launch_failure` — host could not launch the main adapter process;
+- `initial_phase_launch_failure` — host could not launch the initial crash phase;
+- `verifier_failure` — harness verifier launch or timeout failed.
+
+Adapter-declared service, worktree, containment, authentication, quota, or rate-limit claims remain diagnostic. At exit zero they are scored from final state/status; at nonzero they remain adapter crashes. A future service classification requires a separate harness-owned probe.
+
+## Calibration
+
+Offline calibration covers visible-test discovery, correct/wrong trees, scope escape, timeout/group kill, real crash interruption/restart, fabricated chains, missing/duplicate/wrong effects, wrong and whitespace action IDs, ack-before-effect, lost work, malformed telemetry/bundles, exit-zero failed/crashed statuses, token/cost caps, host launch/verifier failures, ignored adapter infrastructure claims, and output bounds. No live/model/network command runs.

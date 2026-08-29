@@ -10,7 +10,7 @@
   },
   "calibration_scenario": null,
   "comparison_mode": "tuned-primary",
-  "config_digest": "2454631fe803288d64cb83cc5d804ed4deb2f9819d7a87347463708573527000",
+  "config_digest": "85e8e3f643f58673dc88cd90e18e64542b501d43702eac1bcaa8327d4903e1cd",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -19,7 +19,6 @@
   "description": "Pi-native production Orkastrator boundary",
   "environment": {},
   "id": "orkastrator",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "fixer": {
       "model": "owner-approved-model-pending",

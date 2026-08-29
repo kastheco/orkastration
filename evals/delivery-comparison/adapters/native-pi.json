@@ -10,7 +10,7 @@
   },
   "calibration_scenario": null,
   "comparison_mode": "tuned-primary",
-  "config_digest": "593d4f1a84fd0d8bace4a69217611401ff3a301c116ba27843ae8e55aff8d72a",
+  "config_digest": "7fe4ab84cfcce9db7e0f4defe43b8636fd1a1dca0cf3b5f1c69b62af68637674",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -19,7 +19,6 @@
   "description": "Native Pi subagent delivery boundary",
   "environment": {},
   "id": "native-pi",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "fixer": {
       "model": "owner-approved-model-pending",

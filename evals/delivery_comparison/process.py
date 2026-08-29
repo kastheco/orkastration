@@ -8,7 +8,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from .models import ProcessEvidence
@@ -125,6 +125,79 @@ def run_process(
             exit_code=exit_code,
             timed_out=timed_out,
             launch_error=launch_error,
+        )
+
+
+def run_with_checkpoint(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    checkpoint_path: Path,
+    on_checkpoint: Callable[[], None],
+    timeout_seconds: float,
+    output_limit_bytes: int = 64 * 1024,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[ProcessEvidence, bool, str | None]:
+    """Run a process while a harness-owned callback handles one published checkpoint."""
+
+    command = list(argv)
+    started = time.monotonic()
+    checkpoint_seen = False
+    callback_error: str | None = None
+    with tempfile.TemporaryDirectory(prefix="delivery-checkpoint-") as temporary:
+        stdout_path = Path(temporary, "stdout")
+        stderr_path = Path(temporary, "stderr")
+        timed_out = False
+        exit_code: int | None = None
+        launch_error: str | None = None
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=offline_environment(environment),
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                launch_error = f"{type(exc).__name__}: {exc}"
+            else:
+                deadline = started + timeout_seconds
+                while time.monotonic() < deadline:
+                    if checkpoint_path.is_file() and not checkpoint_seen:
+                        checkpoint_seen = True
+                        try:
+                            on_checkpoint()
+                        except Exception as exc:  # callback errors become bounded trial evidence
+                            callback_error = f"{type(exc).__name__}: {exc}"
+                            _kill_group(process, signal.SIGKILL)
+                            exit_code = process.wait()
+                            break
+                    polled = process.poll()
+                    if polled is not None:
+                        exit_code = polled
+                        break
+                    time.sleep(0.01)
+                else:
+                    timed_out = True
+                    _kill_group(process, signal.SIGKILL)
+                    exit_code = process.wait()
+                _kill_group(process, signal.SIGKILL)
+        return (
+            _evidence(
+                command,
+                started,
+                stdout_path,
+                stderr_path,
+                output_limit_bytes,
+                exit_code=exit_code,
+                timed_out=timed_out,
+                launch_error=launch_error,
+            ),
+            checkpoint_seen,
+            callback_error,
         )
 
 

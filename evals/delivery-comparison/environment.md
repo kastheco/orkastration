@@ -1,25 +1,25 @@
 # Frozen environment and operations
 
-## Local offline contract
+## Offline contract
 
-- Python and Node versions/dependencies are frozen by repository metadata and lockfiles.
-- Every trial replaces the fixture directory, copies a checked-in template, initializes Git, and commits a baseline. Ignored/untracked state cannot leak between trials.
-- Visible tests use dependency-free `unittest` discovery. Each baseline command discovers at least one test and fails against the intentionally wrong baseline; the accepted state passes it.
-- Adapter subprocesses inherit a small environment allowlist plus manifest values. Credential-shaped manifest keys are rejected. Proxy/credential variables are not inherited, and standard offline flags are set.
-- Stdout/stderr are bounded. Detached process groups receive termination/escalation and are reaped.
-- The harness itself performs no network or model calls.
+- Repository metadata and lockfiles freeze Python/Node dependencies.
+- Every trial replaces the fixture, copies a checked-in template, initializes Git, and commits a baseline.
+- Dependency-free `unittest` commands each discover at least one test, fail on the wrong baseline, and pass accepted state.
+- Subprocesses inherit a small environment allowlist plus non-secret manifest values. Proxy/credential variables are removed and offline flags are set.
+- Stdout/stderr and handshakes are bounded. Detached groups are timed out, killed, and reaped.
+- Validate/calibrate perform no model, API, or network calls.
 
-## Filesystem containment readiness
+## Live execution is structurally disabled
 
-Environment filtering is not filesystem or network containment. Live readiness requires an explicitly evidenced external containment backend that exposes only the isolated repo, copied public manifest/instruction, and output path. Hidden verifiers, accepted hashes, and calibration controls must be outside the adapter namespace. No supported backend has been proven in this checkout; all native and Orkastrator manifests therefore remain `ready=false`, and `run` refuses before any command.
+Environment filtering is not containment. The harness-owned containment-launcher allowlist is empty. Schema permits only `backend=none`, fixes `filesystem_isolation=false`, and rejects every `ready=true` manifest. Production manifests have empty argv. Editing fields or adding prose evidence cannot enable a process.
 
-Calibration protocol stubs run locally without hostile sandbox claims. They contain no accepted implementation and receive no hidden path/content in argv, environment, cwd, or public manifest. Harness-side calibration control changes the final tree only after the stub process exits.
+Future work must implement an allowlisted harness-owned launcher that exposes only isolated repo, public manifest/instruction, output, and necessary runtime. It must also implement production-independent effect/commit and post-effect ack observation for crash recovery. Calibration's harness-owned mutation/Git commit is not a production contract; production crash scoring fails closed without the missing observer.
 
-No credentials are needed for validation or calibration. Do not store secrets in manifests, digests, result bundles, or telemetry.
+No credentials belong in manifests, digests, bundles, or telemetry.
 
-## Harbor state
+## Harbor
 
-At build validation, `command -v harbor` returned no path; Harbor was not installed. This remains a local contract harness with adapter/control-plane contracts suitable for later containment and Harbor work. No Harbor execution is claimed.
+`command -v harbor` returned no path during initial build validation; Harbor was not installed. This remains a local contract harness, not a claim of Harbor execution.
 
 ## Commands
 
@@ -29,7 +29,7 @@ rm -rf /tmp/orkastrator-delivery-calibration
 uv run orkastrator-delivery-eval calibrate \
   --output /tmp/orkastrator-delivery-calibration
 
-# Future only after owner approval and contained, frozen, ready manifests:
+# Documented future commands; currently refused before fixture creation:
 uv run orkastrator-delivery-eval run --allow-live \
   --comparison-mode tuned-primary \
   --output /tmp/orkastrator-delivery-live-primary --repeats 3

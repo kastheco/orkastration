@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "loud",
   "comparison_mode": "tuned-primary",
-  "config_digest": "cd105984b7d28565e71bf0f922672b10b283ed0fa485d792613ed64a1cbf90d7",
+  "config_digest": "982f11512b77aed6ae93b78002b3595a2e7464352e73d37dae82b1e3b8228621",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -26,7 +26,6 @@
   "description": "Calibration-only loud fake",
   "environment": {},
   "id": "fake-loud",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

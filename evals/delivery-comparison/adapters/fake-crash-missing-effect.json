@@ -6,26 +6,26 @@
     "{python}",
     "{protocol_stub}",
     "--mode",
-    "crash-wrong-action",
+    "crash-missing-effect",
     "--adapter-id",
-    "fake-crash-wrong-action"
+    "fake-crash-missing-effect"
   ],
   "budget": {
     "max_cost_usd": 25.0,
     "max_total_tokens": 200000,
     "max_wall_seconds": 1800
   },
-  "calibration_scenario": "crash-wrong-action",
+  "calibration_scenario": "crash-missing-effect",
   "comparison_mode": "tuned-primary",
-  "config_digest": "27c11a9a9a7a175f23c3eb0350d2ee1e9d785ecd0341da4a9f10cefe92792658",
+  "config_digest": "a9b83bff206d579474830997097defcbbd9cdcfaaf16deab6e466ca3685ad1f4",
   "containment": {
     "backend": "none",
-    "evidence": "Calibration protocol stub is not eligible for live use.",
+    "evidence": "No filesystem containment backend is proven.",
     "filesystem_isolation": false
   },
-  "description": "Calibration-only crash-wrong-action protocol stub",
+  "description": "Calibration-only crash-missing-effect protocol stub",
   "environment": {},
-  "id": "fake-crash-wrong-action",
+  "id": "fake-crash-missing-effect",
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 SCHEMA_VERSION = "1"
 ComparisonMode = Literal["tuned-primary", "matched-role-ablation", "sol-high-diagnostic"]
@@ -17,6 +17,11 @@ InfrastructureCode = Literal[
     "containment_failure",
     "worktree_failure",
 ]
+HostInfrastructureCode = Literal[
+    "adapter_launch_failure",
+    "initial_phase_launch_failure",
+    "verifier_failure",
+]
 
 
 class StrictModel(BaseModel):
@@ -26,8 +31,8 @@ class StrictModel(BaseModel):
 
 
 class ContainmentSpec(StrictModel):
-    backend: Literal["none", "external-verified"]
-    filesystem_isolation: bool
+    backend: Literal["none"]
+    filesystem_isolation: Literal[False]
     evidence: str = Field(max_length=500)
 
 
@@ -57,19 +62,12 @@ class AdapterManifest(StrictModel):
     budget: EvaluationBudget
     tuning_budget_hours: float = Field(ge=0)
     config_digest: str
-    infrastructure_exit_codes: dict[InfrastructureCode, list[int]] = Field(default_factory=dict)
     calibration_scenario: str | None = None
 
     @model_validator(mode="after")
     def validate_readiness_and_configuration(self) -> AdapterManifest:
-        if self.ready and not self.argv:
-            raise ValueError("ready adapters require argv")
-        if self.ready and (
-            self.containment.backend != "external-verified"
-            or not self.containment.filesystem_isolation
-            or not self.containment.evidence.strip()
-        ):
-            raise ValueError("ready adapters require explicitly evidenced filesystem containment")
+        if self.ready:
+            raise ValueError("live readiness is disabled: no harness-owned containment launcher")
         if not self.model_role_map:
             raise ValueError("model_role_map cannot be empty")
         routed_models = {route.model for route in self.model_role_map.values()}
@@ -77,11 +75,6 @@ class AdapterManifest(StrictModel):
             raise ValueError("every routed model must be in allowed_model_pool")
         if len(self.config_digest) != 64 or not re.fullmatch(r"[0-9a-f]{64}", self.config_digest):
             raise ValueError("config_digest must be lowercase SHA-256")
-        if any(
-            not codes or len(codes) != len(set(codes))
-            for codes in self.infrastructure_exit_codes.values()
-        ):
-            raise ValueError("infrastructure exit-code allowlists must be nonempty and unique")
         secret_terms = ("token", "secret", "password", "api_key", "apikey", "credential")
         if any(any(term in key.lower() for term in secret_terms) for key in self.environment):
             raise ValueError("adapter environment may not contain credential-shaped keys")
@@ -168,9 +161,20 @@ class TelemetryEvent(StrictModel):
 
     @model_validator(mode="after")
     def require_action_identity(self) -> TelemetryEvent:
-        if self.event in _ACTION_EVENTS and not (self.action_id and self.action_id.strip()):
-            raise ValueError(f"{self.event} requires nonempty action_id")
+        if self.event in _ACTION_EVENTS:
+            if not (self.action_id and self.action_id.strip()):
+                raise ValueError(f"{self.event} requires nonempty action_id")
+            normalized = self.action_id.strip()
+            if len(normalized) > 128:
+                raise ValueError(f"{self.event} action_id exceeds 128 characters")
+            self.action_id = normalized
         return self
+
+
+BoundedIdentifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
 
 
 class DispatchHandshake(StrictModel):
@@ -178,7 +182,15 @@ class DispatchHandshake(StrictModel):
     trial_id: str
     adapter_id: str
     task_id: str
-    action_id: str = Field(min_length=1)
+    action_id: BoundedIdentifier
+
+
+class RecoveryHandshake(StrictModel):
+    schema_version: Literal["1"] = "1"
+    trial_id: str
+    adapter_id: str
+    task_id: str
+    action_id: BoundedIdentifier
 
 
 class ProcessEvidence(StrictModel):
@@ -199,7 +211,17 @@ class FaultInjectionEvidence(StrictModel):
     process_interrupted: bool
     action_id: str | None
     initial_process: ProcessEvidence | None
-    error: str | None = None
+    error: str | None = Field(default=None, max_length=1000)
+
+
+class ExternalEffectEvidence(StrictModel):
+    redelivery_observed: bool
+    effect_count: int = Field(ge=0)
+    commit_count: int = Field(ge=0)
+    action_id: str | None
+    commit_sha: str | None
+    ack_observed: bool
+    error: str | None = Field(default=None, max_length=1000)
 
 
 class VerifierEvidence(StrictModel):
@@ -250,9 +272,13 @@ class TrialResult(StrictModel):
     crash_recovery: bool
     crash_chain_error: str | None
     fault_injection: FaultInjectionEvidence
+    external_effect: ExternalEffectEvidence
     scope_violations: list[str]
+    budget_violations: list[str]
+    infrastructure_code: HostInfrastructureCode | None
     infrastructure_error: str | None
     adapter_process: ProcessEvidence
+    bundle_status: Literal["completed", "failed", "crashed"] | None
     bundle_error: str | None = None
 
 

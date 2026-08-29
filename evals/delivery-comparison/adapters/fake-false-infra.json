@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "false-infra",
   "comparison_mode": "tuned-primary",
-  "config_digest": "387d9fc8791d66ac691b67d06b8e1287cdc8779b342015d59219c8dd51c55311",
+  "config_digest": "d7da11a9bc1f09c58eefab771c18f48e3a6527bc82b18e8aa4f1f49619e694f7",
   "containment": {
     "backend": "none",
     "evidence": "Calibration protocol stub is not eligible for live use.",
@@ -26,11 +26,6 @@
   "description": "Calibration-only false-infra protocol stub",
   "environment": {},
   "id": "fake-false-infra",
-  "infrastructure_exit_codes": {
-    "service_unavailable": [
-      0
-    ]
-  },
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

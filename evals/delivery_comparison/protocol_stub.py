@@ -14,9 +14,14 @@ CRASH_MODES = {
     "crash-missing-crash",
     "crash-missing-redelivery",
     "crash-wrong-action",
-    "crash-duplicate",
+    "crash-whitespace-action",
+    "crash-fabricated-chain",
+    "crash-event-claims-before-effect",
+    "crash-missing-effect",
+    "crash-duplicate-effect",
+    "crash-wrong-effect-action",
+    "crash-ack-before-effect",
     "crash-lost-work",
-    "crash-unordered",
 }
 
 
@@ -36,38 +41,52 @@ def event(
     }
 
 
-def write_protocol(
-    output: Path,
-    *,
-    identity: tuple[str, str, str],
-    mode: str,
-    phase: str,
-) -> None:
+def _atomic_json(path: Path, value: dict[str, object]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _handshake(
+    identity: tuple[str, str, str], action_id: str
+) -> dict[str, object]:
     trial, adapter, task = identity
-    if mode == "malformed":
-        (output / "result.json").write_text("{not-json\n")
-        (output / "events.jsonl").write_text("")
-        return
-    infrastructure = None
-    if mode in {"service-infra-zero", "service-infra-nonzero", "false-infra"}:
-        infrastructure = {
-            "code": "service_unavailable",
-            "evidence": "calibration service probe unavailable",
-        }
-    result = {
+    return {
         "schema_version": "1",
         "trial_id": trial,
         "adapter_id": adapter,
         "task_id": task,
-        "status": "crashed" if mode == "crash" else "completed",
-        "summary": (
-            "infrastructure maybe" if mode == "false-infra" else f"deterministic fake {mode}"
-        ),
+        "action_id": action_id,
+    }
+
+
+def _result(identity: tuple[str, str, str], mode: str) -> dict[str, object]:
+    trial, adapter, task = identity
+    status = "completed"
+    if mode == "status-failed":
+        status = "failed"
+    elif mode in {"status-crashed", "crash"}:
+        status = "crashed"
+    input_tokens = 250_000 if mode == "over-token" else 120
+    cost = 30.0 if mode == "over-cost" else 0.0125
+    infrastructure = None
+    if mode in {"service-infra-zero", "service-infra-nonzero", "false-infra"}:
+        infrastructure = {
+            "code": "service_unavailable",
+            "evidence": "adapter-authored service claim",
+        }
+    return {
+        "schema_version": "1",
+        "trial_id": trial,
+        "adapter_id": adapter,
+        "task_id": task,
+        "status": status,
+        "summary": f"deterministic fake {mode}",
         "metrics": {
             "model_calls": 4,
-            "input_tokens": 120,
+            "input_tokens": input_tokens,
             "output_tokens": 30,
-            "cost_usd": 0.0125,
+            "cost_usd": cost,
             "supervisor_turns": 2,
             "human_interruptions": 0,
             "reviewer_calls": 1,
@@ -75,42 +94,59 @@ def write_protocol(
         },
         "infrastructure": infrastructure,
     }
-    (output / "result.json").write_text(json.dumps(result, sort_keys=True) + "\n")
-    if mode in CRASH_MODES:
-        start = 0 if mode == "crash-missing-crash" else 2
-        chain: list[tuple[str, str | None]] = [
-            ("redelivery", "action-1"),
-            ("action", "action-1"),
-            ("commit", "action-1"),
-            ("ack", "action-1"),
-        ]
-        if mode == "crash-missing-redelivery":
-            chain = chain[1:]
-        elif mode == "crash-wrong-action":
-            chain[0] = ("redelivery", "wrong-action")
-        elif mode == "crash-duplicate":
-            chain.insert(2, ("action", "action-1"))
-        elif mode == "crash-lost-work":
-            chain.append(("lost_committed_work", "action-1"))
-        elif mode == "crash-unordered":
-            chain = [chain[0], chain[2], chain[1], chain[3]]
-        events = [
-            event(identity, start + index, kind, action)
-            for index, (kind, action) in enumerate(chain)
-        ]
-    else:
-        standard_chain = ["dispatch", "action", "commit", "ack"]
-        events = [
-            event(identity, index, kind, "action-1")
-            for index, kind in enumerate(standard_chain)
-        ]
-        if mode == "duplicate":
-            events.append(event(identity, len(events), "action", "action-1"))
-        if mode == "lost-work":
-            events.append(event(identity, len(events), "lost_committed_work", "action-1"))
+
+
+def write_protocol(
+    output: Path,
+    *,
+    identity: tuple[str, str, str],
+    mode: str,
+    events: list[dict[str, object]] | None = None,
+) -> None:
+    if mode == "malformed":
+        (output / "result.json").write_text("{not-json\n")
+        (output / "events.jsonl").write_text("")
+        return
+    (output / "result.json").write_text(json.dumps(_result(identity, mode), sort_keys=True) + "\n")
     (output / "events.jsonl").write_text(
-        "".join(json.dumps(item, sort_keys=True) + "\n" for item in events)
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in (events or []))
     )
+
+
+def _run_crash_recovery(
+    output: Path, identity: tuple[str, str, str], mode: str
+) -> None:
+    if mode == "crash-fabricated-chain":
+        fabricated = [
+            event(identity, index + 2, kind, "action-1")
+            for index, kind in enumerate(["redelivery", "action", "commit", "ack"])
+        ]
+        write_protocol(output, identity=identity, mode=mode, events=fabricated)
+        return
+    if mode == "crash-missing-redelivery":
+        write_protocol(output, identity=identity, mode=mode)
+        return
+
+    action_id = "action-1"
+    if mode == "crash-wrong-action":
+        action_id = "wrong-action"
+    if mode == "crash-event-claims-before-effect":
+        claims = [
+            event(identity, index + 2, kind, action_id)
+            for index, kind in enumerate(["redelivery", "action", "commit", "ack"])
+        ]
+        (output / "events.jsonl").write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in claims)
+        )
+    _atomic_json(output / "redelivery-handshake.json", _handshake(identity, action_id))
+    if mode == "crash-ack-before-effect":
+        _atomic_json(output / "ack-handshake.json", _handshake(identity, action_id))
+    deadline = time.monotonic() + 10
+    while not (output / "effect-observed.json").is_file() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if mode != "crash-ack-before-effect" and (output / "effect-observed.json").is_file():
+        _atomic_json(output / "ack-handshake.json", _handshake(identity, action_id))
+    write_protocol(output, identity=identity, mode=mode)
 
 
 def main() -> int:
@@ -132,16 +168,11 @@ def main() -> int:
     if args.delivery_phase == "initial":
         if args.mode == "crash-missing-crash":
             return 0
-        handshake = {
-            "schema_version": "1",
-            "trial_id": args.trial_id,
-            "adapter_id": args.adapter_id,
-            "task_id": task,
-            "action_id": "action-1",
-        }
-        handshake_temporary = args.output_bundle / "dispatch-handshake.tmp"
-        handshake_temporary.write_text(json.dumps(handshake, sort_keys=True) + "\n")
-        handshake_temporary.replace(args.output_bundle / "dispatch-handshake.json")
+        action_id = "   " if args.mode == "crash-whitespace-action" else "action-1"
+        _atomic_json(
+            args.output_bundle / "dispatch-handshake.json",
+            _handshake(identity, action_id),
+        )
         time.sleep(60)
         return 0
     if args.mode == "timeout":
@@ -152,9 +183,20 @@ def main() -> int:
         return 0
     if args.mode == "loud":
         print("x" * 200_000)
-    if args.mode in {"service-infra-zero", "service-infra-nonzero"}:
-        print("ORK_EVAL_INFRA:service_unavailable", flush=True)
-    write_protocol(args.output_bundle, identity=identity, mode=args.mode, phase=args.delivery_phase)
+    if args.mode in CRASH_MODES:
+        _run_crash_recovery(args.output_bundle, identity, args.mode)
+    else:
+        standard = [
+            event(identity, index, kind, "action-1")
+            for index, kind in enumerate(["dispatch", "action", "commit", "ack"])
+        ]
+        if args.mode == "duplicate":
+            standard.append(event(identity, len(standard), "action", "action-1"))
+        if args.mode == "lost-work":
+            standard.append(
+                event(identity, len(standard), "lost_committed_work", "action-1")
+            )
+        write_protocol(args.output_bundle, identity=identity, mode=args.mode, events=standard)
     if args.mode in {"crash", "service-infra-nonzero"}:
         return 17
     return 0

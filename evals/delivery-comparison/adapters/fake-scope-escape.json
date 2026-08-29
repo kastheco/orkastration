@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "scope-escape",
   "comparison_mode": "tuned-primary",
-  "config_digest": "1fa382498706b95c03ecdd16de8044667a7b85003f059cf6f9a00372b44d817f",
+  "config_digest": "aaa0dda6a31a456f2188f8826e7a1edf7daa8aedeef12bf1c24e1670005eb0bb",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -26,7 +26,6 @@
   "description": "Calibration-only scope-escape fake",
   "environment": {},
   "id": "fake-scope-escape",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

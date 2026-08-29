@@ -3,29 +3,24 @@
     "offline-fake"
   ],
   "argv": [
-    "{python}",
-    "{protocol_stub}",
-    "--mode",
-    "crash-wrong-action",
-    "--adapter-id",
-    "fake-crash-wrong-action"
+    "/definitely/not/an/initial-delivery-adapter"
   ],
   "budget": {
     "max_cost_usd": 25.0,
     "max_total_tokens": 200000,
     "max_wall_seconds": 1800
   },
-  "calibration_scenario": "crash-wrong-action",
+  "calibration_scenario": "initial-infrastructure-failure",
   "comparison_mode": "tuned-primary",
-  "config_digest": "27c11a9a9a7a175f23c3eb0350d2ee1e9d785ecd0341da4a9f10cefe92792658",
+  "config_digest": "be8da2eefa0d3b30e738379270a03b3971e2b2573f43ff04ee3a2ba11be5dfc3",
   "containment": {
     "backend": "none",
-    "evidence": "Calibration protocol stub is not eligible for live use.",
+    "evidence": "No filesystem containment backend is proven.",
     "filesystem_isolation": false
   },
-  "description": "Calibration-only crash-wrong-action protocol stub",
+  "description": "Missing executable calibrates host-observed initial phase launch failure",
   "environment": {},
-  "id": "fake-crash-wrong-action",
+  "id": "fake-initial-infrastructure-failure",
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

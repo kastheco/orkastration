@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "crash",
   "comparison_mode": "tuned-primary",
-  "config_digest": "6665cf47ebd73add70283344d3646b5b954bd667735224e6e34c93e896657feb",
+  "config_digest": "c6e9b83faa93b4212a98fe2dfbf3bf7d5783a3b0a3b00ccea055d66204dd970c",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -26,7 +26,6 @@
   "description": "Calibration-only crash fake",
   "environment": {},
   "id": "fake-crash",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

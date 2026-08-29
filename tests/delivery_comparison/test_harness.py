@@ -29,6 +29,7 @@ from evals.delivery_comparison.report import build_report, write_report
 from evals.delivery_comparison.runner import (
     ReadinessError,
     _adapter_argv,
+    _configuration_digest,
     load_adapter,
     run_comparison,
     run_trial,
@@ -137,17 +138,130 @@ def test_primary_and_matched_modes_freeze_fair_configuration_fields() -> None:
     assert native_matched.tuning_budget_hours == orkastrator_matched.tuning_budget_hours
 
 
-def test_ready_manifest_requires_explicit_verified_filesystem_containment() -> None:
+def _refreeze(adapter: AdapterManifest) -> AdapterManifest:
+    adapter.config_digest = _configuration_digest(adapter.model_dump(mode="json"))
+    return adapter
+
+
+def test_live_preflight_enforces_digest_modes_and_matched_roles(tmp_path: Path) -> None:
+    native = load_adapter(ADAPTERS_ROOT / "native-pi-matched.json")
+    orkastrator = load_adapter(ADAPTERS_ROOT / "orkastrator-matched.json")
+    orkastrator.model_role_map = {
+        **orkastrator.model_role_map,
+        "worker": orkastrator.model_role_map["worker"].model_copy(
+            update={"thinking": "low"}
+        ),
+    }
+    _refreeze(orkastrator)
+    with pytest.raises(ReadinessError, match="identical role maps"):
+        run_comparison(
+            [native, orkastrator],
+            discover_tasks(FIXTURES_ROOT),
+            repeats=1,
+            output_directory=tmp_path,
+        )
+
+    native = load_adapter(ADAPTERS_ROOT / "native-pi.json")
+    native.description = "digest drift"
+    with pytest.raises(ReadinessError, match="digest mismatch"):
+        run_comparison(
+            [native, load_adapter(ADAPTERS_ROOT / "orkastrator.json")],
+            discover_tasks(FIXTURES_ROOT),
+            repeats=1,
+            output_directory=tmp_path,
+        )
+
+    diagnostic = load_adapter(ADAPTERS_ROOT / "fake-success.json")
+    diagnostic.comparison_mode = "sol-high-diagnostic"
+    _refreeze(diagnostic)
+    with pytest.raises(ReadinessError, match="route every role to sol"):
+        run_comparison(
+            [diagnostic, diagnostic.model_copy(deep=True)],
+            discover_tasks(FIXTURES_ROOT),
+            repeats=1,
+            output_directory=tmp_path,
+        )
+
+    sol_route = diagnostic.model_role_map["calibration"].model_copy(
+        update={"model": "sol", "thinking": "high"}
+    )
+    diagnostic.model_role_map = {"calibration": sol_route}
+    diagnostic.allowed_model_pool = ["sol"]
+    _refreeze(diagnostic)
+    peer = diagnostic.model_copy(deep=True)
+    with pytest.raises(ReadinessError, match="comparison adapters not ready"):
+        run_comparison(
+            [diagnostic, peer],
+            discover_tasks(FIXTURES_ROOT),
+            repeats=1,
+            output_directory=tmp_path,
+        )
+
+    tuned = load_adapter(ADAPTERS_ROOT / "fake-success.json")
+    tuned_peer = tuned.model_copy(deep=True)
+    tuned_peer.model_role_map = {
+        "calibration": tuned_peer.model_role_map["calibration"].model_copy(
+            update={"thinking": "high"}
+        )
+    }
+    _refreeze(tuned_peer)
+    with pytest.raises(ReadinessError, match="comparison adapters not ready"):
+        run_comparison(
+            [tuned, tuned_peer],
+            discover_tasks(FIXTURES_ROOT),
+            repeats=1,
+            output_directory=tmp_path,
+        )
+
+
+def test_effective_timeout_is_bounded_by_frozen_wall_budget(tmp_path: Path) -> None:
+    adapter = load_adapter(ADAPTERS_ROOT / "fake-timeout.json")
+    adapter.budget = adapter.budget.model_copy(update={"max_wall_seconds": 1})
+    _refreeze(adapter)
+    result = run_trial(
+        adapter,
+        tasks_by_id()["clean-bugfix"],
+        trial_id="wall-cap",
+        output_directory=tmp_path,
+        timeout_seconds=10,
+        require_ready=False,
+    )
+    assert result.classification == "adapter_timeout"
+    assert result.wall_time_seconds < 2
+
+
+def test_manifest_fields_cannot_self_attest_containment_or_enable_execution(
+    tmp_path: Path,
+) -> None:
     raw = json.loads((ADAPTERS_ROOT / "native-pi.json").read_text())
     raw["ready"] = True
     raw["argv"] = ["native-pi-adapter"]
-    with pytest.raises(ValidationError, match="filesystem containment"):
+    with pytest.raises(ValidationError, match="live readiness is disabled"):
         AdapterManifest.model_validate(raw)
+    raw["containment"] = {
+        "backend": "external-verified",
+        "filesystem_isolation": True,
+        "evidence": "self-attested prose",
+    }
+    with pytest.raises(ValidationError):
+        AdapterManifest.model_validate(raw)
+
+    adapter = load_adapter(ADAPTERS_ROOT / "fake-success.json")
+    adapter.ready = True
+    adapter.config_digest = _configuration_digest(adapter.model_dump(mode="json"))
+    with pytest.raises(ReadinessError, match="no harness-owned containment launcher"):
+        run_trial(
+            adapter,
+            tasks_by_id()["clean-bugfix"],
+            trial_id="must-not-run",
+            output_directory=tmp_path,
+        )
+    assert not (tmp_path / "must-not-run").exists()
     for name in ("native-pi", "orkastrator"):
         manifest = load_adapter(ADAPTERS_ROOT / f"{name}.json")
         assert not manifest.ready
+        assert manifest.argv == []
         assert manifest.containment.backend == "none"
-        assert not manifest.containment.filesystem_isolation
 
 
 def test_reset_replaces_untracked_and_modified_state(tmp_path: Path) -> None:
@@ -166,11 +280,11 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
     results = calibrate(tmp_path / "calibration")
     classifications = [result.classification for result in results]
     assert classifications.count("success") == 4
-    assert classifications.count("agent_failure") == 11
-    assert classifications.count("infrastructure_failure") == 3
+    assert classifications.count("agent_failure") == 20
+    assert classifications.count("infrastructure_failure") == 2
     assert classifications.count("adapter_timeout") == 1
-    assert classifications.count("adapter_crash") == 1
-    assert classifications.count("adapter_protocol_failure") == 1
+    assert classifications.count("adapter_crash") == 2
+    assert classifications.count("adapter_protocol_failure") == 2
 
     by_adapter = {result.adapter_id: result for result in results}
     recovered = by_adapter["fake-crash-redelivery"]
@@ -184,24 +298,41 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
         "initial",
     ]
     assert recovered.adapter_process.argv[-2:] == ["--delivery-phase", "recovery"]
+    assert recovered.external_effect.redelivery_observed
+    assert recovered.external_effect.effect_count == 1
+    assert recovered.external_effect.commit_count == 1
+    assert recovered.external_effect.action_id == recovered.fault_injection.action_id
+    assert recovered.external_effect.commit_sha
+    assert recovered.external_effect.ack_observed
     assert recovered.duplicate_action_ids == []
     assert not recovered.lost_committed_work
 
     expected_errors = {
         "fake-crash-missing-crash": "dispatch handshake",
-        "fake-crash-missing-redelivery": "not exactly ordered",
+        "fake-crash-missing-redelivery": "redelivery checkpoint",
         "fake-crash-wrong-action": "action_id changed",
-        "fake-crash-duplicate": "not exactly ordered",
+        "fake-crash-whitespace-action": "dispatch handshake",
+        "fake-crash-event-claims-before-effect": "claimed effect/commit/ack before",
+        "fake-crash-missing-effect": "exactly one harness-owned effect",
+        "fake-crash-duplicate-effect": "exactly one harness-owned effect",
+        "fake-crash-wrong-effect-action": "effect action_id changed",
+        "fake-crash-ack-before-effect": "ack was published before",
         "fake-crash-lost-work": "lost committed work",
-        "fake-crash-unordered": "not exactly ordered",
     }
     for adapter_id, message in expected_errors.items():
         result = by_adapter[adapter_id]
         assert not result.success
         assert result.classification == "agent_failure"
         assert result.crash_chain_error and message in result.crash_chain_error
-    assert by_adapter["fake-crash-duplicate"].duplicate_action_ids == ["action-1"]
+    fabricated = by_adapter["fake-crash-fabricated-chain"]
+    assert fabricated.classification == "adapter_protocol_failure"
+    assert fabricated.external_effect.effect_count == 0
+    assert by_adapter["fake-crash-duplicate-effect"].external_effect.effect_count == 2
     assert by_adapter["fake-crash-lost-work"].lost_committed_work
+    whitespace = by_adapter["fake-crash-whitespace-action"]
+    assert whitespace.fault_injection.action_id is None
+    assert whitespace.fault_injection.error
+    assert len(whitespace.fault_injection.error) <= 1000
 
     assert recovered.model_calls == 4
     assert recovered.input_tokens + recovered.output_tokens == 150
@@ -221,19 +352,56 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
     assert "weighted_score" not in summary
 
 
-def test_infrastructure_claim_requires_allowlisted_corroboration(tmp_path: Path) -> None:
-    task = tasks_by_id()["clean-bugfix"]
-    launch = run_fake("fake-infrastructure-failure", task, "launch", tmp_path)
-    zero = run_fake("fake-service-infra-zero", task, "zero", tmp_path)
-    nonzero = run_fake("fake-service-infra-nonzero", task, "nonzero", tmp_path)
-    false_claim = run_fake("fake-false-infra", task, "false", tmp_path)
+def test_only_harness_owned_faults_are_infrastructure(tmp_path: Path) -> None:
+    clean = tasks_by_id()["clean-bugfix"]
+    crash_task = tasks_by_id()["crash-redelivery"]
+    launch = run_fake("fake-infrastructure-failure", clean, "launch", tmp_path)
+    initial = run_fake(
+        "fake-initial-infrastructure-failure", crash_task, "initial", tmp_path
+    )
+    zero = run_fake("fake-service-infra-zero", clean, "zero", tmp_path)
+    nonzero = run_fake("fake-service-infra-nonzero", clean, "nonzero", tmp_path)
+    false_claim = run_fake("fake-false-infra", clean, "false", tmp_path)
     assert launch.classification == "infrastructure_failure"
-    assert zero.classification == "infrastructure_failure"
-    assert nonzero.classification == "infrastructure_failure"
-    assert "service_unavailable" in (zero.infrastructure_error or "")
-    assert "service_unavailable" in (nonzero.infrastructure_error or "")
+    assert launch.infrastructure_code == "adapter_launch_failure"
+    assert initial.classification == "infrastructure_failure"
+    assert initial.infrastructure_code == "initial_phase_launch_failure"
+    assert zero.classification == "agent_failure"
+    assert nonzero.classification == "adapter_crash"
     assert false_claim.classification == "agent_failure"
+    assert zero.infrastructure_error is None
+    assert nonzero.infrastructure_error is None
     assert false_claim.infrastructure_error is None
+
+
+def test_verifier_launch_failure_is_host_observed_infrastructure(tmp_path: Path) -> None:
+    task = tasks_by_id()["clean-bugfix"]
+    broken = FrozenTask(
+        root=task.root,
+        manifest=task.manifest,
+        hidden=task.hidden.model_copy(update={"verifier_argv": ["/not/a/verifier"]}),
+    )
+    result = run_fake("fake-success", broken, "verifier-infra", tmp_path)
+    assert result.classification == "infrastructure_failure"
+    assert result.infrastructure_code == "verifier_failure"
+
+
+def test_noncompleted_status_and_reported_budget_overages_cannot_succeed(
+    tmp_path: Path,
+) -> None:
+    task = tasks_by_id()["clean-bugfix"]
+    failed = run_fake("fake-status-failed", task, "failed-status", tmp_path)
+    crashed = run_fake("fake-status-crashed", task, "crashed-status", tmp_path)
+    over_token = run_fake("fake-over-token", task, "over-token", tmp_path)
+    over_cost = run_fake("fake-over-cost", task, "over-cost", tmp_path)
+    assert failed.classification == "agent_failure"
+    assert failed.bundle_status == "failed"
+    assert crashed.classification == "agent_failure"
+    assert crashed.bundle_status == "crashed"
+    assert over_token.classification == "agent_failure"
+    assert over_token.budget_violations == ["tokens 250030 exceed cap 200000"]
+    assert over_cost.classification == "agent_failure"
+    assert over_cost.budget_violations == ["cost 30.0 exceeds cap 25.0"]
 
 
 def _write_events(path: Path, events: list[dict[str, object]]) -> None:

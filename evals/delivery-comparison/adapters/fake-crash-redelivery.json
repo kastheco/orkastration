@@ -17,7 +17,7 @@
   },
   "calibration_scenario": "crash-redelivery",
   "comparison_mode": "tuned-primary",
-  "config_digest": "21150c009145f35fb376b9a7746d3540d016ac9d8d821faf15a78b127b9791e5",
+  "config_digest": "c108a9220c7c3715d81f26567c15b4fa2986819b7003b5d22b6878773a37d617",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -26,7 +26,6 @@
   "description": "Calibration-only crash-redelivery fake",
   "environment": {},
   "id": "fake-crash-redelivery",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

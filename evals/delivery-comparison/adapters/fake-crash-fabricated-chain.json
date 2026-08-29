@@ -6,27 +6,26 @@
     "{python}",
     "{protocol_stub}",
     "--mode",
-    "crash-unordered",
+    "crash-fabricated-chain",
     "--adapter-id",
-    "fake-crash-unordered"
+    "fake-crash-fabricated-chain"
   ],
   "budget": {
     "max_cost_usd": 25.0,
     "max_total_tokens": 200000,
     "max_wall_seconds": 1800
   },
-  "calibration_scenario": "crash-unordered",
+  "calibration_scenario": "crash-fabricated-chain",
   "comparison_mode": "tuned-primary",
-  "config_digest": "a38d8ae6fecd21a7b3894d47bb5633b66b6b96c4f3d6679031893f1e8fcf470a",
+  "config_digest": "be9154892d138bcc8361411e40963ba49900b6431ec0313f892b3cd138d883e3",
   "containment": {
     "backend": "none",
-    "evidence": "Calibration protocol stub is not eligible for live use.",
+    "evidence": "No filesystem containment backend is proven.",
     "filesystem_isolation": false
   },
-  "description": "Calibration-only crash-unordered protocol stub",
+  "description": "Calibration-only crash-fabricated-chain protocol stub",
   "environment": {},
-  "id": "fake-crash-unordered",
-  "infrastructure_exit_codes": {},
+  "id": "fake-crash-fabricated-chain",
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

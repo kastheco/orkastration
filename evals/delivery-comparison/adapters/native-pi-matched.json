@@ -10,7 +10,7 @@
   },
   "calibration_scenario": null,
   "comparison_mode": "matched-role-ablation",
-  "config_digest": "d3ce2f3ebc925f170eebf173fe242115e034ceff3506553f39200da3fac746a6",
+  "config_digest": "bd821f8bf4f3e67bef734f1b1079f298ede70c583b625bc28ed5d8a686d51908",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
@@ -19,7 +19,6 @@
   "description": "Native Pi subagent delivery boundary (matched-role ablation)",
   "environment": {},
   "id": "native-pi-matched",
-  "infrastructure_exit_codes": {},
   "model_role_map": {
     "fixer": {
       "model": "owner-approved-model-pending",
