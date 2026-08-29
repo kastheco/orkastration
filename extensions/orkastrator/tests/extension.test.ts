@@ -123,15 +123,16 @@ function fixture(options: { canonicalizeRepository?: (path: string) => string } 
   };
 }
 
-test("kas command expands the Orkastrator supervisor skill with its objective", async () => {
+test("kas command starts the Pi-native lifecycle flow without legacy Orca", async () => {
   const value = fixture();
   try {
     const ctx = context(value.repository);
     await value.api.commands.get("kas")?.handler("Ship the lifecycle slice", ctx);
     assert.deepEqual(value.api.userMessages, [
       {
-        content: "/skill:orkas Ship the lifecycle slice",
-        options: { expandPromptTemplates: true },
+        content:
+          "Start a Pi-native Orkastrator v1 lifecycle run for this objective: Ship the lifecycle slice\n\nUse orkastrator_run_create directly. Do not use the legacy orkas CLI or Orca.",
+        options: undefined,
       },
     ]);
   } finally {

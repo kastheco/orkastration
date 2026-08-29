@@ -173,8 +173,9 @@ export function installOrkastrator(
         requireTrust(ctx);
         const objective = args.trim();
         pi.sendUserMessage(
-          objective.length === 0 ? "/skill:orkas" : `/skill:orkas ${objective}`,
-          { expandPromptTemplates: true },
+          objective.length === 0
+            ? "Start a Pi-native Orkastrator v1 lifecycle run. Ask me for the objective before calling orkastrator_run_create. Do not use the legacy orkas CLI or Orca."
+            : `Start a Pi-native Orkastrator v1 lifecycle run for this objective: ${objective}\n\nUse orkastrator_run_create directly. Do not use the legacy orkas CLI or Orca.`,
         );
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
