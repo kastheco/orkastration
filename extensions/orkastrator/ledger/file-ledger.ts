@@ -21,6 +21,14 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
+import { parsePolicyV1, type PolicyV1 } from "../policy.ts";
+import {
+  reducePolicy,
+  type PolicyAction,
+  type PolicyCheckpoint,
+  type PolicyEvent,
+  type PolicyReduction,
+} from "../reducer.ts";
 import {
   type AwaitOwnerInput,
   type CreateRunInput,
@@ -29,6 +37,7 @@ import {
   type OwnedProcessExitEvidence,
   type OwnedProcessIdentity,
   type OwnershipInput,
+  type PolicyActionDeliveryEvidence,
   RUN_STATES,
   type RunActor,
   type RunEvent,
@@ -44,6 +53,10 @@ const MAX_POLICY_BYTES = 1_048_576;
 const MAX_OBJECTIVE_CHARS = 8_000;
 const MAX_WORKER_EVENT_BYTES = 32 * 1024;
 const MAX_WORKER_EVENT_TEXT_CHARS = 4_000;
+// A 4 MiB applied-event evidence bound comfortably covers MAX_FINDINGS (1,000).
+const MAX_POLICY_EVENT_EVIDENCE_BYTES = 4 * 1024 * 1024;
+const MAX_POLICY_DELIVERY_EVIDENCE_BYTES = 1024 * 1024;
+const MAX_POLICY_DELIVERY_TEXT_CHARS = 512;
 const EXIT_SIGNAL_SET = new Set<string>(Object.keys(osConstants.signals));
 const STATELESS_EVENT_KEYS = [
   "schemaVersion",
@@ -56,6 +69,13 @@ const STATELESS_EVENT_KEYS = [
   "actor",
   "evidence",
   "projection",
+];
+const POLICY_DELIVERY_EVENT_KEYS = [
+  ...STATELESS_EVENT_KEYS,
+  "actionId",
+  "policyRevision",
+  "actionType",
+  "delivery",
 ];
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const RUN_STATE_SET = new Set<string>(RUN_STATES);
@@ -96,6 +116,17 @@ interface EventInput {
   evidence?: JsonObject;
   fromState?: RunState;
   toState?: RunState;
+  actionId?: string;
+  policyRevision?: number;
+  actionType?: PolicyAction["type"];
+  delivery?: "delivered";
+}
+
+export interface PolicyApplyResult {
+  record: RunRecord;
+  reduction: PolicyReduction;
+  delivery: "pending" | "delivered";
+  appended: boolean;
 }
 
 interface ParsedEvents {
@@ -123,6 +154,8 @@ export class RunLedger {
   }
 
   createRun(input: CreateRunInput): RunRecord {
+    // Validate before even acquiring the filesystem-backed writer lock.
+    parsePolicyV1(Buffer.from(input.policySnapshot, "utf8"));
     return this.#withWriterLock(() => this.#createRun(input));
   }
 
@@ -137,10 +170,12 @@ export class RunLedger {
     if (!isAbsolute(input.repositoryRoot)) {
       throw new LedgerError("repository root must be absolute");
     }
-    const policyBytes = Buffer.byteLength(input.policySnapshot, "utf8");
-    if (policyBytes === 0 || policyBytes > MAX_POLICY_BYTES) {
+    const policyBytes = Buffer.from(input.policySnapshot, "utf8");
+    if (policyBytes.byteLength === 0 || policyBytes.byteLength > MAX_POLICY_BYTES) {
       throw new LedgerError(`policy snapshot must contain 1-${MAX_POLICY_BYTES} bytes`);
     }
+    // The caller-supplied bytes are validated before allocating a run ID or touching a run directory.
+    parsePolicyV1(policyBytes);
     const active = this.activeRunsForSession(input.supervisorSessionId);
     if (active.length > 0) {
       throw new ActiveRunError(
@@ -174,6 +209,7 @@ export class RunLedger {
         updatedAt: timestamp,
         ownedProcesses: [],
         worktrees: [],
+        policyCheckpoint: null,
       };
       const event: RunEvent = {
         schemaVersion: 1,
@@ -215,14 +251,8 @@ export class RunLedger {
     if (last === undefined) throw new LedgerCorruptionError(`run ${runId} has no ledger events`);
     let record = last.projection;
     this.#assertRecord(record, runId);
-    const policyPath = join(directory, record.policyFile);
-    this.#assertRegularFile(policyPath, "policy snapshot");
-    const policyHash = createHash("sha256")
-      .update(readFileSync(policyPath))
-      .digest("hex");
-    if (policyHash !== record.policyHash) {
-      throw new LedgerCorruptionError(`run ${runId} policy snapshot hash does not match`);
-    }
+    const policy = this.#readVerifiedPolicy(directory, record);
+    this.#validatePolicyEventChain(policy, parsed.events);
 
     const statePath = join(directory, "state.json");
     let stateNeedsRepair = true;
@@ -278,6 +308,127 @@ export class RunLedger {
   policySnapshot(runId: string): string {
     this.loadRun(runId);
     return readFileSync(join(this.runDirectory(runId), "policy.yaml"), "utf8");
+  }
+
+  applyPolicyEvent(runId: string, event: PolicyEvent): PolicyApplyResult {
+    return this.#withWriterLock(() => {
+      const current = this.loadRun(runId).record;
+      if (!("policyCheckpoint" in current)) {
+        throw new LedgerError(`legacy run ${runId} cannot apply policy events`);
+      }
+      if (TERMINAL_RUN_STATES.has(current.state)) {
+        throw new LedgerError(`terminal run ${runId} cannot apply policy events`);
+      }
+      this.#assertBoundedPolicyEvent(event);
+
+      const events = this.#readEvents(this.runDirectory(runId)).events;
+      const revision = current.policyCheckpoint?.revision ?? 0;
+      if (event.sequence <= revision) {
+        if (event.sequence < revision) {
+          throw new LedgerError(`policy event sequence ${event.sequence} is stale at revision ${revision}`);
+        }
+        const applied = [...events].reverse().find((candidate) =>
+          candidate.type === "policy_event_applied"
+          && isObject(candidate.evidence.policyEvent)
+          && candidate.evidence.policyEvent.sequence === revision
+        );
+        if (applied === undefined || !isDeepStrictEqual(applied.evidence.policyEvent, event)) {
+          throw new LedgerError(`policy event sequence ${event.sequence} conflicts with the persisted event`);
+        }
+        const reduction = this.#persistedReduction(applied);
+        const delivery = current.pendingPolicyAction?.actionId === reduction.action.actionId
+          ? "pending" as const
+          : "delivered" as const;
+        return { record: current, reduction, delivery, appended: false };
+      }
+      if (current.pendingPolicyAction !== undefined) {
+        throw new LedgerError(
+          `policy action ${current.pendingPolicyAction.actionId} must be delivered before another event`,
+        );
+      }
+
+      const policy = this.#readVerifiedPolicy(this.runDirectory(runId), current);
+      let reduction: PolicyReduction;
+      try {
+        reduction = reducePolicy({ policy, checkpoint: current.policyCheckpoint ?? null, event });
+      } catch (error) {
+        throw new LedgerError(error instanceof Error ? error.message : String(error));
+      }
+      const evidence = {
+        policyEvent: cloneJson(event),
+        occurrenceId: reduction.occurrenceId,
+        action: cloneJson(reduction.action),
+        trace: cloneJson(reduction.trace),
+      } as JsonObject;
+      assertBoundedJson(evidence, MAX_POLICY_EVENT_EVIDENCE_BYTES, "policy event evidence");
+
+      // Append+fsync is the outbox commit point. Dispatch must happen only after this returns.
+      const record = this.#commit(
+        current,
+        {
+          ...current,
+          policyCheckpoint: structuredClone(reduction.checkpoint),
+          pendingPolicyAction: structuredClone(reduction.action),
+        },
+        {
+          type: "policy_event_applied",
+          ruleId: reduction.ruleId,
+          actor: "extension",
+          evidence,
+        },
+      );
+      return { record, reduction, delivery: "pending", appended: true };
+    });
+  }
+
+  recordPolicyActionDelivered(
+    runId: string,
+    actionId: string,
+    evidence: PolicyActionDeliveryEvidence,
+  ): RunRecord {
+    return this.#withWriterLock(() => {
+      assertPolicyDeliveryEvidence(actionId, evidence);
+      const current = this.loadRun(runId).record;
+      const events = this.#readEvents(this.runDirectory(runId)).events;
+      const priorDelivery = [...events].reverse().find((event) =>
+        event.type === "policy_action_delivered" && event.actionId === actionId
+      );
+      const pending = current.pendingPolicyAction;
+      if (pending === undefined) {
+        if (
+          priorDelivery !== undefined
+          && priorDelivery.policyRevision === current.policyCheckpoint?.revision
+        ) {
+          if (!isDeepStrictEqual(priorDelivery.evidence, evidence)) {
+            throw new LedgerError(`policy action ${actionId} delivery receipt conflicts`);
+          }
+          return current;
+        }
+        if (priorDelivery !== undefined) {
+          throw new LedgerError(`policy action ${actionId} delivery is stale`);
+        }
+        throw new LedgerError(`policy action ${actionId} is unknown or is not pending`);
+      }
+      if (pending.actionId !== actionId) {
+        if (priorDelivery !== undefined) throw new LedgerError(`policy action ${actionId} delivery is stale`);
+        throw new LedgerError(`policy action ${actionId} is not the pending action`);
+      }
+      if (current.policyCheckpoint === undefined || current.policyCheckpoint === null) {
+        throw new LedgerCorruptionError(`pending policy action ${actionId} has no checkpoint`);
+      }
+
+      const { pendingPolicyAction: _pending, ...withoutPending } = current;
+      return this.#commit(current, withoutPending, {
+        type: "policy_action_delivered",
+        ruleId: "policy.action_delivered",
+        actor: "extension",
+        evidence: cloneJson(evidence) as unknown as JsonObject,
+        actionId,
+        policyRevision: current.policyCheckpoint.revision,
+        actionType: pending.type,
+        delivery: "delivered",
+      });
+    });
   }
 
   scanNonterminal(): RunRecord[] {
@@ -678,6 +829,144 @@ export class RunLedger {
     return { event: JSON.parse(serialized) as JsonObject };
   }
 
+  #readVerifiedPolicy(directory: string, record: RunRecord): PolicyV1 {
+    const policyPath = join(directory, record.policyFile);
+    this.#assertRegularFile(policyPath, "policy snapshot");
+    const policyBytes = readFileSync(policyPath);
+    const policyHash = createHash("sha256").update(policyBytes).digest("hex");
+    if (policyHash !== record.policyHash) {
+      throw new LedgerCorruptionError(`run ${record.runId} policy snapshot hash does not match`);
+    }
+    try {
+      return parsePolicyV1(policyBytes);
+    } catch (error) {
+      throw new LedgerCorruptionError(
+        `run ${record.runId} frozen policy snapshot is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  #assertBoundedPolicyEvent(event: PolicyEvent): void {
+    assertBoundedJson(event, MAX_POLICY_EVENT_EVIDENCE_BYTES, "policy event");
+  }
+
+  #persistedReduction(event: RunEvent): PolicyReduction {
+    return {
+      checkpoint: structuredClone(event.projection.policyCheckpoint) as PolicyCheckpoint,
+      action: structuredClone(event.evidence.action) as PolicyAction,
+      ruleId: event.ruleId,
+      occurrenceId: String(event.evidence.occurrenceId),
+      trace: structuredClone(event.evidence.trace) as string[],
+    };
+  }
+
+  #validatePolicyEventChain(policy: PolicyV1, events: RunEvent[]): void {
+    for (const [index, event] of events.entries()) {
+      const preceding = events[index - 1]?.projection;
+      if (preceding === undefined) {
+        if (
+          event.type !== "run_created"
+          || event.projection.pendingPolicyAction !== undefined
+          || (("policyCheckpoint" in event.projection) && event.projection.policyCheckpoint !== null)
+        ) {
+          throw new LedgerCorruptionError("initial run event has an invalid policy projection");
+        }
+        continue;
+      }
+
+      if (event.type === "policy_event_applied") {
+        if (
+          !("policyCheckpoint" in preceding)
+          || preceding.policyCheckpoint === undefined
+          || preceding.pendingPolicyAction !== undefined
+          || TERMINAL_RUN_STATES.has(preceding.state)
+          || event.actor !== "extension"
+          || !hasExactKeys(event, STATELESS_EVENT_KEYS)
+          || !hasExactKeys(event.evidence, ["policyEvent", "occurrenceId", "action", "trace"])
+        ) {
+          throw new LedgerCorruptionError(`event ${index + 1} has an invalid policy apply envelope`);
+        }
+        assertBoundedJson(
+          event.evidence,
+          MAX_POLICY_EVENT_EVIDENCE_BYTES,
+          `event ${index + 1} policy evidence`,
+          LedgerCorruptionError,
+        );
+        let reduction: PolicyReduction;
+        try {
+          reduction = reducePolicy({
+            policy,
+            checkpoint: preceding.policyCheckpoint,
+            event: event.evidence.policyEvent as PolicyEvent,
+          });
+        } catch (error) {
+          throw new LedgerCorruptionError(
+            `event ${index + 1} policy reduction is invalid: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (
+          event.ruleId !== reduction.ruleId
+          || !isDeepStrictEqual(event.evidence.occurrenceId, reduction.occurrenceId)
+          || !isDeepStrictEqual(event.evidence.action, reduction.action)
+          || !isDeepStrictEqual(event.evidence.trace, reduction.trace)
+        ) {
+          throw new LedgerCorruptionError(`event ${index + 1} persisted policy reduction differs from replay`);
+        }
+        const expected: RunRecord = {
+          ...preceding,
+          sequence: event.sequence,
+          updatedAt: event.timestamp,
+          policyCheckpoint: reduction.checkpoint,
+          pendingPolicyAction: reduction.action,
+        };
+        if (!isDeepStrictEqual(event.projection, expected)) {
+          throw new LedgerCorruptionError(`event ${index + 1} policy projection differs from replay`);
+        }
+        continue;
+      }
+
+      if (event.type === "policy_action_delivered") {
+        const pending = preceding.pendingPolicyAction;
+        if (
+          pending === undefined
+          || preceding.policyCheckpoint === undefined
+          || preceding.policyCheckpoint === null
+          || event.actor !== "extension"
+          || event.ruleId !== "policy.action_delivered"
+          || !hasExactKeys(event, POLICY_DELIVERY_EVENT_KEYS)
+          || event.actionId !== pending.actionId
+          || event.policyRevision !== preceding.policyCheckpoint.revision
+          || event.actionType !== pending.type
+          || event.delivery !== "delivered"
+        ) {
+          throw new LedgerCorruptionError(`event ${index + 1} has invalid policy delivery metadata`);
+        }
+        try {
+          assertPolicyDeliveryEvidence(pending.actionId, event.evidence);
+        } catch (error) {
+          throw new LedgerCorruptionError(
+            `event ${index + 1} has invalid policy delivery evidence: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        const { pendingPolicyAction: _pending, ...withoutPending } = preceding;
+        const expected: RunRecord = {
+          ...withoutPending,
+          sequence: event.sequence,
+          updatedAt: event.timestamp,
+        };
+        if (!isDeepStrictEqual(event.projection, expected)) {
+          throw new LedgerCorruptionError(`event ${index + 1} policy delivery changed unrelated state`);
+        }
+        continue;
+      }
+
+      if (!sameOptionalField(preceding, event.projection, "policyCheckpoint")
+        || !sameOptionalField(preceding, event.projection, "pendingPolicyAction")) {
+        throw new LedgerCorruptionError(`event ${index + 1} changed policy state outside a policy event`);
+      }
+    }
+  }
+
   runDirectory(runId: string): string {
     if (!RUN_ID_PATTERN.test(runId)) {
       throw new LedgerError(`invalid run ID: ${runId}`);
@@ -720,6 +1009,10 @@ export class RunLedger {
       projection: record,
       ...(input.fromState === undefined ? {} : { fromState: input.fromState }),
       ...(input.toState === undefined ? {} : { toState: input.toState }),
+      ...(input.actionId === undefined ? {} : { actionId: input.actionId }),
+      ...(input.policyRevision === undefined ? {} : { policyRevision: input.policyRevision }),
+      ...(input.actionType === undefined ? {} : { actionType: input.actionType }),
+      ...(input.delivery === undefined ? {} : { delivery: input.delivery }),
     };
     return { record, event };
   }
@@ -1071,6 +1364,10 @@ export class RunLedger {
           value.repositoryRoot,
         )) ||
       (value.ownerWait !== undefined && !isOwnerWait(value.ownerWait)) ||
+      (value.policyCheckpoint !== undefined
+        && value.policyCheckpoint !== null
+        && !isObject(value.policyCheckpoint)) ||
+      (value.pendingPolicyAction !== undefined && !isObject(value.pendingPolicyAction)) ||
       (value.state === "awaiting_owner" &&
         (value.ownerWait === undefined ||
           (isObject(value.ownerWait) && value.ownerWait.response !== undefined)))
@@ -1248,7 +1545,7 @@ function assertWorkerEvent(value: unknown): asserts value is WorkerEvent {
   }
 }
 
-function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+function hasExactKeys(value: object, expected: string[]): boolean {
   const keys = Object.keys(value).sort();
   const expectedKeys = [...expected].sort();
   return keys.length === expectedKeys.length &&
@@ -1272,4 +1569,92 @@ function isExitSignal(value: unknown): value is NodeJS.Signals | null {
 function isIsoTimestamp(value: string): boolean {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function sameOptionalField(
+  left: RunRecord,
+  right: RunRecord,
+  key: "policyCheckpoint" | "pendingPolicyAction",
+): boolean {
+  return Object.hasOwn(left, key) === Object.hasOwn(right, key)
+    && isDeepStrictEqual(left[key], right[key]);
+}
+
+function assertPolicyDeliveryEvidence(
+  actionId: string,
+  value: unknown,
+): asserts value is PolicyActionDeliveryEvidence {
+  if (
+    !isObject(value)
+    || !hasExactKeys(value, ["adapter", "idempotencyKey", "receipt"])
+    || typeof value.adapter !== "string"
+    || value.adapter.trim().length === 0
+    || value.adapter.length > MAX_POLICY_DELIVERY_TEXT_CHARS
+    || typeof value.idempotencyKey !== "string"
+    || value.idempotencyKey !== actionId
+    || value.idempotencyKey.length === 0
+    || value.idempotencyKey.length > MAX_POLICY_DELIVERY_TEXT_CHARS
+  ) {
+    throw new LedgerError("policy delivery evidence or idempotency key is invalid");
+  }
+  assertBoundedJson(value, MAX_POLICY_DELIVERY_EVIDENCE_BYTES, "policy delivery evidence");
+}
+
+function assertBoundedJson(
+  value: unknown,
+  maximumBytes: number,
+  label: string,
+  ErrorType: new (message: string) => Error = LedgerError,
+): void {
+  assertJsonSafe(value, label, new Set(), 0, ErrorType);
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new ErrorType(`${label} is not JSON-safe`);
+  }
+  if (Buffer.byteLength(serialized, "utf8") > maximumBytes) {
+    throw new ErrorType(`${label} exceeds ${maximumBytes} bytes`);
+  }
+}
+
+function assertJsonSafe(
+  value: unknown,
+  label: string,
+  ancestors: Set<object>,
+  depth: number,
+  ErrorType: new (message: string) => Error,
+): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return;
+    throw new ErrorType(`${label} contains a non-finite number`);
+  }
+  if (typeof value !== "object" || depth > 100) {
+    throw new ErrorType(`${label} is not a bounded JSON value`);
+  }
+  if (ancestors.has(value)) throw new ErrorType(`${label} contains a cycle`);
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      for (const item of value) assertJsonSafe(item, label, ancestors, depth + 1, ErrorType);
+      return;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new ErrorType(`${label} contains a non-JSON object`);
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (key.length > MAX_POLICY_DELIVERY_TEXT_CHARS) {
+        throw new ErrorType(`${label} contains an oversized key`);
+      }
+      assertJsonSafe(child, label, ancestors, depth + 1, ErrorType);
+    }
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }

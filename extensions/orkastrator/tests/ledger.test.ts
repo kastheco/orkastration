@@ -21,6 +21,7 @@ import {
   LedgerError,
   RunLedger,
 } from "../ledger/file-ledger.ts";
+import { POLICY_SNAPSHOT } from "./policy-fixture.ts";
 
 function ids(): () => string {
   let value = 0;
@@ -56,7 +57,7 @@ function create(ledger: RunLedger, repository: string, session = "session-1") {
     objective: "Prove the lifecycle ledger.",
     supervisorSessionId: session,
     repositoryRoot: repository,
-    policySnapshot: "version: 1\nmode: lifecycle-test\n",
+    policySnapshot: POLICY_SNAPSHOT,
     hostPid: 4242,
   });
 }
@@ -83,7 +84,7 @@ test("run creation snapshots policy and commits the event before its state proje
 
     assert.equal(record.state, "submitted");
     assert.equal(record.sequence, 1);
-    assert.equal(value.ledger.policySnapshot(record.runId), "version: 1\nmode: lifecycle-test\n");
+    assert.equal(value.ledger.policySnapshot(record.runId), POLICY_SNAPSHOT);
     assert.deepEqual(JSON.parse(readFileSync(join(directory, "state.json"), "utf8")), record);
     const events = value.ledger.events(record.runId);
     assert.equal(events.length, 1);
@@ -480,7 +481,7 @@ test("concurrent processes cannot create two active runs for one supervisor sess
         objective: "contention",
         supervisorSessionId: "shared-session",
         repositoryRoot: repository,
-        policySnapshot: "version: 1\\n",
+        policySnapshot: ${JSON.stringify(POLICY_SNAPSHOT)},
         hostPid: process.pid,
       });
       console.log(JSON.stringify({ ok: true, runId: run.runId }));

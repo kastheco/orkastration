@@ -30,7 +30,7 @@ type WorkCursor =
   | { phase: "re_review"; findings: Finding[]; groups: GroupScope[] }
   | { phase: "validation"; reviewAccepted: boolean };
 type TerminalOutcome = "ready_for_manual_integration" | "stopped";
-type PolicyAction =
+export type PolicyAction =
   | { actionId: string; type: "run_worker"; attempt: number; role: RoleSettings }
   | { actionId: string; type: "run_initial_review"; role: RoleSettings }
   | { actionId: string; type: "run_fixers"; role: RoleSettings; groups: Array<{ groupId: string; findings: Array<{ id: string; round: number }> }> }

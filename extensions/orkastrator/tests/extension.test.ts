@@ -9,6 +9,7 @@ import { installOrkastrator, ENTRY_TYPE, STATUS_KEY } from "../index.ts";
 import { RunLedger } from "../ledger/file-ledger.ts";
 import { LifecycleCoordinator } from "../lifecycle.ts";
 import type { PiAttemptResult, PiAttemptSpec } from "../rpc/pi-attempt.ts";
+import { POLICY_SNAPSHOT } from "./policy-fixture.ts";
 
 interface FakeContext {
   cwd: string;
@@ -166,7 +167,7 @@ test("trusted run tool creates one durable run and rejects a second active run",
     assert.ok(tool);
     const result = await tool.execute(
       "tool-1",
-      { objective: "Build the ledger", policySnapshot: "version: 1\n" },
+      { objective: "Build the ledger", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -183,7 +184,7 @@ test("trusted run tool creates one durable run and rejects a second active run",
     await assert.rejects(
       tool.execute(
         "tool-2",
-        { objective: "Start twice", policySnapshot: "version: 1\n" },
+        { objective: "Start twice", policySnapshot: POLICY_SNAPSHOT },
         undefined,
         undefined,
         ctx,
@@ -235,7 +236,7 @@ test("worker events are ledgered before Pi history and clear ownership with reap
     assert.ok(tool);
     await tool.execute(
       "tool-1",
-      { objective: "Persist worker events", policySnapshot: "version: 1\n" },
+      { objective: "Persist worker events", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -312,7 +313,7 @@ test("a ledger worker-event append failure cannot produce a successful tool resu
     await assert.rejects(
       tool.execute(
         "tool-1",
-        { objective: "Fail closed", policySnapshot: "version: 1\n" },
+        { objective: "Fail closed", policySnapshot: POLICY_SNAPSHOT },
         undefined,
         undefined,
         ctx,
@@ -342,7 +343,7 @@ test("untrusted sessions cannot create or inspect project-local run state", asyn
     await assert.rejects(
       tool.execute(
         "tool-1",
-        { objective: "Denied", policySnapshot: "version: 1\n" },
+        { objective: "Denied", policySnapshot: POLICY_SNAPSHOT },
         undefined,
         undefined,
         ctx,
@@ -381,7 +382,7 @@ test("the default Pi path is repository-local and a pre-aborted tool signal reac
     assert.ok(tool);
     await tool.execute(
       "tool-1",
-      { objective: "Respect cancellation", policySnapshot: "version: 1\n" },
+      { objective: "Respect cancellation", policySnapshot: POLICY_SNAPSHOT },
       controller.signal,
       undefined,
       ctx,
@@ -430,7 +431,7 @@ test("shutdown awaits worker reap and ownership clear before the terminal transi
     assert.ok(tool);
     const execution = tool.execute(
       "tool-1",
-      { objective: "Wait for shutdown", policySnapshot: "version: 1\n" },
+      { objective: "Wait for shutdown", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -484,7 +485,7 @@ test("shutdown durably interrupts after post-cleanup telemetry failure", async (
     assert.ok(tool);
     const execution = tool.execute(
       "tool-1",
-      { objective: "Interrupt after telemetry failure", policySnapshot: "version: 1\n" },
+      { objective: "Interrupt after telemetry failure", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -524,7 +525,7 @@ test("reload rebinds the same session while quit interrupts and preserves the ru
     assert.ok(tool);
     await tool.execute(
       "tool-1",
-      { objective: "Reload safely", policySnapshot: "version: 1\n" },
+      { objective: "Reload safely", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -546,7 +547,7 @@ test("reload rebinds the same session while quit interrupts and preserves the ru
 
     await value.api.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     assert.equal(value.ledger.loadRun(runId).record.state, "interrupted");
-    assert.equal(value.ledger.policySnapshot(runId), "version: 1\n");
+    assert.equal(value.ledger.policySnapshot(runId), POLICY_SNAPSHOT);
     assert.deepEqual(ctx.statuses.at(-1), [STATUS_KEY, undefined]);
   } finally {
     value.cleanup();
@@ -570,7 +571,7 @@ test("shutdown records interruption when repository canonicalization becomes una
     assert.ok(createTool);
     await createTool.execute(
       "tool-create",
-      { objective: "Survive missing cwd", policySnapshot: "version: 1\n" },
+      { objective: "Survive missing cwd", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -602,7 +603,7 @@ test("reload fails closed when repository canonicalization becomes unavailable",
     assert.ok(createTool);
     await createTool.execute(
       "tool-create",
-      { objective: "Fail reload closed", policySnapshot: "version: 1\n" },
+      { objective: "Fail reload closed", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,
@@ -625,7 +626,7 @@ test("same-session startup reports a stale run without claiming or mutating it",
       objective: "Wait for owner",
       supervisorSessionId: "current-session",
       repositoryRoot: value.repository,
-      policySnapshot: "version: 1\n",
+      policySnapshot: POLICY_SNAPSHOT,
       hostPid: 4242,
     });
     value.ledger.beginAwaitingOwner(old.runId, {
@@ -671,7 +672,7 @@ test("owner answers resume an awaiting run claimed by this extension instance", 
     assert.ok(answerTool);
     await createTool.execute(
       "tool-create",
-      { objective: "Wait for owner", policySnapshot: "version: 1\n" },
+      { objective: "Wait for owner", policySnapshot: POLICY_SNAPSHOT },
       undefined,
       undefined,
       ctx,

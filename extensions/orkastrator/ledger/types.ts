@@ -1,3 +1,5 @@
+import type { PolicyAction, PolicyCheckpoint } from "../reducer.ts";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -99,6 +101,10 @@ export interface RunRecord {
   worktrees: WorktreeIdentity[];
   reload?: ReloadMarker;
   ownerWait?: OwnerWait;
+  /** Null is the explicit start marker; absence identifies a legacy run. */
+  policyCheckpoint?: PolicyCheckpoint | null;
+  /** Append-first outbox slot. Dispatchers must acknowledge it before another reduction. */
+  pendingPolicyAction?: PolicyAction;
 }
 
 export type RunActor = "owner" | "extension" | "supervisor" | "worker" | "system";
@@ -116,6 +122,16 @@ export interface RunEvent {
   actor: RunActor;
   evidence: JsonObject;
   projection: RunRecord;
+  actionId?: string;
+  policyRevision?: number;
+  actionType?: PolicyAction["type"];
+  delivery?: "delivered";
+}
+
+export interface PolicyActionDeliveryEvidence {
+  adapter: string;
+  idempotencyKey: string;
+  receipt: JsonValue;
 }
 
 export interface CreateRunInput {

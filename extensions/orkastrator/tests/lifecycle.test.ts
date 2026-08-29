@@ -11,6 +11,7 @@ import {
   type RebindIdentityVerifier,
   type SessionShutdownReason,
 } from "../lifecycle.ts";
+import { POLICY_SNAPSHOT } from "./policy-fixture.ts";
 
 function ids(): () => string {
   let value = 100;
@@ -54,7 +55,7 @@ function create(
     objective: "Test lifecycle ownership.",
     supervisorSessionId: sessionId,
     repositoryRoot: repository,
-    policySnapshot: "version: 1\n",
+    policySnapshot: POLICY_SNAPSHOT,
     hostPid,
   });
 }

@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 import { RunLedger } from "../ledger/file-ledger.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.ts";
+import { POLICY_SNAPSHOT } from "./policy-fixture.ts";
 
 interface RecordValue {
   type: string;
@@ -156,7 +157,7 @@ for (const signal of ["SIGTERM", "SIGHUP"] as const) {
         objective: `Prove ${signal} shutdown.`,
         supervisorSessionId: sessionId,
         repositoryRoot: repository,
-        policySnapshot: "version: 1\n",
+        policySnapshot: POLICY_SNAPSHOT,
         hostPid: probe.child.pid,
       });
       ledger.prepareReload(run.runId, sessionId, repository, probe.child.pid);
