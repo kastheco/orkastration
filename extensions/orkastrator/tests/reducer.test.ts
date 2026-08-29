@@ -385,3 +385,245 @@ test("sequence, legality, monotonic totals, non-finite totals, and terminal inpu
     event: valid,
   }), /terminal checkpoint rejects all events/u);
 });
+
+test("decisions newly reaching each hard limit replace supervisor and owner waits with one stop-only limit action", () => {
+  const waits = [
+    reduce({ phase: "worker", attempt: 1 }, { type: "worker_blocked" }),
+    reduce({ phase: "worker", attempt: 1 }, { type: "incident", incident: "policy_override" }),
+  ];
+  const limits: Array<[PolicyEvent["observation"], string]> = [
+    [observation({ elapsedMs: policy.limits.wall_clock_minutes * 60_000 }), "limit.wall_clock"],
+    [observation({ totalTokens: policy.limits.total_tokens }), "limit.tokens"],
+    [observation({ totalCostMicros: Math.round(policy.limits.total_cost_usd * 1_000_000) }), "limit.cost"],
+  ];
+
+  for (const waiting of waits) {
+    assert.equal(waiting.checkpoint.cursor.phase, "waiting");
+    const sourceTarget = waiting.checkpoint.cursor.target;
+    for (const [totals, ruleId] of limits) {
+      const result = reducePolicy({
+        policy,
+        checkpoint: waiting.checkpoint,
+        event: {
+          type: "decision",
+          sequence: waiting.checkpoint.revision + 1,
+          observation: totals,
+          target: sourceTarget,
+          decision: "resume",
+        },
+      });
+      assert.equal(result.ruleId, ruleId);
+      assert.equal(result.action.type, "wait");
+      if (result.action.type !== "wait" || result.checkpoint.cursor.phase !== "waiting") continue;
+      assert.equal(result.action.incident, "policy_limit_reached");
+      assert.deepEqual(result.action.allowedDecisions, ["stop"]);
+      assert.deepEqual(result.checkpoint.cursor.allowedDecisions, ["stop"]);
+      assert.deepEqual(result.checkpoint.cursor.resumeCursor, { phase: "worker", attempt: 1 });
+      assert.equal("resumeAction" in result.checkpoint.cursor, false);
+    }
+  }
+});
+
+test("waiting checkpoints derive target and exact decisions from policy and contain only a validated resume cursor", () => {
+  const waiting = reduce({ phase: "worker", attempt: 1 }, { type: "worker_blocked" });
+  assert.equal(waiting.checkpoint.cursor.phase, "waiting");
+  const variants: Array<[string, (value: Record<string, unknown>) => void]> = [
+    ["target", (cursor) => { cursor.target = "owner"; }],
+    ["decisions", (cursor) => { cursor.allowedDecisions = ["stop", "resume"]; }],
+    ["duplicate decisions", (cursor) => { cursor.allowedDecisions = ["resume", "stop", "stop"]; }],
+    ["legacy resume action", (cursor) => { cursor.resumeAction = { type: "run_validation" }; }],
+    ["resume work", (cursor) => { cursor.resumeCursor = { phase: "worker", attempt: policy.limits.max_worker_attempts + 1 }; }],
+  ];
+  for (const [name, mutate] of variants) {
+    const forged = structuredClone(waiting.checkpoint) as unknown as { cursor: Record<string, unknown> };
+    mutate(forged.cursor);
+    assert.throws(() => reducePolicy({
+      policy,
+      checkpoint: forged as unknown as PolicyCheckpoint,
+      event: {
+        type: "decision",
+        sequence: 2,
+        observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }),
+        target: "supervisor",
+        decision: "stop",
+      },
+    }), (error: unknown) => error instanceof Error, name);
+  }
+});
+
+test("attempt-bound waits are stop-only and cannot resume into run_worker", () => {
+  const bounded = reduce({ phase: "worker", attempt: policy.limits.max_worker_attempts }, { type: "worker_retryable_failure" });
+  assert.equal(bounded.checkpoint.cursor.phase, "waiting");
+  if (bounded.checkpoint.cursor.phase !== "waiting") return;
+  assert.deepEqual(bounded.checkpoint.cursor.allowedDecisions, ["stop"]);
+  assert.equal("resumeAction" in bounded.checkpoint.cursor, false);
+  const boundedTarget = bounded.checkpoint.cursor.target;
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: bounded.checkpoint,
+    event: {
+      type: "decision",
+      sequence: 2,
+      observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }),
+      target: boundedTarget,
+      decision: "resume",
+    },
+  }), /not allowed/u);
+});
+
+test("event, observation, completion, group, verdict, and finding inputs reject unknown nested keys", () => {
+  const top = { type: "worker_completed", sequence: 1, observation: observation(), extra: true } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: checkpoint(), event: top }), /unknown or missing keys/u);
+
+  const nestedObservation = {
+    type: "worker_completed",
+    sequence: 1,
+    observation: { ...observation(), extra: true },
+  } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: checkpoint(), event: nestedObservation }), /observation has unknown/u);
+
+  const findingAlias = { evidence: { injected: true } };
+  const findingEvent = {
+    type: "initial_review_completed",
+    sequence: 1,
+    observation: observation(),
+    findings: [{ id: "F-1", category: "correctness", groupId: "g", alias: findingAlias }],
+  } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: checkpoint({ phase: "initial_review" }), event: findingEvent }), /finding has unknown/u);
+
+  const validationEvent = {
+    type: "validation_completed",
+    sequence: 1,
+    observation: observation(),
+    passed: true,
+    commitPresent: true,
+    cleanWorktree: true,
+    reviewAccepted: true,
+    completion: { override: true },
+  } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: checkpoint({ phase: "validation", reviewAccepted: true }), event: validationEvent }), /unknown or missing keys/u);
+
+  const fixer = initialReview([{ id: "F-1", category: "correctness", groupId: "g" }]);
+  const fixGroup = {
+    type: "fix_batch_completed",
+    sequence: 2,
+    observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }),
+    groups: [{ groupId: "g", findingIds: ["F-1"], scopePreserved: true, command: "inject" }],
+  } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: fixer.checkpoint, event: fixGroup }), /fix group has unknown/u);
+
+  const review = completeFix(fixer);
+  const verdict = {
+    type: "re_review_completed",
+    sequence: 3,
+    observation: observation({ elapsedMs: 3, totalTokens: 3, totalCostMicros: 3 }),
+    groups: [{ groupId: "g", findings: [{ id: "F-1", accepted: true, rationale: { injected: true } }] }],
+  } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: review.checkpoint, event: verdict }), /review verdict has unknown/u);
+});
+
+test("checkpoint, cursor, work finding, scope, and wait structures reject unknown keys without retaining aliases", () => {
+  const cases: PolicyCheckpoint[] = [
+    { ...checkpoint(), extra: true } as unknown as PolicyCheckpoint,
+    checkpoint({ phase: "worker", attempt: 1, extra: true } as unknown as PolicyCheckpoint["cursor"]),
+    checkpoint({ phase: "validation", reviewAccepted: true, proof: {} } as unknown as PolicyCheckpoint["cursor"]),
+  ];
+  for (const malformed of cases) {
+    assert.throws(() => reducePolicy({
+      policy,
+      checkpoint: malformed,
+      event: { type: "worker_completed", sequence: 1, observation: observation() },
+    }), /unknown or missing keys/u);
+  }
+
+  const fixer = initialReview([{ id: "F-1", category: "correctness", groupId: "g" }]);
+  assert.equal(fixer.checkpoint.cursor.phase, "fix_batch");
+  if (fixer.checkpoint.cursor.phase !== "fix_batch") return;
+  const findingExtra = structuredClone(fixer.checkpoint) as unknown as { cursor: { findings: Array<Record<string, unknown>> } };
+  findingExtra.cursor.findings[0]!.nested = { injected: true };
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: findingExtra as unknown as PolicyCheckpoint,
+    event: { type: "fix_batch_completed", sequence: 2, observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }), groups: [] },
+  }), /checkpoint finding has unknown/u);
+
+  const scopeExtra = structuredClone(fixer.checkpoint) as unknown as { cursor: { groups: Array<Record<string, unknown>> } };
+  scopeExtra.cursor.groups[0]!.nested = { injected: true };
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: scopeExtra as unknown as PolicyCheckpoint,
+    event: { type: "fix_batch_completed", sequence: 2, observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }), groups: [] },
+  }), /group scope has unknown/u);
+
+  const waiting = reduce({ phase: "worker", attempt: 1 }, { type: "worker_blocked" });
+  const waitExtra = structuredClone(waiting.checkpoint) as unknown as { cursor: Record<string, unknown> };
+  waitExtra.cursor.nested = { injected: true };
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: waitExtra as unknown as PolicyCheckpoint,
+    event: { type: "decision", sequence: 2, observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }), target: "supervisor", decision: "stop" },
+  }), /waiting cursor has unknown/u);
+
+  const sourceIds = fixer.checkpoint.cursor.groups[0]!.findingIds;
+  const fixed = completeFix(fixer);
+  assert.equal(fixed.checkpoint.cursor.phase, "re_review");
+  if (fixed.checkpoint.cursor.phase === "re_review") {
+    assert.notEqual(fixed.checkpoint.cursor.groups[0]!.findingIds, sourceIds);
+  }
+});
+
+test("phase scope invariants reject wrong ownership, cross-group duplicates, state mismatch, and omitted active findings", () => {
+  const base = initialReview([
+    { id: "F-1", category: "correctness", groupId: "a" },
+    { id: "F-2", category: "correctness", groupId: "b" },
+  ]).checkpoint;
+  assert.equal(base.cursor.phase, "fix_batch");
+  if (base.cursor.phase !== "fix_batch") return;
+
+  const mutations: Array<[string, (value: Extract<PolicyCheckpoint["cursor"], { phase: "fix_batch" }>) => void]> = [
+    ["wrong group", (cursor) => { cursor.groups[0]!.findingIds = ["F-2"]; }],
+    ["cross group duplicate", (cursor) => { cursor.groups[1]!.findingIds = ["F-1"]; }],
+    ["accepted in active scope", (cursor) => { cursor.findings[0]!.state = "accepted"; }],
+    ["queued in active scope", (cursor) => { cursor.findings[0]!.state = "queued"; }],
+    ["omitted active", (cursor) => { cursor.groups[0]!.findingIds = []; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    const forged = structuredClone(base);
+    assert.equal(forged.cursor.phase, "fix_batch");
+    if (forged.cursor.phase !== "fix_batch") continue;
+    mutate(forged.cursor);
+    assert.throws(() => reducePolicy({
+      policy,
+      checkpoint: forged,
+      event: { type: "fix_batch_completed", sequence: 2, observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }), groups: [] },
+    }), (error: unknown) => error instanceof Error, name);
+  }
+});
+
+test("fix and re-review outer group arrays are bounded before nested traversal", () => {
+  const fixer = initialReview([{ id: "F-1", category: "correctness", groupId: "g" }]);
+  const oversizedFixGroups = Array.from({ length: 1_001 }, () => null) as unknown as Extract<PolicyEvent, { type: "fix_batch_completed" }>["groups"];
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: fixer.checkpoint,
+    event: {
+      type: "fix_batch_completed",
+      sequence: 2,
+      observation: observation({ elapsedMs: 2, totalTokens: 2, totalCostMicros: 2 }),
+      groups: oversizedFixGroups,
+    },
+  }), /exceed assigned group count/u);
+
+  const review = completeFix(fixer);
+  const oversizedReviewGroups = Array.from({ length: 1_001 }, () => null) as unknown as Extract<PolicyEvent, { type: "re_review_completed" }>["groups"];
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: review.checkpoint,
+    event: {
+      type: "re_review_completed",
+      sequence: 3,
+      observation: observation({ elapsedMs: 3, totalTokens: 3, totalCostMicros: 3 }),
+      groups: oversizedReviewGroups,
+    },
+  }), /exceed assigned group count/u);
+});

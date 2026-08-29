@@ -46,7 +46,6 @@ type Cursor =
     target: "supervisor" | "owner";
     allowedDecisions: Array<"resume" | "stop">;
     resumeCursor: WorkCursor;
-    resumeAction: PolicyAction;
   }
   | { phase: "terminal"; outcome: TerminalOutcome; incident?: Incident };
 
@@ -123,18 +122,19 @@ export function reducePolicy({
   event: PolicyEvent;
 }): PolicyReduction {
   validatePolicy(policy);
-  validateCheckpoint(checkpoint);
+  validateCheckpoint(policy, checkpoint);
   validateEventEnvelope(checkpoint, event);
-  validateEventPayload(event);
+  validateEventPayload(checkpoint, event);
 
   const base = observationCheckpoint(checkpoint, event.observation);
   const hardLimit = reachedLimit(policy, event.observation);
-  if (hardLimit !== undefined && !(checkpoint.cursor.phase === "waiting" && checkpoint.cursor.incident === "policy_limit_reached")) {
-    return incidentReduction(policy, base, "policy_limit_reached", `limit.${hardLimit}`, [
-      "event.legal",
-      "observation.valid",
-      `limit.${hardLimit}.reached`,
-    ], true);
+  const previousHardLimit = reachedLimit(policy, checkpoint);
+  if (hardLimit !== undefined && previousHardLimit === undefined) {
+    const trace = ["event.legal", "observation.valid", `limit.${hardLimit}.reached`];
+    if (checkpoint.cursor.phase === "waiting") {
+      return waitingLimitReduction(policy, base, checkpoint.cursor.resumeCursor, `limit.${hardLimit}`, trace);
+    }
+    return incidentReduction(policy, base, "policy_limit_reached", `limit.${hardLimit}`, trace, true);
   }
 
   switch (event.type) {
@@ -162,7 +162,7 @@ export function reducePolicy({
         event.incident === "policy_limit_reached",
       );
     case "decision":
-      return reduceDecision(base, event);
+      return reduceDecision(policy, base, event);
   }
 }
 
@@ -174,7 +174,7 @@ function reduceWorkerRetry(policy: PolicyV1, checkpoint: PolicyCheckpoint): Poli
       "event.legal",
       "observation.valid",
       "worker.attempt_bound",
-    ], false);
+    ], true);
   }
   const attempt = cursor.attempt + 1;
   const nextCursor: WorkCursor = { phase: "worker", attempt };
@@ -190,7 +190,13 @@ function reduceInitialReview(policy: PolicyV1, checkpoint: PolicyCheckpoint, inp
   const blocking = new Set<FindingCategory>(policy.review.blocking as readonly FindingCategory[]);
   const findings: Finding[] = inputs
     .filter((finding) => blocking.has(finding.category))
-    .map((finding) => ({ ...finding, rounds: 0, state: "queued" as const }))
+    .map((finding) => ({
+      id: finding.id,
+      category: finding.category,
+      groupId: finding.groupId,
+      rounds: 0,
+      state: "queued" as const,
+    }))
     .sort(compareFinding);
   if (findings.length === 0) {
     return validationAction(policy, checkpoint, "review.initial.accepted", ["event.legal", "observation.valid", "review.no_blocking_findings"]);
@@ -300,13 +306,12 @@ function reduceValidation(
 }
 
 function reduceDecision(
+  policy: PolicyV1,
   checkpoint: PolicyCheckpoint,
   event: Extract<PolicyEvent, { type: "decision" }>,
 ): PolicyReduction {
   const cursor = checkpoint.cursor;
   if (cursor.phase !== "waiting") throw new Error("internal waiting cursor mismatch");
-  if (event.target !== cursor.target) throw new Error(`decision target ${event.target} does not match recorded target ${cursor.target}`);
-  if (!cursor.allowedDecisions.includes(event.decision)) throw new Error(`decision ${event.decision} is not allowed`);
   if (event.decision === "stop") {
     const terminal: Cursor = { phase: "terminal", outcome: "stopped", incident: cursor.incident };
     return reduction(checkpoint, terminal, "decision.stop", ["event.legal", "observation.valid", "decision.target_verified", "decision.stop"], (actionId) => ({
@@ -316,8 +321,11 @@ function reduceDecision(
       incident: cursor.incident,
     }));
   }
+  if (cursor.resumeCursor.phase === "worker" && cursor.resumeCursor.attempt >= policy.limits.max_worker_attempts) {
+    throw new Error("worker attempt bound cannot resume");
+  }
   const resumeCursor = cloneWorkCursor(cursor.resumeCursor);
-  return reduction(checkpoint, resumeCursor, "decision.resume", ["event.legal", "observation.valid", "decision.target_verified", "decision.resume_exact_work"], (actionId) => withActionId(cursor.resumeAction, actionId));
+  return reduction(checkpoint, resumeCursor, "decision.resume", ["event.legal", "observation.valid", "decision.target_verified", "decision.resume_exact_work"], (actionId) => actionForCursor(policy, resumeCursor, actionId));
 }
 
 function scheduleFixers(
@@ -389,13 +397,34 @@ function incidentReduction(
   incident: Incident,
   ruleId: string,
   trace: string[],
-  hardLimit: boolean,
+  stopOnly: boolean,
 ): PolicyReduction {
   const cursor = checkpoint.cursor;
   if (cursor.phase === "terminal" || cursor.phase === "waiting") throw new Error("incident requires active work");
-  const human = policy.supervision.require_human_on.includes(incident as never);
-  const wake = policy.supervision.wake_on.includes(incident as never);
-  if (!human && !wake) {
+  return incidentForWork(policy, checkpoint, cloneWorkCursor(cursor), incident, ruleId, trace, stopOnly);
+}
+
+function waitingLimitReduction(
+  policy: PolicyV1,
+  checkpoint: PolicyCheckpoint,
+  resumeCursor: WorkCursor,
+  ruleId: string,
+  trace: string[],
+): PolicyReduction {
+  return incidentForWork(policy, checkpoint, cloneWorkCursor(resumeCursor), "policy_limit_reached", ruleId, trace, true);
+}
+
+function incidentForWork(
+  policy: PolicyV1,
+  checkpoint: PolicyCheckpoint,
+  resumeCursor: WorkCursor,
+  incident: Incident,
+  ruleId: string,
+  trace: string[],
+  stopOnly: boolean,
+): PolicyReduction {
+  const supervision = supervisionFor(policy, incident, resumeCursor, stopOnly);
+  if (supervision === undefined) {
     const terminal: Cursor = { phase: "terminal", outcome: "stopped", incident };
     return reduction(checkpoint, terminal, `${ruleId}.fail_closed`, [...trace, "supervision.unconfigured", "supervision.fail_closed"], (actionId) => ({
       actionId,
@@ -404,30 +433,44 @@ function incidentReduction(
       incident,
     }));
   }
-  const target = human ? "owner" : "supervisor";
-  const allowedDecisions: Array<"resume" | "stop"> = hardLimit ? ["stop"] : ["resume", "stop"];
-  const resumeCursor = cloneWorkCursor(cursor);
-  const resumeAction = actionForCursor(policy, cursor, "resume-pending");
   const waiting: Cursor = {
     phase: "waiting",
     incident,
-    target,
-    allowedDecisions: [...allowedDecisions],
+    target: supervision.target,
+    allowedDecisions: [...supervision.allowedDecisions],
     resumeCursor,
-    resumeAction,
   };
-  return reduction(checkpoint, waiting, ruleId, [...trace, human ? "supervision.require_human" : "supervision.wake"], (actionId) => ({
+  return reduction(checkpoint, waiting, ruleId, [...trace, supervision.target === "owner" ? "supervision.require_human" : "supervision.wake"], (actionId) => ({
     actionId,
     type: "wait",
-    target,
+    target: supervision.target,
     incident,
-    allowedDecisions: [...allowedDecisions],
+    allowedDecisions: [...supervision.allowedDecisions],
   }));
+}
+
+function supervisionFor(
+  policy: PolicyV1,
+  incident: Incident,
+  resumeCursor: WorkCursor,
+  stopOnly: boolean,
+): { target: "supervisor" | "owner"; allowedDecisions: Array<"resume" | "stop"> } | undefined {
+  const human = policy.supervision.require_human_on.includes(incident as never);
+  const wake = policy.supervision.wake_on.includes(incident as never);
+  if (!human && !wake) return undefined;
+  const workerBound = resumeCursor.phase === "worker" && resumeCursor.attempt >= policy.limits.max_worker_attempts;
+  return {
+    target: human ? "owner" : "supervisor",
+    allowedDecisions: stopOnly || incident === "policy_limit_reached" || workerBound ? ["stop"] : ["resume", "stop"],
+  };
 }
 
 function actionForCursor(policy: PolicyV1, cursor: WorkCursor, actionId: string): PolicyAction {
   switch (cursor.phase) {
-    case "worker": return { actionId, type: "run_worker", attempt: cursor.attempt, role: role(policy, "worker") };
+    case "worker": {
+      if (cursor.attempt >= policy.limits.max_worker_attempts) throw new Error("worker attempt bound cannot emit run_worker");
+      return { actionId, type: "run_worker", attempt: cursor.attempt, role: role(policy, "worker") };
+    }
     case "initial_review": return { actionId, type: "run_initial_review", role: role(policy, "initial_reviewer") };
     case "fix_batch": return {
       actionId,
@@ -500,13 +543,13 @@ function validateEventEnvelope(checkpoint: PolicyCheckpoint, event: PolicyEvent)
     throw new Error(`event sequence must equal ${checkpoint.revision + 1}`);
   }
   if (checkpoint.cursor.phase === "terminal") throw new Error("terminal checkpoint rejects all events");
-  const phases = EVENT_PHASES[event.type];
+  const phases = EVENT_PHASES[event.type as PolicyEvent["type"]];
   if (!phases.includes(checkpoint.cursor.phase)) throw new Error(`event ${event.type} is illegal in phase ${checkpoint.cursor.phase}`);
   validateObservation(checkpoint, event.observation);
 }
 
 function validateObservation(checkpoint: PolicyCheckpoint, observation: Observation): void {
-  if (!isRecord(observation)) throw new Error("event observation is required");
+  assertExactKeys(observation, ["elapsedMs", "totalCostMicros", "totalTokens"], "observation");
   for (const key of ["elapsedMs", "totalTokens", "totalCostMicros"] as const) {
     const value = observation[key];
     if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) throw new Error(`observation ${key} must be a finite nonnegative safe integer`);
@@ -514,12 +557,20 @@ function validateObservation(checkpoint: PolicyCheckpoint, observation: Observat
   }
 }
 
-function validateEventPayload(event: PolicyEvent): void {
+function validateEventPayload(checkpoint: PolicyCheckpoint, event: PolicyEvent): void {
+  const baseKeys = ["observation", "sequence", "type"];
   switch (event.type) {
+    case "worker_completed":
+    case "worker_retryable_failure":
+    case "worker_blocked":
+      assertExactKeys(event, baseKeys, event.type);
+      return;
     case "initial_review_completed": {
+      assertExactKeys(event, [...baseKeys, "findings"], event.type);
       if (!Array.isArray(event.findings) || event.findings.length > MAX_FINDINGS) throw new Error(`findings must contain at most ${MAX_FINDINGS} items`);
       const ids = new Set<string>();
       for (const finding of event.findings) {
+        assertExactKeys(finding, ["category", "groupId", "id"], "finding");
         validateText(finding.id, "finding id");
         validateText(finding.groupId, "finding groupId");
         if (!CATEGORIES.includes(finding.category)) throw new Error(`unknown finding category ${String(finding.category)}`);
@@ -528,21 +579,34 @@ function validateEventPayload(event: PolicyEvent): void {
       }
       return;
     }
-    case "fix_batch_completed":
-      if (!Array.isArray(event.groups)) throw new Error("fix groups must be an array");
+    case "fix_batch_completed": {
+      assertExactKeys(event, [...baseKeys, "groups"], event.type);
+      const cursor = checkpoint.cursor;
+      if (cursor.phase !== "fix_batch") throw new Error("fix result requires fix_batch cursor");
+      validateOuterGroups(event.groups, cursor.groups.length, "fix groups");
+      const assigned = new Map(cursor.groups.map((group) => [group.groupId, group.findingIds.length]));
       for (const group of event.groups) {
+        assertExactKeys(group, ["findingIds", "groupId", "scopePreserved"], "fix group");
         validateText(group.groupId, "fix groupId");
-        validateTextList(group.findingIds, "fix findingIds");
+        const assignedCount = assigned.get(group.groupId) ?? 0;
+        validateTextList(group.findingIds, "fix findingIds", assignedCount);
         if (typeof group.scopePreserved !== "boolean") throw new Error("scopePreserved must be boolean");
       }
       return;
-    case "re_review_completed":
-      if (!Array.isArray(event.groups)) throw new Error("review groups must be an array");
+    }
+    case "re_review_completed": {
+      assertExactKeys(event, [...baseKeys, "groups"], event.type);
+      const cursor = checkpoint.cursor;
+      if (cursor.phase !== "re_review") throw new Error("review result requires re_review cursor");
+      validateOuterGroups(event.groups, cursor.groups.length, "review groups");
+      const assigned = new Map(cursor.groups.map((group) => [group.groupId, group.findingIds.length]));
       for (const group of event.groups) {
+        assertExactKeys(group, ["findings", "groupId"], "review group");
         validateText(group.groupId, "review groupId");
-        if (!Array.isArray(group.findings)) throw new Error("review findings must be an array");
+        if (!Array.isArray(group.findings) || group.findings.length > (assigned.get(group.groupId) ?? 0)) throw new Error("review findings exceed assigned scope");
         const ids = new Set<string>();
         for (const finding of group.findings) {
+          assertExactKeys(finding, ["accepted", "id"], "review verdict");
           validateText(finding.id, "review finding id");
           if (ids.has(finding.id)) throw new Error(`duplicate review finding id ${finding.id}`);
           if (typeof finding.accepted !== "boolean") throw new Error("review accepted must be boolean");
@@ -550,57 +614,89 @@ function validateEventPayload(event: PolicyEvent): void {
         }
       }
       return;
+    }
     case "validation_completed":
+      assertExactKeys(event, [...baseKeys, "cleanWorktree", "commitPresent", "passed", "reviewAccepted"], event.type);
       for (const key of ["passed", "commitPresent", "cleanWorktree", "reviewAccepted"] as const) {
         if (typeof event[key] !== "boolean") throw new Error(`validation ${key} must be boolean`);
       }
       return;
     case "incident":
+      assertExactKeys(event, [...baseKeys, "incident"], event.type);
       if (!INCIDENTS.includes(event.incident)) throw new Error(`unknown incident ${String(event.incident)}`);
       return;
-    case "decision":
+    case "decision": {
+      assertExactKeys(event, [...baseKeys, "decision", "target"], event.type);
       if (event.target !== "owner" && event.target !== "supervisor") throw new Error("unknown decision target");
       if (event.decision !== "resume" && event.decision !== "stop") throw new Error("unknown decision");
+      const cursor = checkpoint.cursor;
+      if (cursor.phase !== "waiting") throw new Error("decision requires waiting cursor");
+      if (event.target !== cursor.target) throw new Error(`decision target ${event.target} does not match recorded target ${cursor.target}`);
+      if (!cursor.allowedDecisions.includes(event.decision)) throw new Error(`decision ${event.decision} is not allowed`);
       return;
-    default:
-      return;
+    }
   }
 }
 
-function validateCheckpoint(checkpoint: PolicyCheckpoint): void {
-  if (!isRecord(checkpoint)) throw new Error("checkpoint must be an object");
+function validateOuterGroups(value: unknown, assignedCount: number, name: string): asserts value is unknown[] {
+  if (!Array.isArray(value) || value.length > MAX_FINDINGS || value.length > assignedCount) {
+    throw new Error(`${name} exceed assigned group count`);
+  }
+}
+
+function validateCheckpoint(policy: PolicyV1, checkpoint: PolicyCheckpoint): void {
+  assertExactKeys(checkpoint, ["cursor", "elapsedMs", "revision", "totalCostMicros", "totalTokens"], "checkpoint");
   for (const key of ["revision", "elapsedMs", "totalTokens", "totalCostMicros"] as const) {
     const value = checkpoint[key];
     if (!Number.isSafeInteger(value) || value < 0) throw new Error(`checkpoint ${key} must be a nonnegative safe integer`);
   }
-  validateCursor(checkpoint.cursor, false);
+  validateCursor(policy, checkpoint.cursor, false);
+  const existingLimit = reachedLimit(policy, checkpoint);
+  if (
+    existingLimit !== undefined
+    && checkpoint.cursor.phase !== "terminal"
+    && !(checkpoint.cursor.phase === "waiting" && checkpoint.cursor.incident === "policy_limit_reached")
+  ) {
+    throw new Error("nonterminal checkpoint at a hard limit must be a policy-limit wait");
+  }
 }
 
-function validateCursor(cursor: Cursor, nested: boolean): void {
+function validateCursor(policy: PolicyV1, cursor: Cursor, nested: boolean): void {
   if (!isRecord(cursor) || typeof cursor.phase !== "string") throw new Error("checkpoint cursor is malformed");
   switch (cursor.phase) {
     case "worker":
-      if (!Number.isSafeInteger(cursor.attempt) || cursor.attempt < 1) throw new Error("worker attempt must be a positive safe integer");
+      assertExactKeys(cursor, ["attempt", "phase"], "worker cursor");
+      if (!Number.isSafeInteger(cursor.attempt) || cursor.attempt < 1 || cursor.attempt > policy.limits.max_worker_attempts) throw new Error("worker attempt is outside the policy bound");
       return;
     case "initial_review":
+      assertExactKeys(cursor, ["phase"], "initial review cursor");
+      return;
     case "validation":
-      if (cursor.phase === "validation" && typeof cursor.reviewAccepted !== "boolean") throw new Error("validation reviewAccepted must be boolean");
+      assertExactKeys(cursor, ["phase", "reviewAccepted"], "validation cursor");
+      if (typeof cursor.reviewAccepted !== "boolean") throw new Error("validation reviewAccepted must be boolean");
       return;
     case "fix_batch":
     case "re_review":
-      validateFindings(cursor.findings);
-      validateScopes(cursor.groups, cursor.findings);
+      assertExactKeys(cursor, ["findings", "groups", "phase"], `${cursor.phase} cursor`);
+      validateFindings(policy, cursor.findings);
+      validateScopes(policy, cursor.groups, cursor.findings);
       return;
-    case "waiting":
+    case "waiting": {
       if (nested) throw new Error("waiting cursor cannot be nested");
+      assertExactKeys(cursor, ["allowedDecisions", "incident", "phase", "resumeCursor", "target"], "waiting cursor");
       if (!INCIDENTS.includes(cursor.incident)) throw new Error("waiting incident is invalid");
-      if (cursor.target !== "owner" && cursor.target !== "supervisor") throw new Error("waiting target is invalid");
-      if (!Array.isArray(cursor.allowedDecisions) || cursor.allowedDecisions.length < 1 || cursor.allowedDecisions.some((item) => item !== "resume" && item !== "stop")) throw new Error("waiting decisions are invalid");
-      validateCursor(cursor.resumeCursor, true);
-      if (!isRecord(cursor.resumeAction) || typeof cursor.resumeAction.type !== "string" || typeof cursor.resumeAction.actionId !== "string") throw new Error("waiting resume action is invalid");
+      validateCursor(policy, cursor.resumeCursor, true);
+      const expected = supervisionFor(policy, cursor.incident, cursor.resumeCursor, false);
+      if (expected === undefined) throw new Error("unconfigured incident cannot have a waiting cursor");
+      if (cursor.target !== expected.target) throw new Error("waiting target does not match policy");
+      if (!sameDecisionList(cursor.allowedDecisions, expected.allowedDecisions)) throw new Error("waiting decisions do not match policy");
       return;
+    }
     case "terminal":
+      assertExactKeys(cursor, cursor.incident === undefined ? ["outcome", "phase"] : ["incident", "outcome", "phase"], "terminal cursor");
       if (cursor.outcome !== "ready_for_manual_integration" && cursor.outcome !== "stopped") throw new Error("terminal outcome is invalid");
+      if (cursor.incident !== undefined && !INCIDENTS.includes(cursor.incident)) throw new Error("terminal incident is invalid");
+      if (cursor.outcome === "ready_for_manual_integration" && cursor.incident !== undefined) throw new Error("successful terminal cursor cannot contain an incident");
       return;
     default:
       throw new Error(`unknown checkpoint phase ${String((cursor as { phase?: unknown }).phase)}`);
@@ -619,29 +715,58 @@ function validatePolicy(policy: PolicyV1): void {
   if (policy.validation.profile !== "repo-default" || policy.completion.integration !== "manual") throw new Error("unsupported policy execution mode");
 }
 
-function validateFindings(findings: Finding[]): void {
+function validateFindings(policy: PolicyV1, findings: Finding[]): void {
   if (!Array.isArray(findings) || findings.length > MAX_FINDINGS) throw new Error("checkpoint findings are invalid");
   const ids = new Set<string>();
+  let priorId: string | undefined;
   for (const finding of findings) {
+    assertExactKeys(finding, ["category", "groupId", "id", "rounds", "state"], "checkpoint finding");
     validateText(finding.id, "checkpoint finding id");
     validateText(finding.groupId, "checkpoint finding groupId");
     if (ids.has(finding.id) || !CATEGORIES.includes(finding.category)) throw new Error("checkpoint finding is invalid");
-    if (!Number.isSafeInteger(finding.rounds) || finding.rounds < 0) throw new Error("checkpoint finding rounds are invalid");
+    if (priorId !== undefined && compareText(priorId, finding.id) >= 0) throw new Error("checkpoint findings are not canonical");
+    if (!Number.isSafeInteger(finding.rounds) || finding.rounds < 0 || finding.rounds > policy.review.max_fix_rounds_per_finding) throw new Error("checkpoint finding rounds are invalid");
     if (finding.state !== "queued" && finding.state !== "active" && finding.state !== "accepted") throw new Error("checkpoint finding state is invalid");
     ids.add(finding.id);
+    priorId = finding.id;
   }
 }
 
-function validateScopes(groups: GroupScope[], findings: Finding[]): void {
-  if (!Array.isArray(groups) || groups.length > MAX_FINDINGS) throw new Error("checkpoint groups are invalid");
-  const known = new Set(findings.map((finding) => finding.id));
+function validateScopes(policy: PolicyV1, groups: GroupScope[], findings: Finding[]): void {
+  if (!Array.isArray(groups) || groups.length > MAX_FINDINGS || groups.length > policy.review.max_parallel_fixer_groups) throw new Error("checkpoint groups are invalid");
+  const byId = new Map(findings.map((finding) => [finding.id, finding]));
+  const scopedIds = new Set<string>();
   const groupIds = new Set<string>();
+  let priorGroupId: string | undefined;
   for (const group of groups) {
+    assertExactKeys(group, ["findingIds", "groupId"], "checkpoint group scope");
     validateText(group.groupId, "checkpoint groupId");
-    validateTextList(group.findingIds, "checkpoint findingIds");
-    if (groupIds.has(group.groupId) || group.findingIds.some((id) => !known.has(id))) throw new Error("checkpoint group scope is invalid");
+    validateTextList(group.findingIds, "checkpoint findingIds", MAX_FINDINGS);
+    if (group.findingIds.length === 0 || groupIds.has(group.groupId)) throw new Error("checkpoint group scope is invalid");
+    if (priorGroupId !== undefined && compareText(priorGroupId, group.groupId) >= 0) throw new Error("checkpoint groups are not canonical");
+    let priorFindingId: string | undefined;
+    for (const id of group.findingIds) {
+      if (priorFindingId !== undefined && compareText(priorFindingId, id) >= 0) throw new Error("checkpoint scope finding IDs are not canonical");
+      const finding = byId.get(id);
+      if (finding === undefined || finding.groupId !== group.groupId) throw new Error("checkpoint scope group ownership is invalid");
+      if (finding.state !== "active") throw new Error("checkpoint scope contains a non-active finding");
+      if (scopedIds.has(id)) throw new Error("checkpoint scope contains a duplicate finding");
+      scopedIds.add(id);
+      priorFindingId = id;
+    }
     groupIds.add(group.groupId);
+    priorGroupId = group.groupId;
   }
+  const activeIds = findings.filter((finding) => finding.state === "active").map((finding) => finding.id);
+  if (activeIds.length !== scopedIds.size || activeIds.some((id) => !scopedIds.has(id))) {
+    throw new Error("checkpoint active finding scope is incomplete");
+  }
+}
+
+function sameDecisionList(actual: Array<"resume" | "stop">, expected: Array<"resume" | "stop">): boolean {
+  return Array.isArray(actual)
+    && actual.length === expected.length
+    && actual.every((decision, index) => decision === expected[index]);
 }
 
 function assertFixScope(expected: GroupScope[], actual: FixGroupResult[]): void {
@@ -687,20 +812,8 @@ function cloneWorkCursor(cursor: WorkCursor): WorkCursor {
   }
 }
 
-function withActionId(action: PolicyAction, actionId: string): PolicyAction {
-  switch (action.type) {
-    case "run_worker": return { ...action, actionId, role: { ...action.role } };
-    case "run_initial_review": return { ...action, actionId, role: { ...action.role } };
-    case "run_fixers": return { ...action, actionId, role: { ...action.role }, groups: action.groups.map((group) => ({ groupId: group.groupId, findings: group.findings.map((finding) => ({ ...finding })) })) };
-    case "run_re_review": return { ...action, actionId, role: { ...action.role }, groups: cloneScopes(action.groups) };
-    case "run_validation": return { ...action, actionId, requirements: { ...action.requirements } };
-    case "wait": return { ...action, actionId, allowedDecisions: [...action.allowedDecisions] };
-    case "outcome": return { ...action, actionId };
-  }
-}
-
-function validateTextList(values: string[], name: string): void {
-  if (!Array.isArray(values) || values.length > MAX_FINDINGS) throw new Error(`${name} must be a bounded array`);
+function validateTextList(values: string[], name: string, maximum = MAX_FINDINGS): void {
+  if (!Array.isArray(values) || values.length > maximum) throw new Error(`${name} must be a bounded array`);
   const unique = new Set<string>();
   for (const value of values) {
     validateText(value, name);
@@ -711,6 +824,15 @@ function validateTextList(values: string[], name: string): void {
 
 function validateText(value: string, name: string): void {
   if (typeof value !== "string" || value.length < 1 || value.length > MAX_TEXT_LENGTH) throw new Error(`${name} must contain 1-${MAX_TEXT_LENGTH} characters`);
+}
+
+function assertExactKeys(value: unknown, expected: readonly string[], name: string): asserts value is Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${name} must be an object`);
+  const actual = Object.keys(value).sort(compareText);
+  const canonicalExpected = [...expected].sort(compareText);
+  if (actual.length !== canonicalExpected.length || actual.some((key, index) => key !== canonicalExpected[index])) {
+    throw new Error(`${name} has unknown or missing keys`);
+  }
 }
 
 function compareText(left: string, right: string): number {
