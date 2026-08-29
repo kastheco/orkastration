@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "{python}",
+    "{harness_root}/fakes/adapter.py",
+    "--mode",
+    "crash",
+    "--adapter-id",
+    "fake-crash"
+  ],
+  "description": "Calibration-only crash fake",
+  "environment": {},
+  "id": "fake-crash",
+  "protocol_version": "1",
+  "ready": true,
+  "workflow_requirement": "Calibration fake only; never a live comparison candidate."
+}

@@ -1,0 +1,9 @@
+{
+  "argv": [],
+  "description": "Pi-native production Orkastrator boundary",
+  "environment": {},
+  "id": "orkastrator",
+  "protocol_version": "1",
+  "ready": false,
+  "workflow_requirement": "Must invoke production ledger, policy, and Worktrunk adapters; benchmark-only emulation is forbidden and an exact live command is not yet captured."
+}

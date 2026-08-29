@@ -1,0 +1,9 @@
+{
+  "argv": [],
+  "description": "Native Pi subagent delivery boundary",
+  "environment": {},
+  "id": "native-pi",
+  "protocol_version": "1",
+  "ready": false,
+  "workflow_requirement": "Must preserve the observed parent→worker→reviewer→repair workflow; an exact owner-approved command is not yet captured."
+}

@@ -1,0 +1,13 @@
+{
+  "id": "hidden-edge",
+  "capability": "hidden_edge_repair",
+  "instruction": "Repair dedupe_stable for JSON-like values while preserving the first equal value and input order. Keep the public API unchanged.",
+  "setup_argv": ["python", "-m", "unittest", "discover", "-v"],
+  "reset_strategy": "fresh_copy_and_git_init",
+  "visible_test_argv": ["python", "-m", "unittest", "discover", "-v"],
+  "allowed_write_paths": ["collections_ext.py"],
+  "protected_paths": ["test_collections_ext.py"],
+  "expected_final_behavior": ["works for hashable and unhashable JSON-like values", "preserves first-seen order"],
+  "accepted_equivalent_outcomes": ["Equality-based or canonicalization-based implementation with the same observable results"],
+  "fault_point": null
+}

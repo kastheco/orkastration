@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "{python}",
+    "{harness_root}/fakes/adapter.py",
+    "--mode",
+    "scope-escape",
+    "--adapter-id",
+    "fake-scope-escape"
+  ],
+  "description": "Calibration-only scope-escape fake",
+  "environment": {},
+  "id": "fake-scope-escape",
+  "protocol_version": "1",
+  "ready": true,
+  "workflow_requirement": "Calibration fake only; never a live comparison candidate."
+}

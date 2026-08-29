@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "{python}",
+    "{harness_root}/fakes/adapter.py",
+    "--mode",
+    "loud",
+    "--adapter-id",
+    "fake-loud"
+  ],
+  "description": "Calibration-only loud fake",
+  "environment": {},
+  "id": "fake-loud",
+  "protocol_version": "1",
+  "ready": true,
+  "workflow_requirement": "Calibration fake only; never a live comparison candidate."
+}

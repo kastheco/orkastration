@@ -1,0 +1,13 @@
+{
+  "id": "clean-bugfix",
+  "capability": "clean_bugfix",
+  "instruction": "Fix normalize_label so it trims leading/trailing whitespace and collapses every internal whitespace run to one ordinary space. Keep the public API unchanged.",
+  "setup_argv": ["python", "-m", "unittest", "discover", "-v"],
+  "reset_strategy": "fresh_copy_and_git_init",
+  "visible_test_argv": ["python", "-m", "unittest", "discover", "-v"],
+  "allowed_write_paths": ["text_utils.py"],
+  "protected_paths": ["test_text_utils.py"],
+  "expected_final_behavior": ["normalizes leading, trailing, and repeated internal whitespace"],
+  "accepted_equivalent_outcomes": ["Any implementation producing the specified normalized string without changing tests"],
+  "fault_point": null
+}

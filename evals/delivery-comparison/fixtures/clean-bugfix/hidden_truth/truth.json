@@ -1,0 +1,8 @@
+{
+  "verifier_argv": ["python", "verifier.py", "{repo}"],
+  "expected_files_sha256": {
+    "text_utils.py": "7b72d4d135fd49f11f6ce59f623ae8b652542a9b5ccac533e395850e3d4aa94a",
+    "test_text_utils.py": "a5f34944c06d82f41aafd90f569c937ad9f840ce87063fff02f357ad55dde5ce"
+  },
+  "reject_unexpected_paths": true
+}

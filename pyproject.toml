@@ -26,6 +26,7 @@ dev = [
 orkastrator = "orkastrator.cli:app"
 orkas = "orkastrator.cli:app"
 orkastrator-eval = "evals.contracts:main"
+orkastrator-delivery-eval = "evals.delivery_comparison.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.28,<2"]

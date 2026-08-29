@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "/definitely/not/a/delivery-adapter"
+  ],
+  "description": "Nonexistent executable calibrates launch failure",
+  "environment": {},
+  "id": "fake-infrastructure-failure",
+  "protocol_version": "1",
+  "ready": true,
+  "workflow_requirement": "Calibration fake only; never a live comparison candidate."
+}

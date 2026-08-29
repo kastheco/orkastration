@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "{python}",
+    "{harness_root}/fakes/adapter.py",
+    "--mode",
+    "malformed",
+    "--adapter-id",
+    "fake-malformed"
+  ],
+  "description": "Calibration-only malformed fake",
+  "environment": {},
+  "id": "fake-malformed",
+  "protocol_version": "1",
+  "ready": true,
+  "workflow_requirement": "Calibration fake only; never a live comparison candidate."
+}

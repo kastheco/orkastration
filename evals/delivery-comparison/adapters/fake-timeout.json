@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "{python}",
+    "{harness_root}/fakes/adapter.py",
+    "--mode",
+    "timeout",
+    "--adapter-id",
+    "fake-timeout"
+  ],
+  "description": "Calibration-only timeout fake",
+  "environment": {},
+  "id": "fake-timeout",
+  "protocol_version": "1",
+  "ready": true,
+  "workflow_requirement": "Calibration fake only; never a live comparison candidate."
+}
