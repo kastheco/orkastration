@@ -21,6 +21,7 @@ function finding(
     contract: `Fix ${id} without changing unrelated behavior.`,
     evidence: [`Evidence for ${id}`],
     implicatedPaths: paths,
+    writablePaths: paths,
     blocking: true,
     ...overrides,
   };
@@ -97,10 +98,32 @@ test("initial findings freeze once and overlap clumps transitively before bounde
 
   input[0]!.contract = "mutated caller value";
   input[0]!.implicatedPaths.push("src/escape.ts");
+  input[0]!.writablePaths.push("src/write-escape.ts");
   assert.notEqual(first.findings[0]?.contract, "mutated caller value");
   assert.equal(
     first.findings.some((item) => item.implicatedPaths.includes("src/escape.ts")),
     false,
+  );
+  assert.equal(
+    first.findings.some((item) => item.writablePaths.includes("src/write-escape.ts")),
+    false,
+  );
+});
+
+test("shared evidence paths do not clump disjoint writable scopes", () => {
+  const plan = planReviewWaves([
+    finding("finding-a", ["src/a.ts", "test/shared.test.ts"], {
+      writablePaths: ["src/a.ts"],
+    }),
+    finding("finding-b", ["src/b.ts", "test/shared.test.ts"], {
+      writablePaths: ["src/b.ts"],
+    }),
+  ], 2);
+
+  assert.equal(plan.fixerGroups.length, 2);
+  assert.deepEqual(
+    plan.fixerGroups.map((group) => group.writablePaths).sort(),
+    [["src/a.ts"], ["src/b.ts"]],
   );
 });
 
@@ -149,6 +172,8 @@ test("re-review packet contains only the frozen contracts, exact diff, and valid
       category: item.category,
       contract: item.contract,
       evidence: item.evidence,
+      implicatedPaths: item.implicatedPaths,
+      writablePaths: item.writablePaths,
     })),
     fixerDiff: {
       baseSha: "a".repeat(40),
@@ -200,6 +225,11 @@ for (const [name, value, expected] of [
   ],
   ["nonblocking correctness", [finding("bug", ["src/a.ts"], { blocking: false })], /inconsistent/u],
   ["empty blocking scope", [finding("empty", [])], /requires an implicated path/u],
+  [
+    "empty writable scope",
+    [finding("empty-write", ["src/a.ts"], { writablePaths: [] })],
+    /requires a writable path/u,
+  ],
 ] as const) {
   test(`initial review rejects ${name}`, () => {
     assert.throws(() => planReviewWaves(value, 3), expected);

@@ -395,8 +395,10 @@ function initialReviewPrompt(input: ReviewWorkflowInput): string {
     input.objective,
     "Inspect only the committed changes and relevant repository context. Do not modify files.",
     "Report correctness, security, data_loss, scope, and acceptance failures as blocking.",
-    "Use category style only for minor style findings. Orkastrator derives blocking status from category. Every non-style finding needs exact writable file paths.",
-    "Every implicatedPaths value must be repository-relative, such as src/count.js. Never return an absolute path or a path containing . or .. segments.",
+    "Use category style only for minor style findings. Orkastrator derives blocking status from category.",
+    "For each finding, implicatedPaths names evidence locations and writablePaths names only files a fixer may change. Both use repository-relative paths such as src/count.js.",
+    "Never widen writablePaths to tests or aggregate consequence paths unless those files themselves must change. Do not report an umbrella failing-suite finding when scoped root-cause findings already explain the failure.",
+    "Never return an absolute path or a path containing . or .. segments.",
   ].join("\n\n");
 }
 
@@ -545,23 +547,28 @@ function findingSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["id", "severity", "category", "contract", "evidence", "implicatedPaths"],
+    required: ["id", "severity", "category", "contract", "evidence", "implicatedPaths", "writablePaths"],
     properties: {
       id: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
       severity: { enum: ["critical", "high", "medium", "low", "info"] },
       category: { enum: ["correctness", "security", "data_loss", "scope", "acceptance", "style"] },
       contract: { type: "string", minLength: 1, maxLength: 4_000 },
       evidence: { type: "array", maxItems: 50, items: { type: "string", minLength: 1, maxLength: 4_000 } },
-      implicatedPaths: {
-        type: "array",
-        maxItems: 100,
-        items: {
-          type: "string",
-          minLength: 1,
-          maxLength: 512,
-          pattern: "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*//)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*\\/\\.\\.?(?:\\/|$)).+$",
-        },
-      },
+      implicatedPaths: pathArraySchema(),
+      writablePaths: pathArraySchema(),
+    },
+  } as const;
+}
+
+function pathArraySchema() {
+  return {
+    type: "array",
+    maxItems: 100,
+    items: {
+      type: "string",
+      minLength: 1,
+      maxLength: 512,
+      pattern: "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*//)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*\\/\\.\\.?(?:\\/|$)).+$",
     },
   } as const;
 }

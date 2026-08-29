@@ -92,6 +92,7 @@ test("blocking status is derived from review context instead of reviewer discret
         contract: "Fix the bug.",
         evidence: ["test fails"],
         implicatedPaths: ["src/bug.js"],
+        writablePaths: ["src/bug.js"],
       },
       {
         id: "style",
@@ -100,6 +101,7 @@ test("blocking status is derived from review context instead of reviewer discret
         contract: "Optional rename.",
         evidence: ["name is awkward"],
         implicatedPaths: [],
+        writablePaths: [],
       },
     ],
   }, 2);
@@ -117,6 +119,7 @@ test("blocking status is derived from review context instead of reviewer discret
         contract: "Another fixer owns this defect.",
         evidence: ["other test fails"],
         implicatedPaths: ["src/other.js"],
+        writablePaths: ["src/other.js"],
         introducedByFix: false,
       },
       {
@@ -126,6 +129,7 @@ test("blocking status is derived from review context instead of reviewer discret
         contract: "The fix introduced a regression.",
         evidence: ["new scoped test fails"],
         implicatedPaths: ["src/bug.js"],
+        writablePaths: ["src/bug.js"],
         introducedByFix: true,
       },
     ],
@@ -207,6 +211,7 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
       contract: "a.txt must contain fixed a",
       evidence: ["a.txt is broken"],
       implicatedPaths: ["a.txt"],
+      writablePaths: ["a.txt"],
       blocking: true,
     },
     {
@@ -216,6 +221,7 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
       contract: "b.txt must contain fixed b",
       evidence: ["b.txt is broken"],
       implicatedPaths: ["b.txt"],
+      writablePaths: ["b.txt"],
       blocking: true,
     },
   ], 2);

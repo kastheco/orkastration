@@ -16,12 +16,14 @@ export interface InitialReviewFinding {
   contract: string;
   evidence: string[];
   implicatedPaths: string[];
+  writablePaths: string[];
   blocking: boolean;
 }
 
 export interface FrozenFinding extends InitialReviewFinding {
   evidence: string[];
   implicatedPaths: string[];
+  writablePaths: string[];
 }
 
 export interface FixerGroup {
@@ -58,6 +60,8 @@ export interface ReReviewPacket {
     category: Exclude<FindingCategory, "style">;
     contract: string;
     evidence: string[];
+    implicatedPaths: string[];
+    writablePaths: string[];
   }>;
   fixerDiff: {
     baseSha: string;
@@ -117,6 +121,7 @@ export function parseInitialReviewOutput(
         "id",
         "implicatedPaths",
         "severity",
+        "writablePaths",
       ],
       `initial review finding ${index}`,
     );
@@ -208,6 +213,8 @@ export function buildReReviewPacket(
       category: finding.category as Exclude<FindingCategory, "style">,
       contract: finding.contract,
       evidence: [...finding.evidence],
+      implicatedPaths: [...finding.implicatedPaths],
+      writablePaths: [...finding.writablePaths],
     })),
     fixerDiff: {
       baseSha: result.baseSha,
@@ -250,8 +257,16 @@ function normalizeFinding(
     `finding ${finding.id} paths`,
     normalizePath,
   );
+  const writablePaths = sortedUnique(
+    finding.writablePaths,
+    `finding ${finding.id} writable paths`,
+    normalizePath,
+  );
   if (finding.blocking && implicatedPaths.length === 0) {
     throw new Error(`blocking finding ${finding.id} requires an implicated path`);
+  }
+  if (finding.blocking && writablePaths.length === 0) {
+    throw new Error(`blocking finding ${finding.id} requires a writable path`);
   }
   return {
     id: finding.id,
@@ -260,6 +275,7 @@ function normalizeFinding(
     contract: finding.contract,
     evidence,
     implicatedPaths,
+    writablePaths,
     blocking: finding.blocking,
   };
 }
@@ -283,7 +299,7 @@ function clumpFindings(findings: FrozenFinding[]): FixerGroup[] {
   };
   const ownerByPath = new Map<string, number>();
   findings.forEach((finding, index) => {
-    for (const path of finding.implicatedPaths) {
+    for (const path of finding.writablePaths) {
       const owner = ownerByPath.get(path);
       if (owner === undefined) ownerByPath.set(path, index);
       else unite(owner, index);
@@ -300,7 +316,7 @@ function clumpFindings(findings: FrozenFinding[]): FixerGroup[] {
   return [...byRoot.values()]
     .map((groupFindings) => {
       groupFindings.sort((left, right) => left.id.localeCompare(right.id));
-      const writablePaths = [...new Set(groupFindings.flatMap((finding) => finding.implicatedPaths))]
+      const writablePaths = [...new Set(groupFindings.flatMap((finding) => finding.writablePaths))]
         .sort((left, right) => left.localeCompare(right));
       const digest = createHash("sha256")
         .update(JSON.stringify({
