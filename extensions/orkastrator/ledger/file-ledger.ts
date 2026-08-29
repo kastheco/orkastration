@@ -251,8 +251,14 @@ export class RunLedger {
     if (last === undefined) throw new LedgerCorruptionError(`run ${runId} has no ledger events`);
     let record = last.projection;
     this.#assertRecord(record, runId);
-    const policy = this.#readVerifiedPolicy(directory, record);
-    this.#validatePolicyEventChain(policy, parsed.events);
+    const policyBytes = this.#readHashVerifiedPolicy(directory, record);
+    const checkpointCapable = Object.hasOwn(parsed.events[0]!.projection, "policyCheckpoint");
+    if (checkpointCapable) {
+      const policy = this.#parseFrozenPolicy(record, policyBytes);
+      this.#validatePolicyEventChain(policy, parsed.events);
+    } else {
+      this.#validateLegacyPolicyFields(parsed.events);
+    }
 
     const statePath = join(directory, "state.json");
     let stateNeedsRepair = true;
@@ -347,7 +353,10 @@ export class RunLedger {
         );
       }
 
-      const policy = this.#readVerifiedPolicy(this.runDirectory(runId), current);
+      const policy = this.#parseFrozenPolicy(
+        current,
+        this.#readHashVerifiedPolicy(this.runDirectory(runId), current),
+      );
       let reduction: PolicyReduction;
       try {
         reduction = reducePolicy({ policy, checkpoint: current.policyCheckpoint ?? null, event });
@@ -829,7 +838,7 @@ export class RunLedger {
     return { event: JSON.parse(serialized) as JsonObject };
   }
 
-  #readVerifiedPolicy(directory: string, record: RunRecord): PolicyV1 {
+  #readHashVerifiedPolicy(directory: string, record: RunRecord): Buffer {
     const policyPath = join(directory, record.policyFile);
     this.#assertRegularFile(policyPath, "policy snapshot");
     const policyBytes = readFileSync(policyPath);
@@ -837,12 +846,31 @@ export class RunLedger {
     if (policyHash !== record.policyHash) {
       throw new LedgerCorruptionError(`run ${record.runId} policy snapshot hash does not match`);
     }
+    return policyBytes;
+  }
+
+  #parseFrozenPolicy(record: RunRecord, policyBytes: Buffer): PolicyV1 {
     try {
       return parsePolicyV1(policyBytes);
     } catch (error) {
       throw new LedgerCorruptionError(
         `run ${record.runId} frozen policy snapshot is invalid: ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+  }
+
+  #validateLegacyPolicyFields(events: RunEvent[]): void {
+    for (const [index, event] of events.entries()) {
+      if (
+        Object.hasOwn(event.projection, "policyCheckpoint")
+        || Object.hasOwn(event.projection, "pendingPolicyAction")
+        || event.type === "policy_event_applied"
+        || event.type === "policy_action_delivered"
+      ) {
+        throw new LedgerCorruptionError(
+          `legacy event ${index + 1} contains checkpoint-capable policy state`,
+        );
+      }
     }
   }
 

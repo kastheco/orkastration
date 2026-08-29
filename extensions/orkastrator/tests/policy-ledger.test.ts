@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +39,60 @@ function fixture(randomId = ids()) {
   return { temporary, repository, ledger, run, cleanup: () => rmSync(temporary, { recursive: true, force: true }) };
 }
 
+function handcraftedLegacyLedger() {
+  const temporary = mkdtempSync(join(tmpdir(), "orkastrator-legacy-policy-ledger-"));
+  const repository = join(temporary, "repository");
+  const root = join(temporary, "state");
+  const runId = "00000000-0000-4000-8000-000000000001";
+  const timestamp = "2026-08-28T22:00:00.000Z";
+  const policySnapshot = "version: 0\nmode: historical-lifecycle\n";
+  mkdirSync(repository);
+  const ledger = new RunLedger({ root });
+  const directory = join(root, runId);
+  mkdirSync(directory);
+  const record = {
+    schemaVersion: 1,
+    runId,
+    objective: "Inspect a historical run.",
+    supervisorSessionId: "legacy-session",
+    repositoryRoot: repository,
+    policyHash: createHash("sha256").update(policySnapshot).digest("hex"),
+    policyFile: "policy.yaml",
+    generation: 1,
+    hostPid: 4242,
+    sequence: 1,
+    state: "submitted",
+    reason: "run_created",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ownedProcesses: [],
+    worktrees: [],
+  } as const;
+  const event = {
+    schemaVersion: 1,
+    eventId: "00000000-0000-4000-8000-000000000002",
+    runId,
+    sequence: 1,
+    timestamp,
+    type: "run_created",
+    toState: "submitted",
+    ruleId: "run.create",
+    actor: "owner",
+    evidence: { repositoryRoot: repository, policyHash: record.policyHash },
+    projection: record,
+  };
+  writeFileSync(join(directory, "policy.yaml"), policySnapshot);
+  writeFileSync(join(directory, "events.jsonl"), `${JSON.stringify(event)}\n`);
+  writeFileSync(join(directory, "state.json"), `${JSON.stringify(record, null, 2)}\n`);
+  return {
+    temporary,
+    ledger,
+    runId,
+    policySnapshot,
+    cleanup: () => rmSync(temporary, { recursive: true, force: true }),
+  };
+}
+
 function started(): Extract<PolicyEvent, { type: "started" }> {
   return { type: "started", sequence: 1, observation: { elapsedMs: 0, totalTokens: 0, totalCostMicros: 0 } };
 }
@@ -61,25 +116,42 @@ function rewriteEvents(
   writeFileSync(path, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
 }
 
-test("new records explicitly start at null while legacy absence remains inspectable but cannot reduce", () => {
+test("new records explicitly start with a null policy checkpoint", () => {
   const value = fixture();
   try {
     assert.equal(Object.hasOwn(value.run, "policyCheckpoint"), true);
     assert.equal(value.run.policyCheckpoint, null);
+  } finally {
+    value.cleanup();
+  }
+});
 
-    rewriteEvents(value.ledger, value.run.runId, (events) => {
-      delete events[0]!.projection.policyCheckpoint;
-    });
-    const statePath = join(value.ledger.runDirectory(value.run.runId), "state.json");
-    const state = JSON.parse(readFileSync(statePath, "utf8"));
-    delete state.policyCheckpoint;
-    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
-
-    const legacy = new RunLedger({ root: value.ledger.root }).loadRun(value.run.runId).record;
+test("a handcrafted pre-stage run hash-verifies but does not parse its non-v1 policy", () => {
+  const value = handcraftedLegacyLedger();
+  try {
+    const legacy = value.ledger.loadRun(value.runId).record;
     assert.equal(Object.hasOwn(legacy, "policyCheckpoint"), false);
+    assert.equal(value.ledger.policySnapshot(value.runId), value.policySnapshot);
+    const cleaned = value.ledger.transition(value.runId, {
+      state: "interrupted",
+      reason: "legacy_cleanup",
+      ruleId: "legacy.cleanup",
+      actor: "extension",
+    });
+    assert.equal(cleaned.state, "interrupted");
+    assert.equal(Object.hasOwn(cleaned, "policyCheckpoint"), false);
     assert.throws(
-      () => value.ledger.applyPolicyEvent(value.run.runId, started()),
+      () => value.ledger.applyPolicyEvent(value.runId, started()),
       /legacy run .* cannot apply policy events/u,
+    );
+
+    writeFileSync(
+      join(value.ledger.runDirectory(value.runId), "policy.yaml"),
+      `${value.policySnapshot}tampered: true\n`,
+    );
+    assert.throws(
+      () => value.ledger.loadRun(value.runId),
+      /policy snapshot hash does not match/u,
     );
   } finally {
     value.cleanup();
@@ -196,6 +268,7 @@ test("duplicate apply and delivery are idempotent while conflicts, pending, stal
     const deliveredDuplicate = value.ledger.applyPolicyEvent(value.run.runId, started());
     assert.equal(deliveredDuplicate.delivery, "delivered");
     assert.equal(deliveredDuplicate.appended, false);
+    assert.deepEqual(deliveredDuplicate.reduction, first.reduction);
     assert.throws(() => value.ledger.applyPolicyEvent(value.run.runId, { ...workerCompleted(), sequence: 3 }), /sequence must equal 2/u);
     assert.throws(() => value.ledger.recordPolicyActionDelivered(value.run.runId, "unknown", delivery("unknown")), /unknown/u);
     assert.equal(value.ledger.events(value.run.runId).length, ack.sequence);
@@ -281,6 +354,151 @@ test("malformed, illegal, nonmonotonic, and non-JSON policy inputs append nothin
   }
 });
 
+test("policy apply and delivery evidence reject size, depth, cycles, and extra keys without appending", () => {
+  const value = fixture();
+  try {
+    const beforeApply = value.ledger.events(value.run.runId).length;
+    const oversizedApply = {
+      ...started(),
+      padding: "x".repeat(4 * 1024 * 1024),
+    } as unknown as PolicyEvent;
+    assert.throws(
+      () => value.ledger.applyPolicyEvent(value.run.runId, oversizedApply),
+      /policy event exceeds/u,
+    );
+
+    let deepApply: Record<string, unknown> = { leaf: true };
+    for (let index = 0; index < 102; index += 1) deepApply = { next: deepApply };
+    assert.throws(
+      () => value.ledger.applyPolicyEvent(
+        value.run.runId,
+        { ...started(), nested: deepApply } as unknown as PolicyEvent,
+      ),
+      /bounded JSON value/u,
+    );
+    const cyclicApply = started() as PolicyEvent & { cycle?: unknown };
+    cyclicApply.cycle = cyclicApply;
+    assert.throws(
+      () => value.ledger.applyPolicyEvent(value.run.runId, cyclicApply),
+      /contains a cycle/u,
+    );
+    assert.equal(value.ledger.events(value.run.runId).length, beforeApply);
+
+    const applied = value.ledger.applyPolicyEvent(value.run.runId, started());
+    const actionId = applied.reduction.action.actionId;
+    const beforeDelivery = applied.record.sequence;
+    assert.throws(
+      () => value.ledger.recordPolicyActionDelivered(
+        value.run.runId,
+        actionId,
+        delivery(actionId, "x".repeat(1024 * 1024)),
+      ),
+      /policy delivery evidence exceeds/u,
+    );
+
+    let deepReceipt: Record<string, JsonValue> = { leaf: true };
+    for (let index = 0; index < 102; index += 1) deepReceipt = { next: deepReceipt };
+    assert.throws(
+      () => value.ledger.recordPolicyActionDelivered(
+        value.run.runId,
+        actionId,
+        delivery(actionId, deepReceipt),
+      ),
+      /bounded JSON value/u,
+    );
+    const cyclicReceipt: Record<string, unknown> = {};
+    cyclicReceipt.self = cyclicReceipt;
+    assert.throws(
+      () => value.ledger.recordPolicyActionDelivered(
+        value.run.runId,
+        actionId,
+        {
+          adapter: "fake-idempotent",
+          idempotencyKey: actionId,
+          receipt: cyclicReceipt,
+        } as unknown as Parameters<RunLedger["recordPolicyActionDelivered"]>[2],
+      ),
+      /contains a cycle/u,
+    );
+    const extraEvidence = {
+      ...delivery(actionId),
+      unexpected: true,
+    };
+    assert.throws(
+      () => value.ledger.recordPolicyActionDelivered(
+        value.run.runId,
+        actionId,
+        extraEvidence as unknown as Parameters<RunLedger["recordPolicyActionDelivered"]>[2],
+      ),
+      /evidence or idempotency key is invalid/u,
+    );
+    assert.equal(value.ledger.events(value.run.runId).length, beforeDelivery);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("an apply event append write failure leaves no policy event or projection", async () => {
+  const value = fixture();
+  try {
+    const eventsPath = join(value.ledger.runDirectory(value.run.runId), "events.jsonl");
+    const initialBytes = statSync(eventsPath).size;
+    const blockCount = Math.ceil((initialBytes + 1) / 1024);
+    const limitBytes = blockCount * 1024;
+    appendFileSync(eventsPath, "\n".repeat(limitBytes - initialBytes));
+
+    const moduleUrl = pathToFileURL(resolve(import.meta.dirname, "../ledger/file-ledger.ts")).href;
+    const source = `
+      import { RunLedger } from ${JSON.stringify(moduleUrl)};
+      try {
+        new RunLedger({ root: process.env.ROOT }).applyPolicyEvent(
+          process.env.RUN_ID,
+          ${JSON.stringify(started())},
+        );
+        console.log(JSON.stringify({ appended: true }));
+      } catch (error) {
+        console.log(JSON.stringify({ appended: false, message: error instanceof Error ? error.message : String(error) }));
+      }
+    `;
+    const child = spawn(
+      "bash",
+      ["-c", `trap '' XFSZ; ulimit -f ${blockCount}; exec "$NODE" --experimental-strip-types --input-type=module -e "$SOURCE"`],
+      {
+        env: {
+          ...process.env,
+          NODE: process.execPath,
+          SOURCE: source,
+          ROOT: value.ledger.root,
+          RUN_ID: value.run.runId,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const result = await new Promise<{ appended: boolean; message?: string }>((resolveResult, reject) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+      child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      child.once("error", reject);
+      child.once("close", (code) => code === 0
+        ? resolveResult(JSON.parse(stdout.trim()))
+        : reject(new Error(`append-fault child exited ${code}: ${stderr}`)));
+    });
+    assert.equal(result.appended, false);
+    assert.match(result.message ?? "", /EFBIG|file too large/iu);
+    assert.equal(statSync(eventsPath).size, limitBytes);
+    assert.equal(value.ledger.events(value.run.runId).length, 1);
+    assert.equal(value.ledger.loadRun(value.run.runId).record.sequence, 1);
+    assert.equal(value.ledger.loadRun(value.run.runId).record.policyCheckpoint, null);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("apply fsync failure injection has no existing narrow seam", {
+  skip: "node:fs fsyncSync is directly imported and no production fault-injection abstraction exists",
+}, () => {});
+
 test("event-first policy persistence repairs state after a projection write failure", () => {
   const temporary = mkdtempSync(join(tmpdir(), "orkastrator-policy-repair-"));
   const repository = join(temporary, "repository");
@@ -310,6 +528,47 @@ test("event-first policy persistence repairs state after a projection write fail
     assert.equal(repaired.sequence, 2);
     assert.equal(repaired.pendingPolicyAction?.actionId, "1:worker.started:action");
     assert.equal(ledger.events(run.runId).at(-1)?.type, "policy_event_applied");
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("an acknowledged action is repaired from its event after the state write crashes", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "orkastrator-policy-ack-repair-"));
+  const repository = join(temporary, "repository");
+  const root = join(temporary, "state");
+  const runId = "00000000-0000-4000-8000-000000000001";
+  mkdirSync(repository);
+  let value = 0;
+  let collision = "";
+  const ledger = new RunLedger({
+    root,
+    now: () => new Date("2026-08-28T22:00:00.000Z"),
+    randomId: () => {
+      value += 1;
+      const id = `00000000-0000-4000-8000-${value.toString(16).padStart(12, "0")}`;
+      if (value === 8) {
+        collision = join(root, runId, `state.json.${id}.tmp`);
+        mkdirSync(collision);
+      }
+      return id;
+    },
+  });
+  try {
+    const run = ledger.createRun({ objective: "ack repair", supervisorSessionId: "session", repositoryRoot: repository, policySnapshot: POLICY_SNAPSHOT, hostPid: 4242 });
+    const applied = ledger.applyPolicyEvent(run.runId, started());
+    assert.throws(() => ledger.recordPolicyActionDelivered(
+      run.runId,
+      applied.reduction.action.actionId,
+      delivery(applied.reduction.action.actionId),
+    ));
+    rmSync(collision, { recursive: true, force: true });
+
+    const repaired = ledger.loadRun(run.runId).record;
+    assert.equal(repaired.sequence, 3);
+    assert.equal(repaired.pendingPolicyAction, undefined);
+    assert.deepEqual(repaired.policyCheckpoint, applied.reduction.checkpoint);
+    assert.equal(ledger.events(run.runId).at(-1)?.type, "policy_action_delivered");
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -368,8 +627,8 @@ for (const [name, tamper] of applyTampering) {
   });
 }
 
-test("semantic reload rejects snapshot, acknowledgment, and receipt tampering", () => {
-  for (const kind of ["snapshot", "ack", "receipt"] as const) {
+test("semantic reload rejects snapshot, acknowledgment, receipt, and extra-key tampering", () => {
+  for (const kind of ["snapshot", "ack", "receipt", "ack-evidence-extra", "ack-envelope-extra"] as const) {
     const value = fixture();
     try {
       const applied = value.ledger.applyPolicyEvent(value.run.runId, started());
@@ -379,7 +638,9 @@ test("semantic reload rejects snapshot, acknowledgment, and receipt tampering", 
       } else {
         rewriteEvents(value.ledger, value.run.runId, (events) => {
           if (kind === "ack") events[2]!.actionId = "forged";
-          else delete events[2]!.evidence.receipt;
+          else if (kind === "receipt") delete events[2]!.evidence.receipt;
+          else if (kind === "ack-evidence-extra") events[2]!.evidence.unexpected = true;
+          else events[2]!.unexpected = true;
         });
       }
       assert.throws(() => new RunLedger({ root: value.ledger.root }).loadRun(value.run.runId), LedgerCorruptionError);
