@@ -21,7 +21,9 @@ def read_result_bundle(output: Path) -> AdapterResultBundle:
         raise BundleReadError(f"invalid result.json: {exc}") from exc
 
 
-def read_telemetry(output: Path) -> list[TelemetryEvent]:
+def read_telemetry(
+    output: Path, *, trial_id: str, adapter_id: str, task_id: str, start_sequence: int = 0
+) -> list[TelemetryEvent]:
     path = output / "events.jsonl"
     try:
         lines = path.read_text().splitlines()
@@ -30,10 +32,15 @@ def read_telemetry(output: Path) -> list[TelemetryEvent]:
     events: list[TelemetryEvent] = []
     for line_number, line in enumerate(lines, start=1):
         try:
-            events.append(TelemetryEvent.model_validate_json(line))
+            event = TelemetryEvent.model_validate_json(line)
         except ValidationError as exc:
             raise BundleReadError(f"invalid events.jsonl line {line_number}: {exc}") from exc
+        if (event.trial_id, event.adapter_id, event.task_id) != (trial_id, adapter_id, task_id):
+            raise BundleReadError(f"telemetry identity mismatch at line {line_number}")
+        events.append(event)
     sequences = [event.sequence for event in events]
-    if sequences != list(range(len(events))):
-        raise BundleReadError("telemetry sequence must be contiguous and zero-based")
+    if sequences != list(range(start_sequence, start_sequence + len(events))):
+        raise BundleReadError(
+            f"telemetry sequence must be contiguous from {start_sequence}; got {sequences}"
+        )
     return events

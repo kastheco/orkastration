@@ -6,27 +6,31 @@
     "{python}",
     "{protocol_stub}",
     "--mode",
-    "malformed",
+    "false-infra",
     "--adapter-id",
-    "fake-malformed"
+    "fake-false-infra"
   ],
   "budget": {
     "max_cost_usd": 25.0,
     "max_total_tokens": 200000,
     "max_wall_seconds": 1800
   },
-  "calibration_scenario": "malformed",
+  "calibration_scenario": "false-infra",
   "comparison_mode": "tuned-primary",
-  "config_digest": "1935b0924b1a82e1c07fdd78ee3d69de4a9963a35d087151e4947a5343c39d20",
+  "config_digest": "387d9fc8791d66ac691b67d06b8e1287cdc8779b342015d59219c8dd51c55311",
   "containment": {
     "backend": "none",
-    "evidence": "No filesystem containment backend is proven.",
+    "evidence": "Calibration protocol stub is not eligible for live use.",
     "filesystem_isolation": false
   },
-  "description": "Calibration-only malformed fake",
+  "description": "Calibration-only false-infra protocol stub",
   "environment": {},
-  "id": "fake-malformed",
-  "infrastructure_exit_codes": {},
+  "id": "fake-false-infra",
+  "infrastructure_exit_codes": {
+    "service_unavailable": [
+      0
+    ]
+  },
   "model_role_map": {
     "calibration": {
       "model": "offline-fake",

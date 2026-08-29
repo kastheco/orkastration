@@ -2,17 +2,44 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SCHEMA_VERSION = "1"
+ComparisonMode = Literal["tuned-primary", "matched-role-ablation", "sol-high-diagnostic"]
+InfrastructureCode = Literal[
+    "service_unavailable",
+    "rate_limited",
+    "authentication_unavailable",
+    "quota_exhausted",
+    "containment_failure",
+    "worktree_failure",
+]
 
 
 class StrictModel(BaseModel):
     """Base model which rejects accidental protocol expansion."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class ContainmentSpec(StrictModel):
+    backend: Literal["none", "external-verified"]
+    filesystem_isolation: bool
+    evidence: str = Field(max_length=500)
+
+
+class ModelRoute(StrictModel):
+    model: str = Field(min_length=1)
+    thinking: Literal["off", "low", "medium", "high"]
+
+
+class EvaluationBudget(StrictModel):
+    max_total_tokens: int = Field(gt=0)
+    max_cost_usd: float = Field(gt=0)
+    max_wall_seconds: int = Field(gt=0)
 
 
 class AdapterManifest(StrictModel):
@@ -23,11 +50,41 @@ class AdapterManifest(StrictModel):
     argv: list[str]
     environment: dict[str, str] = Field(default_factory=dict)
     workflow_requirement: str
+    containment: ContainmentSpec
+    comparison_mode: ComparisonMode
+    model_role_map: dict[str, ModelRoute]
+    allowed_model_pool: list[str]
+    budget: EvaluationBudget
+    tuning_budget_hours: float = Field(ge=0)
+    config_digest: str
+    infrastructure_exit_codes: dict[InfrastructureCode, list[int]] = Field(default_factory=dict)
+    calibration_scenario: str | None = None
 
     @model_validator(mode="after")
-    def require_argv_when_ready(self) -> AdapterManifest:
+    def validate_readiness_and_configuration(self) -> AdapterManifest:
         if self.ready and not self.argv:
             raise ValueError("ready adapters require argv")
+        if self.ready and (
+            self.containment.backend != "external-verified"
+            or not self.containment.filesystem_isolation
+            or not self.containment.evidence.strip()
+        ):
+            raise ValueError("ready adapters require explicitly evidenced filesystem containment")
+        if not self.model_role_map:
+            raise ValueError("model_role_map cannot be empty")
+        routed_models = {route.model for route in self.model_role_map.values()}
+        if not routed_models <= set(self.allowed_model_pool):
+            raise ValueError("every routed model must be in allowed_model_pool")
+        if len(self.config_digest) != 64 or not re.fullmatch(r"[0-9a-f]{64}", self.config_digest):
+            raise ValueError("config_digest must be lowercase SHA-256")
+        if any(
+            not codes or len(codes) != len(set(codes))
+            for codes in self.infrastructure_exit_codes.values()
+        ):
+            raise ValueError("infrastructure exit-code allowlists must be nonempty and unique")
+        secret_terms = ("token", "secret", "password", "api_key", "apikey", "credential")
+        if any(any(term in key.lower() for term in secret_terms) for key in self.environment):
+            raise ValueError("adapter environment may not contain credential-shaped keys")
         return self
 
 
@@ -62,19 +119,38 @@ class AdapterMetrics(StrictModel):
     fixer_calls: int = Field(default=0, ge=0)
 
 
+class AdapterInfrastructure(StrictModel):
+    code: InfrastructureCode
+    evidence: str = Field(min_length=1, max_length=500)
+
+
 class AdapterResultBundle(StrictModel):
     schema_version: Literal["1"] = "1"
     trial_id: str
     adapter_id: str
     task_id: str
     status: Literal["completed", "failed", "crashed"]
-    summary: str
+    summary: str = Field(max_length=2000)
     metrics: AdapterMetrics = Field(default_factory=AdapterMetrics)
-    infrastructure_error: str | None = None
+    infrastructure: AdapterInfrastructure | None = None
+
+
+_ACTION_EVENTS = {
+    "dispatch",
+    "action",
+    "commit",
+    "ack",
+    "crash",
+    "redelivery",
+    "lost_committed_work",
+}
 
 
 class TelemetryEvent(StrictModel):
     schema_version: Literal["1"] = "1"
+    trial_id: str = Field(min_length=1)
+    adapter_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
     sequence: int = Field(ge=0)
     event: Literal[
         "dispatch",
@@ -88,7 +164,21 @@ class TelemetryEvent(StrictModel):
         "repair",
     ]
     action_id: str | None = None
-    detail: str = ""
+    detail: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def require_action_identity(self) -> TelemetryEvent:
+        if self.event in _ACTION_EVENTS and not (self.action_id and self.action_id.strip()):
+            raise ValueError(f"{self.event} requires nonempty action_id")
+        return self
+
+
+class DispatchHandshake(StrictModel):
+    schema_version: Literal["1"] = "1"
+    trial_id: str
+    adapter_id: str
+    task_id: str
+    action_id: str = Field(min_length=1)
 
 
 class ProcessEvidence(StrictModel):
@@ -101,6 +191,15 @@ class ProcessEvidence(StrictModel):
     stdout_truncated: bool
     stderr_truncated: bool
     launch_error: str | None = None
+
+
+class FaultInjectionEvidence(StrictModel):
+    requested: bool
+    handshake_valid: bool
+    process_interrupted: bool
+    action_id: str | None
+    initial_process: ProcessEvidence | None
+    error: str | None = None
 
 
 class VerifierEvidence(StrictModel):
@@ -121,6 +220,12 @@ class TrialResult(StrictModel):
     trial_id: str
     task_id: str
     adapter_id: str
+    comparison_mode: ComparisonMode
+    model_role_map: dict[str, ModelRoute]
+    allowed_model_pool: list[str]
+    budget: EvaluationBudget
+    tuning_budget_hours: float
+    config_digest: str
     success: bool
     classification: Literal[
         "success",
@@ -143,6 +248,8 @@ class TrialResult(StrictModel):
     duplicate_action_ids: list[str]
     lost_committed_work: bool
     crash_recovery: bool
+    crash_chain_error: str | None
+    fault_injection: FaultInjectionEvidence
     scope_violations: list[str]
     infrastructure_error: str | None
     adapter_process: ProcessEvidence
@@ -151,6 +258,8 @@ class TrialResult(StrictModel):
 
 class AggregateMetrics(StrictModel):
     adapter_id: str
+    comparison_mode: ComparisonMode
+    config_digest: str
     trials: int
     successes: int
     median_wall_time_seconds: float
@@ -169,6 +278,7 @@ class AggregateMetrics(StrictModel):
 
 
 class AdapterDelta(StrictModel):
+    comparison_mode: ComparisonMode
     adapter_a: str
     adapter_b: str
     success_delta: int
@@ -179,6 +289,7 @@ class AdapterDelta(StrictModel):
 
 class ComparisonReport(StrictModel):
     schema_version: Literal["1"] = "1"
+    comparison_mode: ComparisonMode
     trials: list[TrialResult]
     aggregates: list[AggregateMetrics]
     deltas: list[AdapterDelta]

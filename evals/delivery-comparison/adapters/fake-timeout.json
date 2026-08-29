@@ -1,16 +1,40 @@
 {
+  "allowed_model_pool": [
+    "offline-fake"
+  ],
   "argv": [
     "{python}",
-    "{harness_root}/fakes/adapter.py",
+    "{protocol_stub}",
     "--mode",
     "timeout",
     "--adapter-id",
     "fake-timeout"
   ],
+  "budget": {
+    "max_cost_usd": 25.0,
+    "max_total_tokens": 200000,
+    "max_wall_seconds": 1800
+  },
+  "calibration_scenario": "timeout",
+  "comparison_mode": "tuned-primary",
+  "config_digest": "86df2242611df43a1bb1b761ab203b11d8207eb100d2e8556b9cb5488fa2b51a",
+  "containment": {
+    "backend": "none",
+    "evidence": "No filesystem containment backend is proven.",
+    "filesystem_isolation": false
+  },
   "description": "Calibration-only timeout fake",
   "environment": {},
   "id": "fake-timeout",
+  "infrastructure_exit_codes": {},
+  "model_role_map": {
+    "calibration": {
+      "model": "offline-fake",
+      "thinking": "off"
+    }
+  },
   "protocol_version": "1",
-  "ready": true,
+  "ready": false,
+  "tuning_budget_hours": 0.0,
   "workflow_requirement": "Calibration fake only; never a live comparison candidate."
 }

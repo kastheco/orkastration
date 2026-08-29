@@ -1,9 +1,45 @@
 {
+  "allowed_model_pool": [
+    "owner-approved-model-pending"
+  ],
   "argv": [],
+  "budget": {
+    "max_cost_usd": 25.0,
+    "max_total_tokens": 200000,
+    "max_wall_seconds": 1800
+  },
+  "calibration_scenario": null,
+  "comparison_mode": "tuned-primary",
+  "config_digest": "593d4f1a84fd0d8bace4a69217611401ff3a301c116ba27843ae8e55aff8d72a",
+  "containment": {
+    "backend": "none",
+    "evidence": "No filesystem containment backend is proven.",
+    "filesystem_isolation": false
+  },
   "description": "Native Pi subagent delivery boundary",
   "environment": {},
   "id": "native-pi",
+  "infrastructure_exit_codes": {},
+  "model_role_map": {
+    "fixer": {
+      "model": "owner-approved-model-pending",
+      "thinking": "high"
+    },
+    "reviewer": {
+      "model": "owner-approved-model-pending",
+      "thinking": "high"
+    },
+    "supervisor": {
+      "model": "owner-approved-model-pending",
+      "thinking": "high"
+    },
+    "worker": {
+      "model": "owner-approved-model-pending",
+      "thinking": "high"
+    }
+  },
   "protocol_version": "1",
   "ready": false,
+  "tuning_budget_hours": 2.0,
   "workflow_requirement": "Must preserve the observed parent→worker→reviewer→repair workflow; an exact owner-approved command is not yet captured."
 }

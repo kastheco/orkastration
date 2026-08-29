@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,13 +19,22 @@ FIXTURES_ROOT = HARNESS_ROOT / "fixtures"
 
 def validate_contracts() -> dict[str, object]:
     tasks = discover_tasks(FIXTURES_ROOT)
-    adapters = [load_adapter(path) for path in sorted(ADAPTERS_ROOT.glob("*.json"))]
+    adapter_paths = sorted(ADAPTERS_ROOT.glob("*.json"))
+    adapters = [load_adapter(path) for path in adapter_paths]
     task_ids = [task.manifest.id for task in tasks]
     if len(task_ids) != len(set(task_ids)):
         raise ValueError("duplicate task IDs")
     adapter_ids = [adapter.id for adapter in adapters]
     if len(adapter_ids) != len(set(adapter_ids)):
         raise ValueError("duplicate adapter IDs")
+    for path, adapter in zip(adapter_paths, adapters, strict=True):
+        raw = json.loads(path.read_text())
+        frozen = {key: value for key, value in raw.items() if key != "config_digest"}
+        digest = hashlib.sha256(
+            json.dumps(frozen, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if digest != adapter.config_digest:
+            raise ValueError(f"config digest mismatch for {adapter.id}")
     for task in tasks:
         if not task.repo_template.is_dir():
             raise ValueError(f"missing repository template for {task.manifest.id}")
@@ -32,13 +42,15 @@ def validate_contracts() -> dict[str, object]:
         hidden_text = (task.root / "hidden_truth" / "truth.json").read_text()
         if hidden_text in public_text:
             raise ValueError(f"hidden truth leaked into manifest for {task.manifest.id}")
-    live = {
-        adapter.id: adapter.ready
-        for adapter in adapters
-        if adapter.id in {"native-pi", "orkastrator"}
+    live_ids = {
+        "native-pi",
+        "orkastrator",
+        "native-pi-matched",
+        "orkastrator-matched",
     }
-    if set(live) != {"native-pi", "orkastrator"}:
-        raise ValueError("native-pi and orkastrator manifests are required")
+    live = {adapter.id: adapter.ready for adapter in adapters if adapter.id in live_ids}
+    if set(live) != live_ids:
+        raise ValueError("primary and matched native-pi/orkastrator manifests are required")
     return {
         "status": "valid",
         "tasks": task_ids,
@@ -54,7 +66,13 @@ def calibrate(output: Path) -> list[TrialResult]:
     cases = [
         ("success", "clean-bugfix", "success"),
         ("success", "hidden-edge", "success"),
-        ("success", "crash-redelivery", "success"),
+        ("crash-redelivery", "crash-redelivery", "success"),
+        ("crash-missing-crash", "crash-redelivery", "agent_failure"),
+        ("crash-missing-redelivery", "crash-redelivery", "agent_failure"),
+        ("crash-wrong-action", "crash-redelivery", "agent_failure"),
+        ("crash-duplicate", "crash-redelivery", "agent_failure"),
+        ("crash-lost-work", "crash-redelivery", "agent_failure"),
+        ("crash-unordered", "crash-redelivery", "agent_failure"),
         ("wrong", "clean-bugfix", "agent_failure"),
         ("scope-escape", "clean-bugfix", "agent_failure"),
         ("timeout", "clean-bugfix", "adapter_timeout"),
@@ -63,6 +81,9 @@ def calibrate(output: Path) -> list[TrialResult]:
         ("duplicate", "clean-bugfix", "agent_failure"),
         ("lost-work", "clean-bugfix", "agent_failure"),
         ("infrastructure-failure", "clean-bugfix", "infrastructure_failure"),
+        ("service-infra-zero", "clean-bugfix", "infrastructure_failure"),
+        ("service-infra-nonzero", "clean-bugfix", "infrastructure_failure"),
+        ("false-infra", "clean-bugfix", "agent_failure"),
         ("loud", "clean-bugfix", "success"),
     ]
     results = []
@@ -75,6 +96,7 @@ def calibrate(output: Path) -> list[TrialResult]:
             output_directory=output / "trials",
             timeout_seconds=0.3 if fake == "timeout" else 10,
             output_limit_bytes=1024,
+            require_ready=False,
         )
         if result.classification != expected:
             raise RuntimeError(
@@ -93,6 +115,11 @@ def _parser() -> argparse.ArgumentParser:
     calibrate_parser.add_argument("--output", type=Path, required=True)
     run_parser = commands.add_parser("run", help="run the live comparison matrix")
     run_parser.add_argument("--allow-live", action="store_true")
+    run_parser.add_argument(
+        "--comparison-mode",
+        choices=("tuned-primary", "matched-role-ablation"),
+        default="tuned-primary",
+    )
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--repeats", type=int, default=3)
     run_parser.add_argument("--timeout-seconds", type=float, default=1800)
@@ -113,9 +140,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.allow_live:
         raise SystemExit("run requires explicit --allow-live")
+    adapter_files = {
+        "tuned-primary": ("native-pi.json", "orkastrator.json"),
+        "matched-role-ablation": ("native-pi-matched.json", "orkastrator-matched.json"),
+    }
     adapters = [
-        load_adapter(ADAPTERS_ROOT / "native-pi.json"),
-        load_adapter(ADAPTERS_ROOT / "orkastrator.json"),
+        load_adapter(ADAPTERS_ROOT / filename)
+        for filename in adapter_files[args.comparison_mode]
     ]
     tasks = discover_tasks(FIXTURES_ROOT)
     try:

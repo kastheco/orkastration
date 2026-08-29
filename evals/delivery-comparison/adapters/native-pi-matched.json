@@ -9,16 +9,16 @@
     "max_wall_seconds": 1800
   },
   "calibration_scenario": null,
-  "comparison_mode": "tuned-primary",
-  "config_digest": "2454631fe803288d64cb83cc5d804ed4deb2f9819d7a87347463708573527000",
+  "comparison_mode": "matched-role-ablation",
+  "config_digest": "d3ce2f3ebc925f170eebf173fe242115e034ceff3506553f39200da3fac746a6",
   "containment": {
     "backend": "none",
     "evidence": "No filesystem containment backend is proven.",
     "filesystem_isolation": false
   },
-  "description": "Pi-native production Orkastrator boundary",
+  "description": "Native Pi subagent delivery boundary (matched-role ablation)",
   "environment": {},
-  "id": "orkastrator",
+  "id": "native-pi-matched",
   "infrastructure_exit_codes": {},
   "model_role_map": {
     "fixer": {
@@ -41,5 +41,5 @@
   "protocol_version": "1",
   "ready": false,
   "tuning_budget_hours": 2.0,
-  "workflow_requirement": "Must invoke production ledger, policy, and Worktrunk adapters; benchmark-only emulation is forbidden and an exact live command is not yet captured."
+  "workflow_requirement": "Must preserve the observed parent→worker→reviewer→repair workflow; an exact owner-approved command is not yet captured. This secondary configuration uses the same frozen role routes as its peer."
 }

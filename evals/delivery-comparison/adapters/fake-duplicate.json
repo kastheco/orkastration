@@ -1,16 +1,40 @@
 {
+  "allowed_model_pool": [
+    "offline-fake"
+  ],
   "argv": [
     "{python}",
-    "{harness_root}/fakes/adapter.py",
+    "{protocol_stub}",
     "--mode",
     "duplicate",
     "--adapter-id",
     "fake-duplicate"
   ],
+  "budget": {
+    "max_cost_usd": 25.0,
+    "max_total_tokens": 200000,
+    "max_wall_seconds": 1800
+  },
+  "calibration_scenario": "duplicate",
+  "comparison_mode": "tuned-primary",
+  "config_digest": "147593880f7afbd27fe086b355d68823ed3f72da3090b21871e1e4c56ca594dc",
+  "containment": {
+    "backend": "none",
+    "evidence": "No filesystem containment backend is proven.",
+    "filesystem_isolation": false
+  },
   "description": "Calibration-only duplicate fake",
   "environment": {},
   "id": "fake-duplicate",
+  "infrastructure_exit_codes": {},
+  "model_role_map": {
+    "calibration": {
+      "model": "offline-fake",
+      "thinking": "off"
+    }
+  },
   "protocol_version": "1",
-  "ready": true,
+  "ready": false,
+  "tuning_budget_hours": 0.0,
   "workflow_requirement": "Calibration fake only; never a live comparison candidate."
 }

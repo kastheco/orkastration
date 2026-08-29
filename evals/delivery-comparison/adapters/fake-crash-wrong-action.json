@@ -6,26 +6,26 @@
     "{python}",
     "{protocol_stub}",
     "--mode",
-    "malformed",
+    "crash-wrong-action",
     "--adapter-id",
-    "fake-malformed"
+    "fake-crash-wrong-action"
   ],
   "budget": {
     "max_cost_usd": 25.0,
     "max_total_tokens": 200000,
     "max_wall_seconds": 1800
   },
-  "calibration_scenario": "malformed",
+  "calibration_scenario": "crash-wrong-action",
   "comparison_mode": "tuned-primary",
-  "config_digest": "1935b0924b1a82e1c07fdd78ee3d69de4a9963a35d087151e4947a5343c39d20",
+  "config_digest": "c20a0ccceb4cca7acd6409e3118f20c4eb586ea36b2aefb4ec372f4d2f2dd3c4",
   "containment": {
     "backend": "none",
-    "evidence": "No filesystem containment backend is proven.",
+    "evidence": "Calibration protocol stub is not eligible for live use.",
     "filesystem_isolation": false
   },
-  "description": "Calibration-only malformed fake",
+  "description": "Calibration-only crash-wrong-action protocol stub",
   "environment": {},
-  "id": "fake-malformed",
+  "id": "fake-crash-wrong-action",
   "infrastructure_exit_codes": {},
   "model_role_map": {
     "calibration": {

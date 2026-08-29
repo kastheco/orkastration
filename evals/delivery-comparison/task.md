@@ -1,23 +1,17 @@
 # Frozen task contract
 
-Each task directory contains a public `manifest.json`, a small `repo/` template, and `hidden_truth/`. The runner copies only the public manifest for adapter use. Hidden verifier source and complete accepted file hashes remain outside the isolated repository and are not included in adapter prompts.
+Each task has a public `manifest.json`, intentionally wrong `repo/` baseline, and separate `hidden_truth/`. Only a copied public manifest is passed to adapters. Hidden verifier source and complete accepted SHA-256 tree are absent from argv, environment, cwd, and public manifest.
 
-| task | single capability | Harness-visible test | hidden evidence |
+| task | capability | dependency-free visible command | hidden evidence |
 |---|---|---|---|
-| `clean-bugfix` | clean bugfix | `python -m unittest discover -v` | repeated mixed whitespace normalization and complete tree hashes |
-| `hidden-edge` | hidden-edge repair | `python -m unittest discover -v` | equality dedupe for unhashable JSON-like values and complete tree hashes |
-| `crash-redelivery` | after-dispatch/before-ack redelivery | `python -m unittest discover -v` | repeated stable action ID applies once, distinct ID applies, and complete tree hashes |
+| `clean-bugfix` | whitespace bugfix | `python -m unittest discover -v` | mixed whitespace normalization and complete tree hashes |
+| `hidden-edge` | equality repair | `python -m unittest discover -v` | nested unhashable JSON-like equality and complete tree hashes |
+| `crash-redelivery` | at-most-once recovery | `python -m unittest discover -v` | repeated stable action applies once, distinct action applies, complete tree, and harness fault evidence |
 
-Every manifest freezes:
+Every baseline visible command discovers exactly one test and fails on the wrong implementation. Accepted calibration state passes. The hidden verifier adds held-out behavior not present in the visible test.
 
-- Harness-visible instruction and setup/test argv;
-- reset strategy (`fresh_copy_and_git_init`);
-- allowed write paths and protected paths;
-- expected final behavior and accepted behaviorally equivalent outcomes;
-- optional fault point.
+Each manifest freezes instruction, setup/test argv, replacement reset strategy, write/protected paths, behavior, accepted-equivalence description, and optional fault point. Current accepted trees use exact bytes to remove subjective scoring; adding an equivalent tree requires an owner-approved fixture revision.
 
-`hidden_truth/truth.json` freezes the independent verifier argv and complete accepted SHA-256 tree. Exact bytes are used in this initial matrix to eliminate subjective review; the manifest still records behaviorally equivalent outcomes so a later owner-approved fixture revision can add multiple accepted hashes without changing the behavioral contract. Current code intentionally supports one frozen accepted tree per task.
+For crash redelivery, repository correctness is necessary but insufficient. The harness must observe a live dispatch handshake, kill that process group, restart recovery, and validate one stable action ID through redelivery, one effect/action, commit, and ack in order. Missing or fabricated crash evidence, missing redelivery, ID changes, duplicate action, lost committed work, and unordered chains all fail.
 
-The clean and hidden-edge tasks permit writing only their implementation module. The crash task permits writing only `worker.py`; `test_worker.py` is protected. Any extra file, changed test, deleted expected file, symlink, or write outside the allowlist fails exact-tree/scope evidence.
-
-The crash task's telemetry must distinguish dispatch, crash, redelivery, action, commit, and acknowledgement. Repeating an `action` ID is a duplicate even if the final behavior happens to pass. A `lost_committed_work` event is a hard failure. Crash recovery is credited only when crash and redelivery are observed, the final trial succeeds, and neither duplicate nor lost-work evidence exists.
+Calibration accepted source lives in harness-side control, not in the protocol-stub process. This supports scoring calibration without placing accepted implementations in trial invocation material. It is not represented as production-agent behavior and cannot make a live adapter ready.

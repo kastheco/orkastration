@@ -16,6 +16,10 @@ def _median(values: list[int | float]) -> float:
 
 def build_report(trials: list[TrialResult]) -> ComparisonReport:
     ordered = sorted(trials, key=lambda trial: trial.trial_id)
+    modes = {trial.comparison_mode for trial in ordered}
+    if len(modes) != 1:
+        raise ValueError("one report cannot mix comparison modes")
+    comparison_mode = next(iter(modes))
     grouped: dict[str, list[TrialResult]] = defaultdict(list)
     for trial in ordered:
         grouped[trial.adapter_id].append(trial)
@@ -24,6 +28,8 @@ def build_report(trials: list[TrialResult]) -> ComparisonReport:
         aggregates.append(
             AggregateMetrics(
                 adapter_id=adapter_id,
+                comparison_mode=comparison_mode,
+                config_digest=rows[0].config_digest,
                 trials=len(rows),
                 successes=sum(row.success for row in rows),
                 median_wall_time_seconds=_median([row.wall_time_seconds for row in rows]),
@@ -48,6 +54,7 @@ def build_report(trials: list[TrialResult]) -> ComparisonReport:
         first, second = aggregates
         deltas.append(
             AdapterDelta(
+                comparison_mode=comparison_mode,
                 adapter_a=first.adapter_id,
                 adapter_b=second.adapter_id,
                 success_delta=first.successes - second.successes,
@@ -62,7 +69,12 @@ def build_report(trials: list[TrialResult]) -> ComparisonReport:
                 ),
             )
         )
-    return ComparisonReport(trials=ordered, aggregates=aggregates, deltas=deltas)
+    return ComparisonReport(
+        comparison_mode=comparison_mode,
+        trials=ordered,
+        aggregates=aggregates,
+        deltas=deltas,
+    )
 
 
 def write_report(report: ComparisonReport, output: Path) -> None:
@@ -70,7 +82,14 @@ def write_report(report: ComparisonReport, output: Path) -> None:
     (output / "summary.json").write_text(
         json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
     )
-    lines = ["# Delivery comparison", "", "No weighted score is computed.", ""]
+    lines = [
+        "# Delivery comparison",
+        "",
+        f"Comparison mode: `{report.comparison_mode}`.",
+        "",
+        "No weighted score is computed.",
+        "",
+    ]
     lines.extend(
         [
             "| adapter | successes/trials | median wall (s) | median supervisor turns | "

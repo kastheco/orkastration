@@ -1,37 +1,43 @@
 # Harness contract
 
-## Adapter boundary
+## Adapter invocation and containment
 
-An adapter is launched as an argv array with no shell. The runner appends:
+Adapters are launched as argv arrays without a shell. The runner appends absolute isolated repo, copied public manifest, output bundle, trial ID, optional fault point, and crash delivery phase arguments. Processes start in detached process groups with closed stdin, bounded stdout/stderr, hard timeout, group kill, and leader reap.
+
+A live-ready manifest must declare `external-verified` filesystem containment, `filesystem_isolation=true`, and bounded evidence. No checked-in live manifest does so. The harness does not implement or claim an OS sandbox today, and all live manifests remain unready. Calibration protocol stubs are non-live, copied alone into the trial root, and have no accepted implementations; accepted calibration mutations stay in harness-side control and their path/content is absent from adapter argv, environment, cwd, and public manifest.
+
+## Frozen configuration contract
+
+Every manifest records:
+
+- comparison mode (`tuned-primary`, `matched-role-ablation`, or diagnostic);
+- role→model map and thinking level (`off`, `low`, `medium`, `high`);
+- allowed model pool;
+- total token, USD cost, and wall-clock ceilings;
+- equal pre-evaluation tuning budget;
+- SHA-256 digest over the manifest configuration;
+- containment capability and evidence.
+
+The runner requires peers to share mode, model pool, resource budget, and tuning budget. Their tuned primary role maps may differ. Reports retain the mode, routes, pool, budget, and digest for every trial and aggregate.
+
+## Exact result and telemetry protocol
+
+`result.json` and `events.jsonl` use schema version `1` and reject unknown fields. Every telemetry event carries exact trial, adapter, and task identity. Sequence numbers must be contiguous and monotonic from the required phase start. Dispatch, action/effect, crash, redelivery, commit, and acknowledgement events require a nonempty action ID. Missing, extra, or mismatched identities; missing/duplicate sequences; or absent action IDs are protocol failures. Missing IDs are never discarded from duplicate analysis because schema validation fails first.
+
+Adapter infrastructure reporting is closed and bounded. `infrastructure.code` is one of service unavailable, rate limited, authentication unavailable, quota exhausted, containment failure, or worktree failure; evidence is nonempty and at most 500 characters. It is classified as infrastructure only when process stdout/stderr contains the exact marker `ORK_EVAL_INFRA:<code>` **and** the independently observed exit code is in that adapter configuration's frozen per-code allowlist. All three facts must agree. Allowlists may explicitly cover zero or nonzero exits. Free-text summaries and uncorroborated structured claims cannot erase candidate failures. Runner launch and verifier launch failures remain independently observed infrastructure failures.
+
+## Harness-controlled crash/redelivery
+
+For the crash task the runner starts an initial delivery phase. The adapter must publish an exact identity/action handshake while remaining alive. The harness observes that live state, kills the detached process group, and records dispatch and crash events itself. It then launches a separate recovery process. Success requires exactly this ordered action-stable chain:
 
 ```text
---repo ABSOLUTE_ISOLATED_REPO
---task-manifest ABSOLUTE_PUBLIC_MANIFEST
---output-bundle ABSOLUTE_OUTPUT_DIRECTORY
---trial-id STABLE_TRIAL_ID
-[--fault-point after-dispatch-before-ack]
+dispatch → harness kill/crash → restart/redelivery → one external action/effect → one commit → ack
 ```
 
-The process starts in a detached session/process group with stdin closed. Stdout and stderr go to temporary files and only a bounded prefix is retained. A hard timeout terminates, then kills if needed, the whole process group and reaps the leader. Launch failures are infrastructure failures; timeout, nonzero exit, malformed protocol, and wrong final state remain distinct classifications.
+All six events use the same nonempty action ID. Missing crash, missing redelivery, changed ID, duplicate effect, lost work, or unordered events fail even if repository behavior and hashes pass. Crash recovery cannot be self-awarded by writing fabricated crash event names.
 
-Adapters must write `result.json` and `events.jsonl` in the output bundle. Both use schema version `1`, reject unknown fields, and require matching trial/adapter/task identities. Event sequence numbers are contiguous from zero. Action IDs are independently counted to detect duplicates. See `evals.delivery_comparison.models` for the exact types.
+## Correctness and evidence
 
-The adapter receives only the Harness-visible manifest copy, never `hidden_truth/truth.json` or the hidden verifier source. This is prompt separation, not a hostile OS sandbox: an adapter with arbitrary host filesystem access could inspect this checkout. A future live adapter must provide its own filesystem/network sandbox if secrecy against malicious access is required.
+After process completion, the runner compares the complete accepted tree, detects protected/out-of-scope writes, and invokes a hidden behavior verifier. Adapter claims, model metrics, and summaries are diagnostic. A success requires valid protocol, successful independently observed final behavior/tree, no scope violation, no duplicate/lost work, and—on the crash task—the validated chain.
 
-## Native Pi boundary
-
-The native adapter must drive Pi's real parent session and preserve the observed parent → worker → reviewer → repair lifecycle. It must report reviewer and fixer calls and must not replace review with a benchmark script. The exact argv is intentionally absent and readiness is false.
-
-## Orkastrator boundary
-
-The Orkastrator adapter must invoke the production ledger, policy, and Worktrunk integration. It must surface durable dispatch/commit/ack/redelivery evidence from production paths. Benchmark-only emulation is prohibited. The exact argv is intentionally absent and readiness is false.
-
-## Scoring and evidence
-
-After an adapter exits, the runner snapshots all non-VCS files, compares complete expected hashes, detects writes outside allowed paths and changes to protected paths, then runs the hidden verifier. Adapter status and self-reported metrics do not decide success. A passing trial requires valid protocol, a successful process, exact accepted tree, passing behavior, no scope violation, no duplicate action, and no lost committed work.
-
-Reports contain per-trial evidence and unweighted aggregates: success, wall time, calls, tokens, cost, supervisor turns, human interruptions, reviewer/fixer calls, duplicates, lost work, crash recovery, scope violations, and infrastructure errors. Pairwise deltas are descriptive; no vanity score exists.
-
-## Calibration fakes
-
-Checked-in fakes cover success, wrong result, protected-path escape, timeout (including a child process), crash/redelivery telemetry, malformed bundles, duplicate actions, lost committed work, launch infrastructure failure, and oversized output. `calibrate` asserts expected classifications and never selects a live adapter.
+Calibration covers correct/wrong trees, protected escape, timeout/process-group kill, real harness fault injection/restart, six invalid crash chains, malformed protocol, duplicate/lost actions, launch infrastructure, corroborated service infrastructure at zero and nonzero exits, false infrastructure claims, and bounded output. No live adapter or model is selected.

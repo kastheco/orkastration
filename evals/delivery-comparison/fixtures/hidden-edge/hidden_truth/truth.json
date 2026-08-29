@@ -1,8 +1,12 @@
 {
-  "verifier_argv": ["python", "verifier.py", "{repo}"],
   "expected_files_sha256": {
     "collections_ext.py": "73510a269c991cd1e181ed546e71a736f9c7df06b4334fc24f41c7f748e72be1",
-    "test_collections_ext.py": "45393d27f03f0575fa1531a87fc2a1275b4779b26f2e439c271b0ef9547542e8"
+    "test_collections_ext.py": "acebb422b683979b84ae61b5a0c64c76836e889ce6bbbf20de0579d322f753ae"
   },
-  "reject_unexpected_paths": true
+  "reject_unexpected_paths": true,
+  "verifier_argv": [
+    "python",
+    "verifier.py",
+    "{repo}"
+  ]
 }
