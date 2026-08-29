@@ -3,6 +3,7 @@ import {
   chmodSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -48,6 +49,23 @@ interface Call {
 
 function exited(stdout: string, exitCode = 0, stderr = ""): Result {
   return { type: "exit", exitCode, stdout, stderr };
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForExit(pid: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!isAlive(pid)) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  return !isAlive(pid);
 }
 
 function fixture(): {
@@ -675,9 +693,10 @@ test("fresh post-create list returns a stronger identity mismatch over original 
 test("repository/worktree equality and ancestor overlap fail closed in every direction", async () => {
   const value = fixture();
   try {
-    const descendant = join(value.repository, "nested-worktree");
-    mkdirSync(descendant);
-    for (const path of [value.repository, value.temporary, descendant]) {
+    const descendants = ["nested-worktree", "..owned", "..."]
+      .map((name) => join(value.repository, name));
+    descendants.forEach((path) => mkdirSync(path));
+    for (const path of [value.repository, value.temporary, ...descendants]) {
       const testModule = harness([exited(schema(value.repository, path))]);
       assert.deepEqual(
         await testModule.module.ensureOwnedWorktree({ repositoryRoot: value.repository, runId: RUN_ID }),
@@ -792,11 +811,21 @@ test("production runner kills hangs and independently caps stdout and stderr", a
   try {
     for (const [name, source, expectedStream] of [
       ["hang", "setInterval(() => {}, 1000);", null],
-      ["stdout", "process.stdout.write('x'.repeat(4096));", "stdout"],
-      ["stderr", "process.stderr.write('x'.repeat(4096));", "stderr"],
+      ["stdout", "process.stdout.write('x'.repeat(4096)); setInterval(() => {}, 1000);", "stdout"],
+      ["stderr", "process.stderr.write('x'.repeat(4096)); setInterval(() => {}, 1000);", "stderr"],
     ] as const) {
       const executable = join(value.temporary, `helper-${name}`);
-      writeFileSync(executable, `#!/usr/bin/env node\n${source}\n`);
+      const descendantPidFile = join(value.temporary, `descendant-${name}.pid`);
+      writeFileSync(executable, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+  stdio: ["ignore", "inherit", "inherit"],
+});
+writeFileSync(${JSON.stringify(descendantPidFile)}, String(descendant.pid));
+descendant.unref();
+${source}
+`);
       chmodSync(executable, 0o700);
       const module = createWorktrunkForTesting({
         executable,
@@ -813,6 +842,8 @@ test("production runner kills hangs and independently caps stdout and stderr", a
         assert.ok(Buffer.byteLength(result.stdout) <= 1024);
         assert.ok(Buffer.byteLength(result.stderr) <= 256);
       }
+      const descendantPid = Number.parseInt(readFileSync(descendantPidFile, "utf8"), 10);
+      assert.equal(await waitForExit(descendantPid), true, `descendant ${descendantPid} survived ${name}`);
     }
   } finally {
     value.cleanup();

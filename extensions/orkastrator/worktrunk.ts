@@ -151,6 +151,7 @@ function boundedText(value: string, maximumBytes: number): string {
 
 const runCommand: CommandRunner = (request) => new Promise((complete) => {
   const child = spawn(request.executable, [...request.argv], {
+    detached: true,
     shell: false,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -161,13 +162,47 @@ const runCommand: CommandRunner = (request) => new Promise((complete) => {
   let settled = false;
   let forced: { type: "timeout" } | { type: "output_limit"; stream: StreamName } | undefined;
   let timer: NodeJS.Timeout | undefined;
+  let settlementTimer: NodeJS.Timeout | undefined;
 
   const captured = (chunks: Buffer[]): string => Buffer.concat(chunks).toString("utf8");
   const finish = (result: CommandExecution): void => {
     if (settled) return;
     settled = true;
     if (timer !== undefined) clearTimeout(timer);
+    if (settlementTimer !== undefined) clearTimeout(settlementTimer);
     complete(result);
+  };
+  const forcedResult = (): CommandExecution => {
+    const output = { stdout: captured(stdout), stderr: captured(stderr) };
+    return forced?.type === "output_limit"
+      ? { type: "output_limit", stream: forced.stream, ...output }
+      : { type: "timeout", ...output };
+  };
+  const killProcessGroup = (): void => {
+    const pid = child.pid;
+    if (pid !== undefined && pid >= 2) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // The group may have exited between observation and signal delivery.
+      }
+    }
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Spawn failure or an already-absent direct child is safe to ignore.
+    }
+    settlementTimer = setTimeout(() => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish(forcedResult());
+    }, 500);
+    settlementTimer.unref();
+  };
+  const force = (reason: NonNullable<typeof forced>): void => {
+    if (forced !== undefined || settled) return;
+    forced = reason;
+    killProcessGroup();
   };
   const capture = (stream: StreamName, chunk: Buffer): void => {
     const maximum = stream === "stdout" ? request.maxStdoutBytes : request.maxStderrBytes;
@@ -177,21 +212,21 @@ const runCommand: CommandRunner = (request) => new Promise((complete) => {
     if (available > 0) chunks.push(chunk.subarray(0, available));
     if (stream === "stdout") stdoutBytes += Math.min(chunk.byteLength, available);
     else stderrBytes += Math.min(chunk.byteLength, available);
-    if (chunk.byteLength > available && forced === undefined) {
-      forced = { type: "output_limit", stream };
-      child.kill("SIGKILL");
-    }
+    if (chunk.byteLength > available) force({ type: "output_limit", stream });
   };
 
   child.stdout.on("data", (chunk: Buffer) => capture("stdout", chunk));
   child.stderr.on("data", (chunk: Buffer) => capture("stderr", chunk));
-  child.on("error", (error) => finish({
-    type: "exit",
-    exitCode: null,
-    stdout: captured(stdout),
-    stderr: captured(stderr),
-    error: error.message,
-  }));
+  child.on("error", (error) => {
+    if (forced !== undefined) finish(forcedResult());
+    else finish({
+      type: "exit",
+      exitCode: null,
+      stdout: captured(stdout),
+      stderr: captured(stderr),
+      error: error.message,
+    });
+  });
   child.on("close", (code) => {
     const output = { stdout: captured(stdout), stderr: captured(stderr) };
     if (forced?.type === "timeout") finish({ type: "timeout", ...output });
@@ -199,11 +234,7 @@ const runCommand: CommandRunner = (request) => new Promise((complete) => {
       finish({ type: "output_limit", stream: forced.stream, ...output });
     } else finish({ type: "exit", exitCode: code, ...output });
   });
-  timer = setTimeout(() => {
-    if (settled || forced !== undefined) return;
-    forced = { type: "timeout" };
-    child.kill("SIGKILL");
-  }, request.timeoutMs);
+  timer = setTimeout(() => force({ type: "timeout" }), request.timeoutMs);
   timer.unref();
 });
 

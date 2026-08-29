@@ -20,6 +20,7 @@ import {
   ActiveRunError,
   LedgerCorruptionError,
   LedgerError,
+  ownershipFingerprint,
   RunLedger,
 } from "../ledger/file-ledger.ts";
 import type { CurrentWorktreeIdentity, RunRecord } from "../ledger/types.ts";
@@ -209,6 +210,23 @@ test("handcrafted old worktree identity remains loadable and cleanable but canno
       () => reloaded.recordOwnership(run.runId, { ownedProcesses: [], worktrees: [legacy] }),
       /current worktree identity is incomplete/u,
     );
+    const pendingReload = reloaded.prepareReload(
+      run.runId,
+      run.supervisorSessionId,
+      run.repositoryRoot,
+      run.hostPid,
+    );
+    assert.throws(
+      () => reloaded.rebind(
+        run.runId,
+        run.supervisorSessionId,
+        run.repositoryRoot,
+        pendingReload.sequence,
+        ownershipFingerprint(pendingReload),
+        run.hostPid,
+      ),
+      /legacy worktree identity that cannot authorize rebind/u,
+    );
     assert.deepEqual(
       reloaded.recordOwnership(run.runId, { ownedProcesses: [], worktrees: [] }).worktrees,
       [],
@@ -223,9 +241,10 @@ test("persisted validation rejects repository/worktree overlap in all directions
   try {
     const run = create(value.ledger, value.repository);
     const normal = worktreeIdentity(run, join(value.temporary, "owned-worktree"));
-    const descendant = join(value.repository, "nested");
-    mkdirSync(descendant);
-    for (const path of [run.repositoryRoot, value.temporary, descendant]) {
+    const descendants = ["nested", "..owned", "..."]
+      .map((name) => join(value.repository, name));
+    descendants.forEach((path) => mkdirSync(path));
+    for (const path of [run.repositoryRoot, value.temporary, ...descendants]) {
       const facts = statSync(path);
       assert.throws(
         () => value.ledger.recordOwnership(run.runId, {

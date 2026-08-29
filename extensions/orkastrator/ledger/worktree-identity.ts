@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type {
   CurrentWorktreeIdentity,
@@ -55,7 +55,9 @@ export function pathsOverlap(left: string, right: string): boolean {
   if (!isAbsolute(left) || !isAbsolute(right)) return true;
   const leftToRight = relative(left, right);
   const rightToLeft = relative(right, left);
-  const isWithin = (value: string): boolean => value === "" || (!value.startsWith("..") && !isAbsolute(value));
+  const isOutside = (value: string): boolean =>
+    value === ".." || value.startsWith(`..${sep}`) || isAbsolute(value);
+  const isWithin = (value: string): boolean => !isOutside(value);
   return isWithin(leftToRight) || isWithin(rightToLeft);
 }
 

@@ -693,6 +693,11 @@ export class RunLedger {
   ): RunRecord {
     const current = this.loadRun(runId).record;
     this.#assertOwnedBy(current, sessionId);
+    if (current.worktrees.some((identity) =>
+      !isCurrentWorktreeIdentity(identity, current.runId, current.repositoryRoot)
+    )) {
+      throw new LedgerError(`run ${runId} has legacy worktree identity that cannot authorize rebind`);
+    }
     const marker = current.reload;
     if (
       current.sequence !== expectedSequence ||
