@@ -61,6 +61,20 @@ function create(ledger: RunLedger, repository: string, session = "session-1") {
   });
 }
 
+function rewriteEvents(
+  ledger: RunLedger,
+  runId: string,
+  mutate: (events: Array<Record<string, unknown>>) => void,
+): void {
+  const path = join(ledger.runDirectory(runId), "events.jsonl");
+  const events = readFileSync(path, "utf8")
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  mutate(events);
+  writeFileSync(path, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+}
+
 test("run creation snapshots policy and commits the event before its state projection", () => {
   const value = fixture();
   try {
@@ -143,7 +157,7 @@ test("owned process journal binds and clears one attempt idempotently", () => {
   }
 });
 
-test("worker events survive reload with ledger-authoritative sequence and unchanged run state", () => {
+test("worker events and duplicate observations remain append-only across reload", () => {
   const value = fixture();
   try {
     const run = create(value.ledger, value.repository);
@@ -158,19 +172,24 @@ test("worker events survive reload with ledger-authoritative sequence and unchan
     });
     const accepted = value.ledger.appendWorkerEvent(run.runId, { type: "prompt_accepted" });
     const settled = value.ledger.appendWorkerEvent(run.runId, { type: "settled" });
+    const duplicate = value.ledger.appendWorkerEvent(run.runId, { type: "settled" });
 
     assert.deepEqual(
-      [started, accepted, settled].map((record) => ({ sequence: record.sequence, state: record.state })),
+      [started, accepted, settled, duplicate].map((record) => ({
+        sequence: record.sequence,
+        state: record.state,
+      })),
       [
         { sequence: 2, state: "submitted" },
         { sequence: 3, state: "submitted" },
         { sequence: 4, state: "submitted" },
+        { sequence: 5, state: "submitted" },
       ],
     );
 
     const reloaded = new RunLedger({ root: value.ledger.root });
     const workerEvents = reloaded.events(run.runId).filter((event) => event.type === "worker_event");
-    assert.deepEqual(workerEvents.map((event) => event.sequence), [2, 3, 4]);
+    assert.deepEqual(workerEvents.map((event) => event.sequence), [2, 3, 4, 5]);
     assert.deepEqual(workerEvents.map((event) => event.evidence.event), [
       {
         type: "started",
@@ -183,6 +202,7 @@ test("worker events survive reload with ledger-authoritative sequence and unchan
       },
       { type: "prompt_accepted" },
       { type: "settled" },
+      { type: "settled" },
     ]);
     assert.equal(reloaded.loadRun(run.runId).record.state, "submitted");
     assert.throws(
@@ -191,6 +211,211 @@ test("worker events survive reload with ledger-authoritative sequence and unchan
     );
   } finally {
     value.cleanup();
+  }
+});
+
+for (const [name, corrupt] of [
+  [
+    "malformed worker payload",
+    (event: Record<string, unknown>) => {
+      (event.evidence as Record<string, unknown>).event = { type: "unknown" };
+    },
+  ],
+  [
+    "oversized worker payload",
+    (event: Record<string, unknown>) => {
+      (event.evidence as Record<string, unknown>).event = {
+        type: "started",
+        identity: {
+          pid: 6001,
+          processGroupId: 6001,
+          sessionFile: `/${"x".repeat(32 * 1024)}`,
+          attemptToken: "attempt-1",
+        },
+      };
+    },
+  ],
+  [
+    "extra worker evidence key",
+    (event: Record<string, unknown>) => {
+      (event.evidence as Record<string, unknown>).unexpected = true;
+    },
+  ],
+  [
+    "wrong worker rule",
+    (event: Record<string, unknown>) => {
+      event.ruleId = "worker.unexpected";
+    },
+  ],
+  [
+    "wrong worker actor",
+    (event: Record<string, unknown>) => {
+      event.actor = "extension";
+    },
+  ],
+  [
+    "extra worker envelope key",
+    (event: Record<string, unknown>) => {
+      event.unexpected = true;
+    },
+  ],
+] as const) {
+  test(`reload rejects ${name}`, () => {
+    const value = fixture();
+    try {
+      const run = create(value.ledger, value.repository);
+      value.ledger.appendWorkerEvent(run.runId, { type: "settled" });
+      rewriteEvents(value.ledger, run.runId, (events) => corrupt(events.at(-1)!));
+
+      assert.throws(
+        () => new RunLedger({ root: value.ledger.root }).loadRun(run.runId),
+        (error: unknown) => error instanceof LedgerCorruptionError,
+      );
+    } finally {
+      value.cleanup();
+    }
+  });
+}
+
+for (const [name, corrupt] of [
+  [
+    "missing clear identity",
+    (events: Array<Record<string, unknown>>) => {
+      delete (events.at(-1)!.evidence as Record<string, unknown>).identity;
+    },
+  ],
+  [
+    "false process-group absence",
+    (events: Array<Record<string, unknown>>) => {
+      (events.at(-1)!.evidence as Record<string, unknown>).processGroupAbsent = false;
+    },
+  ],
+  [
+    "invalid clear exit code",
+    (events: Array<Record<string, unknown>>) => {
+      (events.at(-1)!.evidence as Record<string, unknown>).exitCode = -1;
+    },
+  ],
+  [
+    "invalid clear exit signal",
+    (events: Array<Record<string, unknown>>) => {
+      (events.at(-1)!.evidence as Record<string, unknown>).exitSignal = "SIG_NOT_REAL";
+    },
+  ],
+  [
+    "clear identity absent from the preceding projection",
+    (events: Array<Record<string, unknown>>) => {
+      const clearEvidence = events.at(-1)!.evidence as Record<string, unknown>;
+      clearEvidence.identity = {
+        ...(clearEvidence.identity as Record<string, unknown>),
+        pid: 7001,
+        processGroupId: 7001,
+      };
+    },
+  ],
+  [
+    "wrong process clear rule",
+    (events: Array<Record<string, unknown>>) => {
+      events.at(-1)!.ruleId = "worker.unexpected";
+    },
+  ],
+  [
+    "wrong process clear actor",
+    (events: Array<Record<string, unknown>>) => {
+      events.at(-1)!.actor = "worker";
+    },
+  ],
+  [
+    "extra process clear evidence key",
+    (events: Array<Record<string, unknown>>) => {
+      (events.at(-1)!.evidence as Record<string, unknown>).unexpected = true;
+    },
+  ],
+] as const) {
+  test(`reload rejects ${name}`, () => {
+    const value = fixture();
+    try {
+      const run = create(value.ledger, value.repository);
+      const identity = {
+        pid: 6001,
+        processGroupId: 6001,
+        sessionFile: join(value.temporary, "worker.jsonl"),
+        attemptToken: "attempt-1",
+      };
+      value.ledger.journalOwnedProcess(run.runId, identity.attemptToken, identity);
+      value.ledger.journalOwnedProcess(
+        run.runId,
+        identity.attemptToken,
+        undefined,
+        { exitCode: 143, exitSignal: null },
+      );
+      rewriteEvents(value.ledger, run.runId, corrupt);
+
+      assert.throws(
+        () => new RunLedger({ root: value.ledger.root }).loadRun(run.runId),
+        (error: unknown) => error instanceof LedgerCorruptionError,
+      );
+    } finally {
+      value.cleanup();
+    }
+  });
+}
+
+test("worker events cannot append after a terminal transition", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const terminal = value.ledger.transition(run.runId, {
+      state: "interrupted",
+      reason: "test_terminal",
+      ruleId: "test.terminal",
+      actor: "extension",
+    });
+    assert.throws(
+      () => value.ledger.appendWorkerEvent(run.runId, { type: "settled" }),
+      /terminal run .* cannot record worker events/u,
+    );
+    assert.equal(value.ledger.loadRun(run.runId).record.sequence, terminal.sequence);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("an appended worker event repairs an older state projection after its write fails", () => {
+  const temporary = mkdtempSync(join(tmpdir(), "orkastrator-worker-repair-"));
+  const repository = join(temporary, "repository");
+  const root = join(temporary, "state");
+  const runId = "00000000-0000-4000-8000-000000000001";
+  mkdirSync(repository);
+  let value = 0;
+  let collision = "";
+  const ledger = new RunLedger({
+    root,
+    now: () => new Date("2026-08-28T22:00:00.000Z"),
+    randomId: () => {
+      value += 1;
+      const id = `00000000-0000-4000-8000-${value.toString(16).padStart(12, "0")}`;
+      if (value === 6) {
+        collision = join(root, runId, `state.json.${id}.tmp`);
+        mkdirSync(collision);
+      }
+      return id;
+    },
+  });
+  try {
+    const run = create(ledger, repository);
+    assert.throws(() => ledger.appendWorkerEvent(run.runId, { type: "settled" }));
+    rmSync(collision, { recursive: true, force: true });
+
+    const repaired = ledger.loadRun(run.runId).record;
+    assert.equal(repaired.sequence, 2);
+    assert.equal(ledger.events(run.runId).at(-1)?.type, "worker_event");
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(ledger.runDirectory(run.runId), "state.json"), "utf8")),
+      repaired,
+    );
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
   }
 });
 

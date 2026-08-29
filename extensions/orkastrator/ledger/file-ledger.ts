@@ -19,6 +19,7 @@ import {
 import { constants as osConstants, homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   type AwaitOwnerInput,
@@ -44,6 +45,18 @@ const MAX_OBJECTIVE_CHARS = 8_000;
 const MAX_WORKER_EVENT_BYTES = 32 * 1024;
 const MAX_WORKER_EVENT_TEXT_CHARS = 4_000;
 const EXIT_SIGNAL_SET = new Set<string>(Object.keys(osConstants.signals));
+const STATELESS_EVENT_KEYS = [
+  "schemaVersion",
+  "eventId",
+  "runId",
+  "sequence",
+  "timestamp",
+  "type",
+  "ruleId",
+  "actor",
+  "evidence",
+  "projection",
+];
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const RUN_STATE_SET = new Set<string>(RUN_STATES);
 const RUN_ACTOR_SET = new Set<string>([
@@ -651,11 +664,7 @@ export class RunLedger {
   }
 
   #assertExitEvidence(evidence: OwnedProcessExitEvidence): void {
-    if (
-      (evidence.exitCode !== null &&
-        (!Number.isInteger(evidence.exitCode) || evidence.exitCode < 0)) ||
-      !isExitSignal(evidence.exitSignal)
-    ) {
+    if (!isOwnedProcessExitEvidence(evidence)) {
       throw new LedgerError("owned process exit evidence is invalid");
     }
   }
@@ -730,7 +739,7 @@ export class RunLedger {
       if (line.length === 0) continue;
       try {
         const event = JSON.parse(line) as unknown;
-        this.#assertEvent(event, index + 1);
+        this.#assertEvent(event, index + 1, events.at(-1)?.projection);
         if (event.runId !== expectedRunId) {
           throw new LedgerCorruptionError(`event ${index + 1} belongs to another run`);
         }
@@ -902,7 +911,11 @@ export class RunLedger {
     }
   }
 
-  #assertEvent(value: unknown, line: number): asserts value is RunEvent {
+  #assertEvent(
+    value: unknown,
+    line: number,
+    precedingProjection?: RunRecord,
+  ): asserts value is RunEvent {
     if (!isObject(value)) throw new LedgerCorruptionError(`event ${line} is not an object`);
     if (
       value.schemaVersion !== 1 ||
@@ -934,6 +947,78 @@ export class RunLedger {
       value.projection.updatedAt !== value.timestamp
     ) {
       throw new LedgerCorruptionError(`event ${line} projection metadata does not match`);
+    }
+    if (value.type === "worker_event") {
+      if (
+        value.ruleId !== "worker.event_observed" ||
+        value.actor !== "worker" ||
+        !hasExactKeys(value, STATELESS_EVENT_KEYS) ||
+        !hasExactKeys(value.evidence, ["event"])
+      ) {
+        throw new LedgerCorruptionError(`event ${line} has an invalid worker event envelope`);
+      }
+      assertWorkerEvent(value.evidence.event);
+      const serialized = JSON.stringify(value.evidence.event);
+      if (Buffer.byteLength(serialized, "utf8") > MAX_WORKER_EVENT_BYTES) {
+        throw new LedgerCorruptionError(`event ${line} worker event exceeds the byte limit`);
+      }
+      if (
+        precedingProjection === undefined ||
+        !isDeepStrictEqual(value.projection, {
+          ...precedingProjection,
+          sequence: value.sequence,
+          updatedAt: value.timestamp,
+        })
+      ) {
+        throw new LedgerCorruptionError(`event ${line} worker event changed its run projection`);
+      }
+    }
+    if (value.type === "owned_process_cleared") {
+      const hasBaseEvidence = hasExactKeys(value.evidence, [
+        "identity",
+        "processGroupAbsent",
+      ]);
+      const hasExitEvidence = hasExactKeys(value.evidence, [
+        "identity",
+        "processGroupAbsent",
+        "exitCode",
+        "exitSignal",
+      ]);
+      if (
+        value.ruleId !== "worker.process_ownership" ||
+        value.actor !== "extension" ||
+        !hasExactKeys(value, STATELESS_EVENT_KEYS) ||
+        (!hasBaseEvidence && !hasExitEvidence) ||
+        !isExactOwnedProcessIdentity(value.evidence.identity) ||
+        value.evidence.processGroupAbsent !== true ||
+        (hasExitEvidence &&
+          !isOwnedProcessExitEvidence({
+            exitCode: value.evidence.exitCode,
+            exitSignal: value.evidence.exitSignal,
+          }))
+      ) {
+        throw new LedgerCorruptionError(`event ${line} has invalid process clear evidence`);
+      }
+      const identity = value.evidence.identity;
+      const existed = precedingProjection?.ownedProcesses.some((candidate) =>
+        sameOwnedProcessIdentity(candidate, identity)
+      ) ?? false;
+      const remains = value.projection.ownedProcesses.some(
+        (candidate) => candidate.attemptToken === identity.attemptToken,
+      );
+      if (!existed || remains || precedingProjection === undefined) {
+        throw new LedgerCorruptionError(`event ${line} process clear projection is inconsistent`);
+      }
+      if (!isDeepStrictEqual(value.projection, {
+        ...precedingProjection,
+        sequence: value.sequence,
+        updatedAt: value.timestamp,
+        ownedProcesses: precedingProjection.ownedProcesses.filter(
+          (candidate) => candidate.attemptToken !== identity.attemptToken,
+        ),
+      })) {
+        throw new LedgerCorruptionError(`event ${line} process clear changed unrelated run state`);
+      }
     }
   }
 
@@ -1011,7 +1096,13 @@ function sameOwnedProcessIdentity(
   );
 }
 
-function isOwnedProcessIdentity(value: unknown): boolean {
+function isExactOwnedProcessIdentity(value: unknown): value is OwnedProcessIdentity {
+  return isObject(value) &&
+    hasExactKeys(value, ["pid", "processGroupId", "sessionFile", "attemptToken"]) &&
+    isOwnedProcessIdentity(value);
+}
+
+function isOwnedProcessIdentity(value: unknown): value is OwnedProcessIdentity {
   return (
     isObject(value) &&
     typeof value.pid === "number" &&
@@ -1162,6 +1253,16 @@ function hasExactKeys(value: Record<string, unknown>, expected: string[]): boole
   const expectedKeys = [...expected].sort();
   return keys.length === expectedKeys.length &&
     keys.every((key, index) => key === expectedKeys[index]);
+}
+
+function isOwnedProcessExitEvidence(value: unknown): value is OwnedProcessExitEvidence {
+  return isObject(value) &&
+    hasExactKeys(value, ["exitCode", "exitSignal"]) &&
+    (value.exitCode === null ||
+      (typeof value.exitCode === "number" &&
+        Number.isInteger(value.exitCode) &&
+        value.exitCode >= 0)) &&
+    isExitSignal(value.exitSignal);
 }
 
 function isExitSignal(value: unknown): value is NodeJS.Signals | null {
