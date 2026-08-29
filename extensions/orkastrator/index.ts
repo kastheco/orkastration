@@ -66,7 +66,12 @@ export function installOrkastrator(
   const runAttempt = dependencies.runAttempt ?? runOwnedPiAttempt;
   let claimedRunId: string | undefined;
   let activeAttempt:
-    | { runId: string; controller: AbortController; promise: Promise<PiAttemptResult> }
+    | {
+        runId: string;
+        controller: AbortController;
+        promise: Promise<PiAttemptResult>;
+        cleanup: { reapAndOwnershipClearProven: boolean };
+      }
     | undefined;
 
   const requireTrust = (ctx: LifecycleContext): void => {
@@ -153,13 +158,22 @@ export function installOrkastrator(
 
   pi.on("session_shutdown", async (event, ctx) => {
     if (!ctx.isProjectTrusted()) return;
+    let postCleanupAttemptError: unknown;
     if (activeAttempt !== undefined) {
-      activeAttempt.controller.abort();
-      await activeAttempt.promise;
-      activeAttempt = undefined;
+      const attempt = activeAttempt;
+      attempt.controller.abort();
+      try {
+        await attempt.promise;
+      } catch (error) {
+        if (!attempt.cleanup.reapAndOwnershipClearProven) throw error;
+        postCleanupAttemptError = error;
+      } finally {
+        if (activeAttempt === attempt) activeAttempt = undefined;
+      }
     }
     if (claimedRunId === undefined) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
+      if (postCleanupAttemptError !== undefined) throw postCleanupAttemptError;
       return;
     }
     const result = coordinator.sessionShutdown(
@@ -185,6 +199,7 @@ export function installOrkastrator(
       });
     }
     ctx.ui.setStatus(STATUS_KEY, undefined);
+    if (postCleanupAttemptError !== undefined) throw postCleanupAttemptError;
   });
 
   pi.registerCommand("kas", {
@@ -263,6 +278,7 @@ export function installOrkastrator(
       const onToolAbort = (): void => controller.abort();
       signal?.addEventListener("abort", onToolAbort, { once: true });
       if (signal?.aborted) controller.abort();
+      const cleanup = { reapAndOwnershipClearProven: false };
       const promise = runAttempt(
         {
           executable: piExecutable,
@@ -274,6 +290,8 @@ export function installOrkastrator(
           thinking: ctx.thinkingLevel ?? "off",
           journalOwnership: (identity) => {
             ledger.journalOwnedProcess(record.runId, attemptToken, identity ?? undefined);
+            // runOwnedPiAttempt clears only after proving process-group absence.
+            if (identity === null) cleanup.reapAndOwnershipClearProven = true;
           },
           recordEvent: (event) => {
             pi.appendEntry(ENTRY_TYPE, { action: "worker_event", runId: record.runId, event });
@@ -281,7 +299,7 @@ export function installOrkastrator(
         },
         controller.signal,
       );
-      activeAttempt = { runId: record.runId, controller, promise };
+      activeAttempt = { runId: record.runId, controller, promise, cleanup };
       try {
         const attempt = await promise;
         return {

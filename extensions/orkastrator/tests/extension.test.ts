@@ -322,6 +322,64 @@ test("shutdown awaits worker reap and ownership clear before the terminal transi
   }
 });
 
+test("shutdown durably interrupts after post-cleanup telemetry failure", async () => {
+  let ownershipBound = false;
+  const value = fixture({
+    runAttempt: async (spec, signal) => {
+      await spec.journalOwnership({
+        pid: 6002,
+        processGroupId: 6002,
+        sessionFile: join(value.repository, "worker-telemetry.jsonl"),
+        attemptToken: spec.attemptToken,
+      });
+      ownershipBound = true;
+      await new Promise<void>((resolveAbort) => {
+        if (signal.aborted) resolveAbort();
+        else signal.addEventListener("abort", () => resolveAbort(), { once: true });
+      });
+      await spec.journalOwnership(null);
+      ownershipBound = false;
+      throw new Error("exit telemetry failed after cleanup");
+    },
+  });
+  try {
+    const ctx = context(value.repository);
+    const tool = value.api.tools.get("orkastrator_run_create");
+    assert.ok(tool);
+    const execution = tool.execute(
+      "tool-1",
+      { objective: "Interrupt after telemetry failure", policySnapshot: "version: 1\n" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const executionFailure = assert.rejects(execution, /exit telemetry failed after cleanup/u);
+    while (!ownershipBound) {
+      await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+    }
+    const runId = value.ledger.activeRunsForSession("session-1")[0]!.runId;
+    const shutdown = value.api.handlers.get("session_shutdown");
+    assert.ok(shutdown);
+
+    await assert.rejects(
+      async () => shutdown({ reason: "quit" }, ctx),
+      /exit telemetry failed after cleanup/u,
+    );
+    await executionFailure;
+
+    const interrupted = value.ledger.loadRun(runId).record;
+    assert.equal(ownershipBound, false);
+    assert.equal(interrupted.state, "interrupted");
+    assert.equal(interrupted.reason, "session_shutdown:quit");
+    assert.deepEqual(
+      value.ledger.events(runId).slice(-2).map((event) => event.type),
+      ["owned_process_cleared", "run_state_transitioned"],
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
 test("reload rebinds the same session while quit interrupts and preserves the run directory", async () => {
   const value = fixture();
   try {
