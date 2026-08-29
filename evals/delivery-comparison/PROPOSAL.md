@@ -39,7 +39,7 @@ No weighted score is computed.
 
 **No live run is ready or authorized.** The harness-owned containment-launcher allowlist is empty; schema accepts no self-attested containment backend and rejects all `ready=true` manifests. All primary and matched production manifests have `ready=false` and empty argv. Field edits or prose cannot enable execution.
 
-A second blocker is the missing production-independent crash effect/ack contract. Calibration can apply and Git-commit an effect under harness ownership before releasing a protocol stub to ack. A production adapter cannot use that calibration control. Until a harness-owned observer can independently establish the real production effect/commit and post-effect ack, the live crash trial fails closed.
+A second blocker is the missing production-independent crash effect/ack contract. Calibration can apply and Git-commit an effect under harness ownership, then generate an unpredictable release nonce that a later identity-bound ack must echo. The nonce is unavailable before commit, so an ack raced during mutation/commit fails. A production adapter cannot use that calibration control. Until a harness-owned observer can independently establish the real production effect/commit and nonce-bound post-effect ack, the live crash trial fails closed.
 
 Before live readiness, implement and test both a harness-owned filesystem-containment launcher and production-independent effect/ack observation; freeze exact commands/models; re-digest configs; and obtain owner approval. No model/API/network or Harbor execution is claimed.
 

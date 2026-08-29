@@ -4,6 +4,7 @@ import json
 import shutil
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 from pydantic import ValidationError
@@ -23,13 +24,19 @@ from evals.delivery_comparison.fixtures import (
     reset_fixture,
     snapshot_tree,
 )
-from evals.delivery_comparison.models import AdapterManifest, TelemetryEvent, TrialResult
+from evals.delivery_comparison.models import (
+    AdapterManifest,
+    DispatchHandshake,
+    TelemetryEvent,
+    TrialResult,
+)
 from evals.delivery_comparison.process import run_process
 from evals.delivery_comparison.report import build_report, write_report
 from evals.delivery_comparison.runner import (
     ReadinessError,
     _adapter_argv,
     _configuration_digest,
+    _read_handshake,
     load_adapter,
     run_comparison,
     run_trial,
@@ -280,7 +287,7 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
     results = calibrate(tmp_path / "calibration")
     classifications = [result.classification for result in results]
     assert classifications.count("success") == 4
-    assert classifications.count("agent_failure") == 20
+    assert classifications.count("agent_failure") == 21
     assert classifications.count("infrastructure_failure") == 2
     assert classifications.count("adapter_timeout") == 1
     assert classifications.count("adapter_crash") == 2
@@ -303,6 +310,7 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
     assert recovered.external_effect.commit_count == 1
     assert recovered.external_effect.action_id == recovered.fault_injection.action_id
     assert recovered.external_effect.commit_sha
+    assert recovered.external_effect.release_nonce_published
     assert recovered.external_effect.ack_observed
     assert recovered.duplicate_action_ids == []
     assert not recovered.lost_committed_work
@@ -317,6 +325,7 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
         "fake-crash-duplicate-effect": "exactly one harness-owned effect",
         "fake-crash-wrong-effect-action": "effect action_id changed",
         "fake-crash-ack-before-effect": "ack was published before",
+        "fake-crash-ack-during-commit": "ack release nonce mismatch",
         "fake-crash-lost-work": "lost committed work",
     }
     for adapter_id, message in expected_errors.items():
@@ -328,6 +337,34 @@ def test_calibration_classifies_crash_chains_and_telemetry(tmp_path: Path) -> No
     assert fabricated.classification == "adapter_protocol_failure"
     assert fabricated.external_effect.effect_count == 0
     assert by_adapter["fake-crash-duplicate-effect"].external_effect.effect_count == 2
+    race = by_adapter["fake-crash-ack-during-commit"]
+    assert race.external_effect.effect_count == 1
+    assert race.external_effect.commit_count == 1
+    assert not race.external_effect.ack_observed
+    race_output = (
+        tmp_path
+        / "calibration"
+        / "trials"
+        / race.trial_id
+        / "adapter-output"
+    )
+    assert (race_output / "premature-ack-attempted").is_file()
+
+    recovered_output = (
+        tmp_path
+        / "calibration"
+        / "trials"
+        / recovered.trial_id
+        / "adapter-output"
+    )
+    release = json.loads((recovered_output / "effect-observed.json").read_text())
+    ack = json.loads((recovered_output / "ack-handshake.json").read_text())
+    assert len(release["release_nonce"]) >= 32
+    assert ack["release_nonce"] == release["release_nonce"]
+    assert "release_nonce" not in json.loads(
+        (recovered_output / "dispatch-handshake.json").read_text()
+    )
+
     assert by_adapter["fake-crash-lost-work"].lost_committed_work
     whitespace = by_adapter["fake-crash-whitespace-action"]
     assert whitespace.fault_injection.action_id is None
@@ -402,6 +439,49 @@ def test_noncompleted_status_and_reported_budget_overages_cannot_succeed(
     assert over_token.budget_violations == ["tokens 250030 exceed cap 200000"]
     assert over_cost.classification == "agent_failure"
     assert over_cost.budget_violations == ["cost 30.0 exceeds cap 25.0"]
+
+
+def test_handshake_read_is_single_open_and_strictly_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    valid = tmp_path / "valid.json"
+    valid.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "trial_id": "trial",
+                "adapter_id": "adapter",
+                "task_id": "task",
+                "action_id": "action-1",
+            }
+        )
+    )
+
+    def forbidden_stat(self: Path, *, follow_symlinks: bool = True) -> NoReturn:
+        del self, follow_symlinks
+        raise AssertionError("handshake reader must not stat before reading")
+
+    monkeypatch.setattr(Path, "stat", forbidden_stat)
+    parsed = _read_handshake(
+        valid,
+        DispatchHandshake,
+        trial_id="trial",
+        adapter_id="adapter",
+        task_id="task",
+    )
+    assert parsed.action_id == "action-1"
+    monkeypatch.undo()
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"{" + b" " * 4096)
+    with pytest.raises(ValueError, match="exceeds 4096-byte limit"):
+        _read_handshake(
+            oversized,
+            DispatchHandshake,
+            trial_id="trial",
+            adapter_id="adapter",
+            task_id="task",
+        )
 
 
 def _write_events(path: Path, events: list[dict[str, object]]) -> None:

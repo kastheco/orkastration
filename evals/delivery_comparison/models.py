@@ -193,6 +193,21 @@ class RecoveryHandshake(StrictModel):
     action_id: BoundedIdentifier
 
 
+ReleaseNonce = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=32, max_length=256),
+]
+
+
+class AckHandshake(StrictModel):
+    schema_version: Literal["1"] = "1"
+    trial_id: str
+    adapter_id: str
+    task_id: str
+    action_id: BoundedIdentifier
+    release_nonce: ReleaseNonce
+
+
 class ProcessEvidence(StrictModel):
     argv: list[str]
     exit_code: int | None
@@ -220,6 +235,7 @@ class ExternalEffectEvidence(StrictModel):
     commit_count: int = Field(ge=0)
     action_id: str | None
     commit_sha: str | None
+    release_nonce_published: bool
     ack_observed: bool
     error: str | None = Field(default=None, max_length=1000)
 

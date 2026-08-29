@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import shutil
 import sys
 from collections import Counter
@@ -16,6 +17,7 @@ from .bundles import BundleReadError, read_result_bundle, read_telemetry
 from .calibration import apply_calibration_scenario, apply_crash_effect
 from .fixtures import FrozenTask, prepare_fixture
 from .models import (
+    AckHandshake,
     AdapterManifest,
     AdapterMetrics,
     AdapterResultBundle,
@@ -130,15 +132,17 @@ def _identity_event(
 
 def _read_handshake(
     path: Path,
-    expected_type: type[DispatchHandshake] | type[RecoveryHandshake],
+    expected_type: type[DispatchHandshake] | type[RecoveryHandshake] | type[AckHandshake],
     *,
     trial_id: str,
     adapter_id: str,
     task_id: str,
-) -> DispatchHandshake | RecoveryHandshake:
-    if path.stat().st_size > 4096:
+) -> DispatchHandshake | RecoveryHandshake | AckHandshake:
+    with path.open("rb") as stream:
+        payload = stream.read(4097)
+    if len(payload) > 4096:
         raise ValueError("handshake exceeds 4096-byte limit")
-    handshake = expected_type.model_validate_json(path.read_text())
+    handshake = expected_type.model_validate_json(payload)
     if (handshake.trial_id, handshake.adapter_id, handshake.task_id) != (
         trial_id,
         adapter_id,
@@ -236,6 +240,7 @@ def _empty_effect() -> ExternalEffectEvidence:
         commit_count=0,
         action_id=None,
         commit_sha=None,
+        release_nonce_published=False,
         ack_observed=False,
     )
 
@@ -247,6 +252,7 @@ class _RecoveryState:
     commit_count: int = 0
     action_id: str | None = None
     commit_sha: str | None = None
+    release_nonce: str | None = None
     error: str | None = None
     ack_preexisting: bool = False
 
@@ -316,20 +322,28 @@ def _run_crash_recovery(
                 state.commit_count = mutation.commit_count
                 state.action_id = mutation.action_id
                 state.commit_sha = mutation.commit_sha
+                if (
+                    mutation.effect_count == 1
+                    and mutation.commit_count == 1
+                    and mutation.action_id == fault.action_id
+                ):
+                    # Generated only after apply_crash_effect returns from its Git commit.
+                    state.release_nonce = secrets.token_urlsafe(32)
         except (OSError, ValidationError, ValueError) as exc:
             state.error = f"invalid redelivery handshake: {exc}"
-        continue_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": "1",
-                    "action_id": fault.action_id,
-                    "effect_count": state.effect_count,
-                    "commit_count": state.commit_count,
-                },
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        release_payload = json.dumps(
+            {
+                "schema_version": "1",
+                "action_id": fault.action_id,
+                "effect_count": state.effect_count,
+                "commit_count": state.commit_count,
+                "release_nonce": state.release_nonce,
+            },
+            sort_keys=True,
+        ) + "\n"
+        release_temporary = continue_path.with_suffix(".tmp")
+        release_temporary.write_text(release_payload)
+        release_temporary.replace(continue_path)
 
     argv = _adapter_argv(
         adapter,
@@ -356,18 +370,25 @@ def _run_crash_recovery(
         state.error = callback_error
 
     ack_observed = False
-    if not state.ack_preexisting and state.effect_count == 1 and state.commit_count == 1:
+    if (
+        not state.ack_preexisting
+        and state.effect_count == 1
+        and state.commit_count == 1
+        and state.release_nonce
+    ):
         try:
             parsed_ack = _read_handshake(
                 ack_path,
-                RecoveryHandshake,
+                AckHandshake,
                 trial_id=trial_id,
                 adapter_id=adapter.id,
                 task_id=task.manifest.id,
             )
-            assert isinstance(parsed_ack, RecoveryHandshake)
+            assert isinstance(parsed_ack, AckHandshake)
             if parsed_ack.action_id != fault.action_id:
                 raise ValueError("ack action_id changed")
+            if not secrets.compare_digest(parsed_ack.release_nonce, state.release_nonce):
+                raise ValueError("ack release nonce mismatch")
             ack_observed = True
         except (OSError, ValidationError, ValueError) as exc:
             state.error = f"invalid post-effect ack: {exc}"
@@ -378,6 +399,7 @@ def _run_crash_recovery(
         commit_count=state.commit_count,
         action_id=state.action_id,
         commit_sha=state.commit_sha,
+        release_nonce_published=state.release_nonce is not None,
         ack_observed=ack_observed,
         error=state.error[:1000] if state.error else None,
     )

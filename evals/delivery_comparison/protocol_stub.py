@@ -21,6 +21,7 @@ CRASH_MODES = {
     "crash-duplicate-effect",
     "crash-wrong-effect-action",
     "crash-ack-before-effect",
+    "crash-ack-during-commit",
     "crash-lost-work",
 }
 
@@ -58,6 +59,14 @@ def _handshake(
         "task_id": task,
         "action_id": action_id,
     }
+
+
+def _ack_handshake(
+    identity: tuple[str, str, str], action_id: str, release_nonce: str
+) -> dict[str, object]:
+    value = _handshake(identity, action_id)
+    value["release_nonce"] = release_nonce
+    return value
 
 
 def _result(identity: tuple[str, str, str], mode: str) -> dict[str, object]:
@@ -114,7 +123,7 @@ def write_protocol(
 
 
 def _run_crash_recovery(
-    output: Path, identity: tuple[str, str, str], mode: str
+    output: Path, repo: Path, identity: tuple[str, str, str], mode: str
 ) -> None:
     if mode == "crash-fabricated-chain":
         fabricated = [
@@ -140,12 +149,36 @@ def _run_crash_recovery(
         )
     _atomic_json(output / "redelivery-handshake.json", _handshake(identity, action_id))
     if mode == "crash-ack-before-effect":
-        _atomic_json(output / "ack-handshake.json", _handshake(identity, action_id))
+        _atomic_json(
+            output / "ack-handshake.json",
+            _ack_handshake(identity, action_id, "premature-release-nonce" * 2),
+        )
+    baseline_source = (repo / "worker.py").read_bytes()
+    attempted_during_commit = False
     deadline = time.monotonic() + 10
     while not (output / "effect-observed.json").is_file() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    if mode != "crash-ack-before-effect" and (output / "effect-observed.json").is_file():
-        _atomic_json(output / "ack-handshake.json", _handshake(identity, action_id))
+        if (
+            mode == "crash-ack-during-commit"
+            and not attempted_during_commit
+            and (repo / "worker.py").read_bytes() != baseline_source
+        ):
+            attempted_during_commit = True
+            _atomic_json(
+                output / "ack-handshake.json",
+                _ack_handshake(identity, action_id, "guessed-release-nonce" * 2),
+            )
+            (output / "premature-ack-attempted").write_text("during mutation/commit\n")
+        time.sleep(0.001)
+    if mode not in {"crash-ack-before-effect", "crash-ack-during-commit"} and (
+        output / "effect-observed.json"
+    ).is_file():
+        release = json.loads((output / "effect-observed.json").read_text())
+        nonce = release.get("release_nonce")
+        if isinstance(nonce, str):
+            _atomic_json(
+                output / "ack-handshake.json",
+                _ack_handshake(identity, action_id, nonce),
+            )
     write_protocol(output, identity=identity, mode=mode)
 
 
@@ -184,7 +217,7 @@ def main() -> int:
     if args.mode == "loud":
         print("x" * 200_000)
     if args.mode in CRASH_MODES:
-        _run_crash_recovery(args.output_bundle, identity, args.mode)
+        _run_crash_recovery(args.output_bundle, args.repo, identity, args.mode)
     else:
         standard = [
             event(identity, index, kind, "action-1")

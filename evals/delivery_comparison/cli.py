@@ -77,6 +77,7 @@ def calibrate(output: Path) -> list[TrialResult]:
         ("crash-duplicate-effect", "crash-redelivery", "agent_failure"),
         ("crash-wrong-effect-action", "crash-redelivery", "agent_failure"),
         ("crash-ack-before-effect", "crash-redelivery", "agent_failure"),
+        ("crash-ack-during-commit", "crash-redelivery", "agent_failure"),
         ("crash-lost-work", "crash-redelivery", "agent_failure"),
         ("wrong", "clean-bugfix", "agent_failure"),
         ("scope-escape", "clean-bugfix", "agent_failure"),
