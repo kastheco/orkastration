@@ -17,7 +17,7 @@ import type {
 } from "pi-subagents/delegation";
 
 import reviewWorkflow from "../../../.pi/workflows/orkastrator-review.workflow.ts";
-import { planReviewWaves } from "../../orkastrator/review-wave.ts";
+import { planReviewWaves } from "../review-wave.ts";
 import {
   delegateSubagent,
   installDelegationBridge,
@@ -231,6 +231,8 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
   let activeFixers = 0;
   let fixerRequests = 0;
   let maximumActiveFixers = 0;
+  let reportNovelDeferredFinding = false;
+  const reReviewTasks: string[] = [];
   events.on(SUBAGENT_DELEGATION_REQUEST_EVENT, (payload) => {
     const request = payload as SubagentDelegationRequest;
     void (async () => {
@@ -250,9 +252,27 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
         return;
       }
       if (request.nodeId.includes(":re-review:")) {
+        reReviewTasks.push(request.task);
+        const novel = reportNovelDeferredFinding
+          && request.nodeId.includes(plan.fixerGroups[0]!.groupId);
         respond(events, request, {
           kind: "structured",
-          value: { verdict: "accept", reason: "contract satisfied", introducedFindings: [] },
+          value: {
+            verdict: "accept",
+            reason: "contract satisfied",
+            introducedFindings: novel
+              ? [{
+                  id: "novel-out-of-scope",
+                  severity: "high",
+                  category: "correctness",
+                  contract: "c.txt must preserve its contract",
+                  evidence: ["c.txt contains a novel defect"],
+                  implicatedPaths: ["c.txt"],
+                  writablePaths: ["c.txt"],
+                  introducedByFix: false,
+                }]
+              : [],
+          },
         });
         return;
       }
@@ -282,12 +302,17 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
   assert.equal(result.unresolved.length, 0);
   assert.equal(maximumActiveFixers, 2);
   assert.equal(fixerRequests, 2);
+  assert.equal(reReviewTasks.length, 2);
+  assert.equal(reReviewTasks.every((task) => task.includes("Known sibling findings")), true);
   assert.equal(await readFile(join(repository, "a.txt"), "utf8"), "fixed a\n");
   assert.equal(await readFile(join(repository, "b.txt"), "utf8"), "fixed b\n");
 
   const integratedHead = await git(repository, ["rev-parse", "HEAD"]);
+  reportNovelDeferredFinding = true;
   const repeated = await runFixWaves(actionContext(input, "workflow-run-1"), plan);
-  assert.equal(repeated.status, "completed");
+  assert.equal(repeated.status, "needs_owner");
+  assert.equal(repeated.unresolved.length, 1);
+  assert.match(repeated.unresolved[0]!.reason, /final reconciliation/);
   assert.equal(await git(repository, ["rev-parse", "HEAD"]), integratedHead);
   assert.equal(fixerRequests, 2, "a resumed action adopts existing exact fixer commits");
   uninstall();

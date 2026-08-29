@@ -8,7 +8,7 @@ import {
   humanDecisionEdge,
 } from "@osolmaz/pi-workflows";
 
-import type { FrozenReviewPlan } from "../../extensions/orkastrator/review-wave.ts";
+import type { FrozenReviewPlan } from "../../extensions/orkastrator-workflows/review-wave.ts";
 import {
   parseReviewWorkflowInput,
   runFixWaves,
@@ -17,7 +17,7 @@ import {
   type ReviewWorkflowInput,
 } from "../../extensions/orkastrator-workflows/review-runtime.ts";
 
-const IMPLEMENTATION_REVISION = 5;
+const IMPLEMENTATION_REVISION = 6;
 
 const ownerChoices = defineHumanChoices({
   accept_partial: choice({ label: "Accept integrated fixes" }),

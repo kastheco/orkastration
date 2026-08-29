@@ -1,1 +1,1 @@
-export { default } from "../../extensions/orkastrator/index.ts";
+export { default } from "../../extensions/orkastrator-workflows/index.ts";

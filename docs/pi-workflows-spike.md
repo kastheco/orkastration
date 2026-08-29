@@ -1,115 +1,83 @@
-# Pi Workflows migration spike
+# Pi Workflows cutover decision
 
 ## Decision
 
-Use `@osolmaz/pi-workflows` as Orkastrator's durable control plane. Use `pi-subagents` only for bounded specialist execution that Pi Workflows does not expose as a general public node.
+Orkastrator is a policy layer on top of `@osolmaz/pi-workflows` and
+`pi-subagents`. The migration is complete; this is no longer an exploratory
+architecture.
 
-Do not continue building a second workflow engine, Pi RPC process manager, run ledger, or session lifecycle implementation unless a verified product requirement cannot be expressed through Pi Workflows.
+Pi Workflows owns durable graph execution, checkpoints, recovery, human
+choices, source identity, and result delivery. `pi-subagents` owns bounded
+reviewer and fixer sessions. Orkastrator owns only the review-and-repair rules
+that are specific to this project.
 
-The existing implementation remains untouched until a live spike proves the replacement path. It is reference code, not the target architecture.
+## Why the custom runtime was removed
 
-## Implemented spike
+The original implementation directly built a lifecycle engine, JSONL ledger,
+policy reducer, Pi RPC process manager, Worktrunk identity layer, monitoring
+extension, timeout behavior, and recovery protocol. Those components were
+useful for discovering the required invariants, but retaining them would mean
+maintaining a second workflow platform beside Pi Workflows.
 
-The project now contains:
+The cutover removed that duplicate runtime after a live vertical slice proved
+the replacement path.
 
-- `.pi/workflows/orkastrator-review.workflow.ts`: the durable review workflow graph
-- `extensions/orkastrator-workflows/index.ts`: the lightweight Pi extension bridge
-- `extensions/orkastrator-workflows/delegation-bridge.ts`: correlated `pi-subagents` delegation and cancellation
-- `extensions/orkastrator-workflows/review-runtime.ts`: bounded review, fixer worktree, re-review, and integration actions
-- `extensions/orkastrator/review-wave.ts`: strict finding contracts and deterministic clumping
+## Live proof
 
-The graph delegates state, checkpoints, recovery, durable output, source revision checks, and owner decisions to Pi Workflows.
+Run `20260829T212547609Z-orkastrator-review-3556c326` reviewed a committed
+fixture containing independent regressions in `parseCount` and
+`normalizeName`.
 
-## Proven in automated tests
+The run demonstrated:
 
-The spike proves:
+- one immutable structured initial review;
+- two blocking findings with a shared test evidence path;
+- two disjoint writable scopes and two deterministic fixer groups;
+- both groups dispatched in one bounded parallel wave;
+- exact one-file fixer commits `8945c1a` and `19dae23`;
+- mandatory scoped re-review for each commit;
+- unrelated sibling observations not blocking the wrong fixer;
+- serial integration at `a543512`;
+- a clean final worktree with all fixture tests passing;
+- durable Pi Workflows completion with no unresolved groups.
 
-- strict workflow input and graph validation
-- one immutable structured initial review
-- deterministic transitive clumping by overlapping writable paths
-- at most three concurrent disjoint fixer groups
-- one detached Git worktree per fixer group
-- one exact clean commit per fixer attempt
-- rejection of changed paths outside the declared scope
-- mandatory scoped re-review after every fixer attempt
-- a maximum of two fix rounds
-- deferral of re-review findings not introduced by the fix
-- serial integration that preserves the accepted fixer commit in repository history
-- idempotent adoption of already integrated commits when the action reruns
-- one protected owner decision when blocking risk or integration conflict remains
-- correlated cancellation through the public `pi-subagents` delegation event contract
+Automated tests additionally cover strict schemas, path escape rejection,
+parallel caps, transitive clumping, exact commit identity, idempotent effect
+adoption, owner escalation, cancellation, and novel deferred-finding
+reconciliation.
 
-## Architecture after the spike
+## Retained policy
 
-```text
-Pi Workflows
-  graph, durable SQLite state, claims, fencing, parking/resume,
-  human decisions, output delivery, source digests, viewer
+Orkastrator keeps:
 
-pi-subagents
-  configured reviewer and fixer leaf sessions, model routing,
-  bounded tool use, structured output, cancellation
+- immutable initial finding contracts;
+- separate evidence paths and writable paths;
+- deterministic grouping by overlapping write authority;
+- bounded parallel fixer waves;
+- exact-commit and scope enforcement;
+- mandatory scoped re-review;
+- a two-round repair bound;
+- serial integration;
+- final reconciliation and owner escalation.
 
-Orkastrator
-  workflow definitions, review schemas, path-scope enforcement,
-  fixer worktree adapter, integration policy
-```
+A re-review observation is classified as a known sibling finding, a regression
+introduced by the current fix, a genuinely novel relevant finding, or an
+unrelated repository issue. Only the first may be ignored at the current fixer
+boundary without further action. A novel deferred finding prevents workflow
+completion until reconciliation.
 
-## Replaced Orkastrator components
+## Remaining limitations
 
-These should be deleted after the live proof succeeds:
+- The extension-to-extension delegation bridge is currently an interactive Pi
+  integration. Standalone `pi-workflows host` support requires a supported host
+  extension seam or generic public agent action.
+- Rejected-round reviewer evidence is not its own workflow node, so an
+  interruption may repeat a reviewer call. Git effects are still observed and
+  adopted idempotently.
+- Fixer worktrees are preserved for evidence; automated retention cleanup is
+  not yet implemented.
+- Integration conflicts stop for owner intervention rather than invoking an
+  automatic conflict resolver.
 
-- custom run lifecycle and session rebind logic
-- custom JSONL ledger and projected state
-- custom policy reducer used only to advance the review graph
-- owned Pi RPC process manager
-- duplicate timeout, cancellation, and terminal-delivery machinery
-- the large production extension entrypoint that coordinates those components
-
-The review schema and deterministic grouping logic remain useful. Worktree identity checks may remain as a small adapter if Pi Workflows' built-in workspace preparation cannot cover group-scoped fixer worktrees.
-
-## Known gaps
-
-The spike is intentionally not production-ready yet.
-
-1. **Standalone host compatibility.** The bridge depends on a loaded Pi extension and therefore works in an interactive Pi process. Pi Workflows' standalone host excludes project extensions from headless agent children and does not currently expose a general public child-agent action. Always-on execution needs either a supported host plugin seam or a public generic agent-group API from Pi Workflows.
-2. **Action-level recovery granularity.** Git effects are observable and adopted after an interrupted action, but individual re-review results and rejected-round evidence are not separate Pi Workflows nodes. An interruption can repeat a reviewer call or a rejected fixer round.
-3. **Fallback policy.** The confirmed alternate-model fallback boundary is not implemented in the spike.
-4. **Conflict handling.** Integration conflicts stop and escalate. The supervisor does not yet resolve independently safe conflicts.
-5. **Worktree retention.** Fixer worktrees are preserved for evidence. A verified finalizer and retention policy are still required.
-6. **Live model availability.** The configured owner-selected model IDs must exist in the active Pi registry before a paid run.
-
-## Local use
-
-Install both Pi packages:
-
-```sh
-pi install npm:@osolmaz/pi-workflows
-pi install npm:pi-subagents
-```
-
-Trust the project, commit the worker changes, and start the workflow from that clean worktree:
-
-```sh
-/workflow orkastrator-review --input-json {
-  "objective": "the exact implementation objective",
-  "repository": "/absolute/path/to/the/worktree",
-  "reviewRevision": "40-character-lowercase-git-sha",
-  "maxParallelFixers": 3
-}
-```
-
-The workflow refuses a dirty worktree, a revision mismatch, unknown input fields, malformed review output, scope escape, multiple commits from one fixer attempt, or an unverified model result.
-
-## Next proof
-
-Run one no-cost fixture through the installed Pi extensions, then one owner-approved live task. The live proof must demonstrate:
-
-- Pi Workflows run visibility in `piw`
-- real structured delegation to `pi-subagents`
-- two disjoint fixer worktrees active concurrently
-- one rejected fix entering exactly one second round
-- serial integration and an owner checkpoint
-- interruption and resume without repeating a Git effect
-
-Only after that proof should the replaced Orkastrator modules be removed.
+These are bounded adapter limitations, not reasons to restore the removed
+workflow engine.

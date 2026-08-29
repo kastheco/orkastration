@@ -13,7 +13,7 @@ import {
   type FixerGroup,
   type FrozenReviewPlan,
   type InitialReviewFinding,
-} from "../orkastrator/review-wave.ts";
+} from "./review-wave.ts";
 import { delegateSubagent, type DelegationSpec } from "./delegation-bridge.ts";
 
 const execFileAsync = promisify(execFile);
@@ -156,12 +156,36 @@ export async function runFixWaves(
     const results = await Promise.all(wave.groupIds.map(async (groupId) => {
       const group = groups.get(groupId);
       if (group === undefined) throw new Error(`review wave references unknown group ${groupId}`);
-      return await runFixerGroup(context, input, repository, group);
+      const groupIds = new Set(group.findings.map((finding) => finding.id));
+      const knownSiblingFindings = plan.findings
+        .filter((finding) => finding.blocking && !groupIds.has(finding.id))
+        .map((finding) => ({
+          id: finding.id,
+          category: finding.category,
+          writablePaths: finding.writablePaths,
+        }));
+      return await runFixerGroup(
+        context,
+        input,
+        repository,
+        group,
+        knownSiblingFindings,
+      );
     }));
     for (const result of results) {
       if ("commitSha" in result) accepted.push(result);
       else unresolved.push(result);
     }
+  }
+
+  for (const fix of accepted) {
+    if (fix.deferredFindings.length === 0) continue;
+    unresolved.push({
+      groupId: fix.groupId,
+      reason: "novel out-of-scope findings require final reconciliation",
+      evidence: fix.deferredFindings.map((finding) => `${finding.id}: ${finding.contract}`),
+      worktree: fix.worktree,
+    });
   }
 
   let integratedHead = await git(repository, ["rev-parse", "HEAD"], context.signal);
@@ -196,6 +220,11 @@ async function runFixerGroup(
   input: ReviewWorkflowInput,
   repository: string,
   group: FixerGroup,
+  knownSiblingFindings: Array<{
+    id: string;
+    category: InitialReviewFinding["category"];
+    writablePaths: string[];
+  }>,
 ): Promise<AcceptedFix | UnresolvedFix> {
   const worktree = await ensureFixerWorktree(input, context.state.runId, group.groupId, context.signal);
   let rejectionEvidence: string[] = [];
@@ -239,7 +268,7 @@ async function runFixerGroup(
       ownerRunId: context.state.runId,
       nodeId: `${group.groupId}:re-review:${round}`,
       agent: "reviewer",
-      task: reReviewPrompt(input, packet),
+      task: reReviewPrompt(input, packet, knownSiblingFindings),
       context: "fresh",
       cwd: worktree,
       model: "anthropic/claude-sonnet-5",
@@ -426,13 +455,20 @@ function fixerPrompt(
 function reReviewPrompt(
   input: ReviewWorkflowInput,
   packet: ReturnType<typeof buildReReviewPacket>,
+  knownSiblingFindings: Array<{
+    id: string;
+    category: InitialReviewFinding["category"];
+    writablePaths: string[];
+  }>,
 ): string {
   return [
     `Re-review one fix for objective: ${input.objective}`,
     "Use only this bounded contract and the committed diff in the current worktree.",
     JSON.stringify(packet),
+    `Known sibling findings handled by other fixer groups: ${JSON.stringify(knownSiblingFindings)}`,
     "Do not modify files. Reject any unmet contract or blocking regression introduced by this fix.",
-    "New findings not introduced by this fix must be returned with introducedByFix=false so they are deferred.",
+    "Do not return a known sibling finding as new. If validation fails only because of a known sibling, mention it in the reason and keep introducedFindings empty.",
+    "Return a non-fix-introduced finding only when it is genuinely novel. Novel deferred findings block final workflow completion pending reconciliation.",
   ].join("\n\n");
 }
 
