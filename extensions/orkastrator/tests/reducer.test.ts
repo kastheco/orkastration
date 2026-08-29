@@ -627,3 +627,142 @@ test("fix and re-review outer group arrays are bounded before nested traversal",
     },
   }), /exceed assigned group count/u);
 });
+
+
+test("direct fix and re-review checkpoints require charged active findings and nonempty scopes", () => {
+  type ReviewCursor = Extract<PolicyCheckpoint["cursor"], { phase: "fix_batch" | "re_review" }>;
+  const malformed: Array<[string, Omit<ReviewCursor, "phase">, RegExp]> = [
+    [
+      "empty scopes",
+      { findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 1, state: "active" }], groups: [] },
+      /at least one group/u,
+    ],
+    [
+      "empty group finding IDs",
+      {
+        findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 1, state: "active" }],
+        groups: [{ groupId: "g", findingIds: [] }],
+      },
+      /group scope is invalid/u,
+    ],
+    [
+      "no active findings",
+      { findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 1, state: "accepted" }], groups: [] },
+      /at least one active finding/u,
+    ],
+    [
+      "active round zero",
+      {
+        findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 0, state: "active" }],
+        groups: [{ groupId: "g", findingIds: ["F-1"] }],
+      },
+      /require a charged round/u,
+    ],
+    [
+      "accepted round zero",
+      {
+        findings: [
+          { id: "F-1", category: "correctness", groupId: "a", rounds: 1, state: "active" },
+          { id: "F-2", category: "correctness", groupId: "b", rounds: 0, state: "accepted" },
+        ],
+        groups: [{ groupId: "a", findingIds: ["F-1"] }],
+      },
+      /require a charged round/u,
+    ],
+  ];
+
+  for (const phase of ["fix_batch", "re_review"] as const) {
+    for (const [name, value, pattern] of malformed) {
+      const cursor = { phase, ...structuredClone(value) } as ReviewCursor;
+      const event: PolicyEvent = phase === "fix_batch"
+        ? { type: "fix_batch_completed", sequence: 1, observation: observation(), groups: [] }
+        : { type: "re_review_completed", sequence: 1, observation: observation(), groups: [] };
+      assert.throws(() => reducePolicy({ policy, checkpoint: checkpoint(cursor), event }), pattern, `${phase}: ${name}`);
+    }
+  }
+});
+
+test("waiting resume cursors enforce the same charged active nonempty scope invariants", () => {
+  type ReviewCursor = Extract<PolicyCheckpoint["cursor"], { phase: "fix_batch" | "re_review" }>;
+  const malformed: Array<[string, ReviewCursor, RegExp]> = [
+    [
+      "empty scopes",
+      {
+        phase: "fix_batch",
+        findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 1, state: "active" }],
+        groups: [],
+      },
+      /at least one group/u,
+    ],
+    [
+      "empty group finding IDs",
+      {
+        phase: "re_review",
+        findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 1, state: "active" }],
+        groups: [{ groupId: "g", findingIds: [] }],
+      },
+      /group scope is invalid/u,
+    ],
+    [
+      "no active findings",
+      {
+        phase: "fix_batch",
+        findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 1, state: "accepted" }],
+        groups: [],
+      },
+      /at least one active finding/u,
+    ],
+    [
+      "active round zero",
+      {
+        phase: "re_review",
+        findings: [{ id: "F-1", category: "correctness", groupId: "g", rounds: 0, state: "active" }],
+        groups: [{ groupId: "g", findingIds: ["F-1"] }],
+      },
+      /require a charged round/u,
+    ],
+    [
+      "accepted round zero",
+      {
+        phase: "fix_batch",
+        findings: [
+          { id: "F-1", category: "correctness", groupId: "a", rounds: 1, state: "active" },
+          { id: "F-2", category: "correctness", groupId: "b", rounds: 0, state: "accepted" },
+        ],
+        groups: [{ groupId: "a", findingIds: ["F-1"] }],
+      },
+      /require a charged round/u,
+    ],
+  ];
+
+  for (const [name, resumeCursor, pattern] of malformed) {
+    const waiting: PolicyCheckpoint["cursor"] = {
+      phase: "waiting",
+      incident: "worker_blocked",
+      target: "supervisor",
+      allowedDecisions: ["resume", "stop"],
+      resumeCursor,
+    };
+    assert.throws(() => reducePolicy({
+      policy,
+      checkpoint: checkpoint(waiting),
+      event: { type: "decision", sequence: 1, observation: observation(), target: "supervisor", decision: "stop" },
+    }), pattern, name);
+  }
+});
+
+test("generated fixer and re-review actions always contain nonzero charged work", () => {
+  const fixer = initialReview([{ id: "F-1", category: "correctness", groupId: "g" }]);
+  assert.equal(fixer.action.type, "run_fixers");
+  if (fixer.action.type !== "run_fixers") return;
+  assert.ok(fixer.action.groups.length > 0);
+  assert.ok(fixer.action.groups.every((group) => group.findings.length > 0));
+  assert.ok(fixer.action.groups.every((group) => group.findings.every((finding) => finding.round > 0)));
+
+  const review = completeFix(fixer);
+  assert.equal(review.action.type, "run_re_review");
+  if (review.action.type === "run_re_review") {
+    assert.ok(review.action.groups.length > 0);
+    assert.ok(review.action.groups.every((group) => group.findingIds.length > 0));
+  }
+});

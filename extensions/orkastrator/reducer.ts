@@ -352,6 +352,9 @@ function scheduleFixers(
   }
   findings.sort(compareFinding);
   const groups = scopesFor(findings.filter((finding) => finding.state === "active" && selected.has(finding.groupId)));
+  if (groups.length === 0 || findings.some((finding) => finding.state === "active" && finding.rounds < 1)) {
+    throw new Error("fixer action requires charged active finding groups");
+  }
   return reduction(checkpoint, { phase: "fix_batch", findings, groups }, ruleId, [...trace, "fix.round_charged"], (actionId) => ({
     actionId,
     type: "run_fixers",
@@ -472,20 +475,27 @@ function actionForCursor(policy: PolicyV1, cursor: WorkCursor, actionId: string)
       return { actionId, type: "run_worker", attempt: cursor.attempt, role: role(policy, "worker") };
     }
     case "initial_review": return { actionId, type: "run_initial_review", role: role(policy, "initial_reviewer") };
-    case "fix_batch": return {
-      actionId,
-      type: "run_fixers",
-      role: role(policy, "fixer"),
-      groups: cursor.groups.map((group) => ({
-        groupId: group.groupId,
-        findings: group.findingIds.map((id) => {
-          const finding = cursor.findings.find((candidate) => candidate.id === id);
-          if (finding === undefined) throw new Error("fix scope references an unknown finding");
-          return { id, round: finding.rounds };
-        }),
-      })),
-    };
-    case "re_review": return { actionId, type: "run_re_review", role: role(policy, "re_reviewer"), groups: cloneScopes(cursor.groups) };
+    case "fix_batch": {
+      if (cursor.groups.length === 0) throw new Error("fixer action requires at least one group");
+      return {
+        actionId,
+        type: "run_fixers",
+        role: role(policy, "fixer"),
+        groups: cursor.groups.map((group) => ({
+          groupId: group.groupId,
+          findings: group.findingIds.map((id) => {
+            const finding = cursor.findings.find((candidate) => candidate.id === id);
+            if (finding === undefined) throw new Error("fix scope references an unknown finding");
+            if (finding.rounds < 1) throw new Error("fixer action cannot emit round zero");
+            return { id, round: finding.rounds };
+          }),
+        })),
+      };
+    }
+    case "re_review": {
+      if (cursor.groups.length === 0) throw new Error("re-review action requires at least one group");
+      return { actionId, type: "run_re_review", role: role(policy, "re_reviewer"), groups: cloneScopes(cursor.groups) };
+    }
     case "validation": return {
       actionId,
       type: "run_validation",
@@ -727,6 +737,9 @@ function validateFindings(policy: PolicyV1, findings: Finding[]): void {
     if (priorId !== undefined && compareText(priorId, finding.id) >= 0) throw new Error("checkpoint findings are not canonical");
     if (!Number.isSafeInteger(finding.rounds) || finding.rounds < 0 || finding.rounds > policy.review.max_fix_rounds_per_finding) throw new Error("checkpoint finding rounds are invalid");
     if (finding.state !== "queued" && finding.state !== "active" && finding.state !== "accepted") throw new Error("checkpoint finding state is invalid");
+    if ((finding.state === "active" || finding.state === "accepted") && finding.rounds < 1) {
+      throw new Error("active and accepted findings require a charged round");
+    }
     ids.add(finding.id);
     priorId = finding.id;
   }
@@ -734,6 +747,9 @@ function validateFindings(policy: PolicyV1, findings: Finding[]): void {
 
 function validateScopes(policy: PolicyV1, groups: GroupScope[], findings: Finding[]): void {
   if (!Array.isArray(groups) || groups.length > MAX_FINDINGS || groups.length > policy.review.max_parallel_fixer_groups) throw new Error("checkpoint groups are invalid");
+  const activeIds = findings.filter((finding) => finding.state === "active").map((finding) => finding.id);
+  if (activeIds.length === 0) throw new Error("fix and re-review cursors require at least one active finding");
+  if (groups.length === 0) throw new Error("fix and re-review cursors require at least one group");
   const byId = new Map(findings.map((finding) => [finding.id, finding]));
   const scopedIds = new Set<string>();
   const groupIds = new Set<string>();
@@ -757,7 +773,6 @@ function validateScopes(policy: PolicyV1, groups: GroupScope[], findings: Findin
     groupIds.add(group.groupId);
     priorGroupId = group.groupId;
   }
-  const activeIds = findings.filter((finding) => finding.state === "active").map((finding) => finding.id);
   if (activeIds.length !== scopedIds.size || activeIds.some((id) => !scopedIds.has(id))) {
     throw new Error("checkpoint active finding scope is incomplete");
   }
