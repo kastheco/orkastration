@@ -197,7 +197,7 @@ export class RunLedger {
         runId,
         objective,
         supervisorSessionId: input.supervisorSessionId,
-        repositoryRoot: resolve(input.repositoryRoot),
+        repositoryRoot: realpathSync(input.repositoryRoot),
         policyHash: createHash("sha256").update(input.policySnapshot).digest("hex"),
         policyFile: "policy.yaml",
         generation: 1,
@@ -563,13 +563,19 @@ export class RunLedger {
       this.#assertOwnedProcess(processIdentity);
     }
     for (const worktree of input.worktrees) {
-      if (
-        !isAbsolute(worktree.repositoryRoot) ||
-        !isAbsolute(worktree.path) ||
-        worktree.branch.length === 0 ||
-        !/^[0-9a-f]{40}$/u.test(worktree.headSha)
-      ) {
+      if (!isWorktreeIdentity(worktree, current.runId, current.repositoryRoot)) {
         throw new LedgerError("worktree identity is incomplete");
+      }
+      try {
+        if (
+          realpathSync(worktree.repositoryRoot) !== worktree.repositoryRoot ||
+          realpathSync(worktree.path) !== worktree.path
+        ) {
+          throw new LedgerError("worktree identity paths must be canonical real paths");
+        }
+      } catch (error) {
+        if (error instanceof LedgerError) throw error;
+        throw new LedgerError("worktree identity paths must exist");
       }
     }
     return this.#commit(
@@ -1382,7 +1388,9 @@ export class RunLedger {
     }
     if (
       !value.ownedProcesses.every(isOwnedProcessIdentity) ||
-      !value.worktrees.every(isWorktreeIdentity) ||
+      !value.worktrees.every((identity) =>
+        isWorktreeIdentity(identity, value.runId as string, value.repositoryRoot as string)
+      ) ||
       (value.reload !== undefined &&
         !isReloadMarker(
           value.reload,
@@ -1443,18 +1451,59 @@ function isOwnedProcessIdentity(value: unknown): value is OwnedProcessIdentity {
   );
 }
 
-function isWorktreeIdentity(value: unknown): boolean {
-  return (
-    isObject(value) &&
-    typeof value.repositoryRoot === "string" &&
-    isAbsolute(value.repositoryRoot) &&
-    typeof value.path === "string" &&
-    isAbsolute(value.path) &&
-    typeof value.branch === "string" &&
-    value.branch.length > 0 &&
-    typeof value.headSha === "string" &&
-    /^[0-9a-f]{40}$/u.test(value.headSha)
-  );
+function isWorktreeIdentity(
+  value: unknown,
+  runId: string,
+  repositoryRoot: string,
+): boolean {
+  if (
+    !isObject(value) ||
+    !hasExactKeys(value, [
+      "repositoryRoot",
+      "remoteUrl",
+      "branch",
+      "path",
+      "baseSha",
+      "headSha",
+      "operation",
+      "clean",
+    ]) ||
+    value.repositoryRoot !== repositoryRoot ||
+    !isAbsolute(repositoryRoot) ||
+    resolve(repositoryRoot) !== repositoryRoot ||
+    (value.remoteUrl !== null &&
+      (typeof value.remoteUrl !== "string" || canonicalRemoteUrl(value.remoteUrl) !== value.remoteUrl)) ||
+    value.branch !== `orkastrator/${runId.toLowerCase()}/worker` ||
+    typeof value.path !== "string" ||
+    !isAbsolute(value.path) ||
+    resolve(value.path) !== value.path ||
+    value.path === repositoryRoot ||
+    typeof value.baseSha !== "string" ||
+    !/^[0-9a-f]{40}$/u.test(value.baseSha) ||
+    value.headSha !== value.baseSha ||
+    value.operation !== null ||
+    value.clean !== true
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function canonicalRemoteUrl(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (!new Set(["https:", "http:", "ssh:"]).has(parsed.protocol)) return null;
+    if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
+      return null;
+    }
+    parsed.hostname = parsed.hostname.toLowerCase();
+    let pathname = parsed.pathname.replace(/\/+$/u, "").replace(/\.git$/u, "");
+    if (pathname === "") pathname = "/";
+    parsed.pathname = pathname;
+    return parsed.toString().replace(/\/$/u, "");
+  } catch {
+    return null;
+  }
 }
 
 function isReloadMarker(

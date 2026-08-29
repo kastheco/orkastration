@@ -55,10 +55,19 @@ export type WorkerEvent =
   | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
 
 export interface WorktreeIdentity {
+  /** Canonical real path of the repository whose Worktrunk list established ownership. */
   repositoryRoot: string;
-  path: string;
+  /** Canonical forge URL from schema-2 repo.forge, or null when the repository has no forge. */
+  remoteUrl: string | null;
   branch: string;
+  /** Canonical real path of the owned feature worktree. */
+  path: string;
+  baseSha: string;
   headSha: string;
+  /** Ownership is valid only while Worktrunk reports no in-progress operation. */
+  operation: null;
+  /** Ownership is valid only while all schema-2 change bits remain false. */
+  clean: true;
 }
 
 export interface ReloadMarker {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { RunLedger } from "../ledger/file-ledger.ts";
-import type { RunRecord } from "../ledger/types.ts";
+import type { RunRecord, WorktreeIdentity } from "../ledger/types.ts";
 import {
   LifecycleCoordinator,
   type RebindIdentityVerifier,
@@ -60,6 +60,20 @@ function create(
   });
 }
 
+function worktreeIdentity(run: RunRecord, path: string, sha: string): WorktreeIdentity {
+  mkdirSync(path);
+  return {
+    repositoryRoot: run.repositoryRoot,
+    remoteUrl: null,
+    branch: `orkastrator/${run.runId}/worker`,
+    path,
+    baseSha: sha,
+    headSha: sha,
+    operation: null,
+    clean: true,
+  };
+}
+
 test("startup reports incomplete runs without claiming, resuming, or deleting them", async () => {
   const value = fixture();
   try {
@@ -84,7 +98,7 @@ test("startup reports incomplete runs without claiming, resuming, or deleting th
 test("same-session same-process reload rebinds when every recorded identity is proven", async () => {
   const verifier: RebindIdentityVerifier = {
     verifyProcess: (identity) => identity.attemptToken === "attempt-1",
-    verifyWorktree: (identity) => identity.branch === "feature",
+    verifyWorktree: (identity) => identity.branch.endsWith("/worker"),
   };
   const value = fixture(verifier);
   try {
@@ -99,12 +113,7 @@ test("same-session same-process reload rebinds when every recorded identity is p
         },
       ],
       worktrees: [
-        {
-          repositoryRoot: value.repository,
-          path: join(value.temporary, "worktree"),
-          branch: "feature",
-          headSha: "a".repeat(40),
-        },
+        worktreeIdentity(created, join(value.temporary, "worktree"), "a".repeat(40)),
       ],
     });
 
@@ -333,12 +342,11 @@ for (const reason of ["new", "resume", "fork", "quit"] satisfies SessionShutdown
       value.ledger.recordOwnership(created.runId, {
         ownedProcesses: [],
         worktrees: [
-          {
-            repositoryRoot: value.repository,
-            path: join(value.temporary, "preserved-worktree"),
-            branch: "feature",
-            headSha: "b".repeat(40),
-          },
+          worktreeIdentity(
+            created,
+            join(value.temporary, "preserved-worktree"),
+            "b".repeat(40),
+          ),
         ],
       });
 

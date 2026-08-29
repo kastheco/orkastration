@@ -21,6 +21,7 @@ import {
   LedgerError,
   RunLedger,
 } from "../ledger/file-ledger.ts";
+import type { RunRecord, WorktreeIdentity } from "../ledger/types.ts";
 import { POLICY_SNAPSHOT } from "./policy-fixture.ts";
 
 function ids(): () => string {
@@ -62,6 +63,20 @@ function create(ledger: RunLedger, repository: string, session = "session-1") {
   });
 }
 
+function worktreeIdentity(run: RunRecord, path: string): WorktreeIdentity {
+  mkdirSync(path);
+  return {
+    repositoryRoot: run.repositoryRoot,
+    remoteUrl: "https://github.com/kastheco/orkastrator",
+    branch: `orkastrator/${run.runId}/worker`,
+    path,
+    baseSha: "a".repeat(40),
+    headSha: "a".repeat(40),
+    operation: null,
+    clean: true,
+  };
+}
+
 function rewriteEvents(
   ledger: RunLedger,
   runId: string,
@@ -96,6 +111,82 @@ test("run creation snapshots policy and commits the event before its state proje
       (error: unknown) => error instanceof ActiveRunError && /already owns active run/u.test(error.message),
     );
     assert.equal(create(value.ledger, value.repository, "session-2").state, "submitted");
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("strengthened worktree identity records and reloads every ownership field", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const identity = worktreeIdentity(run, join(value.temporary, "owned-worktree"));
+    const recorded = value.ledger.recordOwnership(run.runId, {
+      ownedProcesses: [],
+      worktrees: [identity],
+    });
+    assert.deepEqual(recorded.worktrees, [identity]);
+    assert.deepEqual(new RunLedger({ root: value.ledger.root }).loadRun(run.runId).record.worktrees, [identity]);
+  } finally {
+    value.cleanup();
+  }
+});
+
+for (const [name, tamper] of [
+  ["missing remote", (identity: Record<string, unknown>) => delete identity.remoteUrl],
+  ["noncanonical remote", (identity: Record<string, unknown>) => {
+    identity.remoteUrl = "https://github.com/kastheco/orkastrator.git";
+  }],
+  ["wrong branch", (identity: Record<string, unknown>) => {
+    identity.branch = "orkastrator/other/worker";
+  }],
+  ["base/head disagreement", (identity: Record<string, unknown>) => {
+    identity.headSha = "b".repeat(40);
+  }],
+  ["active operation", (identity: Record<string, unknown>) => {
+    identity.operation = "rebase";
+  }],
+  ["unclean marker", (identity: Record<string, unknown>) => {
+    identity.clean = false;
+  }],
+  ["extra field", (identity: Record<string, unknown>) => {
+    identity.unexpected = true;
+  }],
+] as const) {
+  test(`ledger reload rejects worktree identity tamper: ${name}`, () => {
+    const value = fixture();
+    try {
+      const run = create(value.ledger, value.repository);
+      value.ledger.recordOwnership(run.runId, {
+        ownedProcesses: [],
+        worktrees: [worktreeIdentity(run, join(value.temporary, "owned-worktree"))],
+      });
+      rewriteEvents(value.ledger, run.runId, (events) => {
+        const projection = events.at(-1)!.projection as { worktrees: Array<Record<string, unknown>> };
+        tamper(projection.worktrees[0]!);
+      });
+      assert.throws(
+        () => new RunLedger({ root: value.ledger.root }).loadRun(run.runId),
+        (error: unknown) => error instanceof LedgerCorruptionError,
+      );
+    } finally {
+      value.cleanup();
+    }
+  });
+}
+
+test("ledger mutation rejects incomplete or noncanonical worktree identity", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const valid = worktreeIdentity(run, join(value.temporary, "owned-worktree"));
+    assert.throws(
+      () => value.ledger.recordOwnership(run.runId, {
+        ownedProcesses: [],
+        worktrees: [{ ...valid, path: `${value.temporary}/x/../owned-worktree` }],
+      }),
+      /worktree identity is incomplete/u,
+    );
   } finally {
     value.cleanup();
   }
