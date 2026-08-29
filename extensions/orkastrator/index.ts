@@ -166,7 +166,23 @@ export function installOrkastrator(
     ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 
-  pi.registerCommand("orkastrator-runs", {
+  pi.registerCommand("kas", {
+    description: "Start and supervise an Orkastrator run",
+    handler: async (args, ctx) => {
+      try {
+        requireTrust(ctx);
+        const objective = args.trim();
+        pi.sendUserMessage(
+          objective.length === 0 ? "/skill:orkas" : `/skill:orkas ${objective}`,
+          { expandPromptTemplates: true },
+        );
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    },
+  });
+
+  pi.registerCommand("kas-runs", {
     description: "Report active and preserved Orkastrator runs",
     handler: async (_args, ctx) => {
       try {

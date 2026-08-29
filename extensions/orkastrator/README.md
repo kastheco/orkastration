@@ -11,7 +11,7 @@ npm install
 pi --approve
 ```
 
-Use `/reload` after editing extension source. `/orkastrator-runs` confirms that the extension loaded. The private package manifest also exposes the extension for local `pi install <path>` development, but there is no published package yet.
+Use `/reload` after editing extension source. `/kas-runs` confirms that the extension loaded. The private package manifest also exposes the extension for local `pi install <path>` development, but there is no published package yet.
 
 ## KAS-740 lifecycle slice
 
@@ -69,6 +69,7 @@ Normal startup after a crash never rebinds, even if the Pi session ID matches. I
 
 - `orkastrator_run_create`: creates the lifecycle-only run and snapshots caller-supplied policy bytes. KAS-742 replaces this temporary seam with strict repository-owned `repo-default` resolution.
 - `orkastrator_owner_answer`: records an allowed answer for a run owned by the current session and resumes that same run.
-- `/orkastrator-runs`: reports the current session's run plus preserved runs from other sessions.
+- `/kas <objective>`: expands the Orkastrator supervisor skill and starts a model turn for the requested run.
+- `/kas-runs`: reports the current session's run plus preserved runs from other sessions.
 
 All surfaces require project trust. The package manifest exposes `index.ts` as a first-class Pi package extension, while `.pi/extensions/orkastrator.ts` is the repository-local trusted entrypoint.

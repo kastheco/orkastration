@@ -124,7 +124,7 @@ npm install
 pi --approve
 ```
 
-Use `/reload` after source changes and `/orkastrator-runs` to inspect active and preserved runs. The
+Use `/reload` after source changes, `/kas <objective>` to start a supervised run, and `/kas-runs` to inspect active and preserved runs. The
 current KAS-740 slice owns lifecycle and durable ledger evidence only; worker RPC, policy reduction,
 and Worktrunk mutation land in follow-up issues.
 

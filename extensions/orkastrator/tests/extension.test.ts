@@ -47,6 +47,10 @@ class FakeApi {
   readonly tools = new Map<string, FakeTool>();
   readonly commands = new Map<string, FakeCommand>();
   readonly entries: Array<{ customType: string; data: unknown }> = [];
+  readonly userMessages: Array<{
+    content: string;
+    options: { expandPromptTemplates?: boolean } | undefined;
+  }> = [];
 
   on(event: string, handler: FakeHandler): void {
     this.handlers.set(event, handler);
@@ -63,6 +67,13 @@ class FakeApi {
 
   appendEntry(customType: string, data: unknown): void {
     this.entries.push({ customType, data });
+  }
+
+  sendUserMessage(
+    content: string,
+    options?: { expandPromptTemplates?: boolean },
+  ): void {
+    this.userMessages.push({ content, options });
   }
 }
 
@@ -111,6 +122,22 @@ function fixture(options: { canonicalizeRepository?: (path: string) => string } 
     cleanup: () => rmSync(temporary, { recursive: true, force: true }),
   };
 }
+
+test("kas command expands the Orkastrator supervisor skill with its objective", async () => {
+  const value = fixture();
+  try {
+    const ctx = context(value.repository);
+    await value.api.commands.get("kas")?.handler("Ship the lifecycle slice", ctx);
+    assert.deepEqual(value.api.userMessages, [
+      {
+        content: "/skill:orkas Ship the lifecycle slice",
+        options: { expandPromptTemplates: true },
+      },
+    ]);
+  } finally {
+    value.cleanup();
+  }
+});
 
 test("trusted run tool creates one durable run and rejects a second active run", async () => {
   const value = fixture();
@@ -168,7 +195,7 @@ test("untrusted sessions cannot create or inspect project-local run state", asyn
       ),
       /requires project trust/u,
     );
-    await value.api.commands.get("orkastrator-runs")?.handler("", ctx);
+    await value.api.commands.get("kas-runs")?.handler("", ctx);
     assert.match(ctx.notifications.at(-1)?.[0] ?? "", /requires project trust/u);
     assert.equal(value.ledger.scanNonterminal().length, 0);
   } finally {

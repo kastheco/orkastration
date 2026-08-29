@@ -112,10 +112,14 @@ test("trusted project discovery loads the repository-local Orkastrator extension
     const commands = await probe.send({ type: "get_commands" });
     const data = commands.data as { commands: Array<{ name: string }> };
     assert.equal(
-      data.commands.some((command) => command.name === "orkastrator-runs"),
+      data.commands.some((command) => command.name === "kas-runs"),
       true,
     );
-    await probe.send({ type: "prompt", message: "/orkastrator-runs" });
+    assert.equal(
+      data.commands.some((command) => command.name === "kas"),
+      true,
+    );
+    await probe.send({ type: "prompt", message: "/kas-runs" });
     await new Promise<void>((resolveTick) => setImmediate(resolveTick));
     const notification = probe.events.find(
       (event) =>
