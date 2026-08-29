@@ -1,8 +1,8 @@
 # orkastrator
 
-orkastrator v1 is a Pi-native supervision extension. The current KAS-740 slice owns trusted run creation, durable lifecycle evidence, same-session reload proof, stale-run reporting, and resumable owner decisions. It does not launch workers, mutate Worktrunk state, validate changes, publish branches, or merge.
+orkastrator v1 is a Pi-native supervision extension. KAS-740 owns trusted run creation and durable lifecycle evidence. KAS-741 adds one fresh owned Pi RPC worker attempt with strict framing, durable process identity before prompt delivery, bounded usage/error evidence, and verified process-group reap.
 
-Use `/kas <objective>` to ask the active model to create one lifecycle-only run through `orkastrator_run_create`. Use `/kas-runs` to inspect the run owned by this Pi session and preserved runs from other sessions. The caller-supplied policy snapshot is a temporary KAS-740 seam; repository-owned `repo-default` resolution belongs to KAS-742.
+Use `/kas <objective>` to ask the active model to create a run through `orkastrator_run_create`. Use `/kas-runs` to inspect the run owned by this Pi session and preserved runs from other sessions. The worker still runs in the trusted checkout until KAS-743 adds Worktrunk isolation. The caller-supplied policy snapshot is temporary; repository-owned `repo-default` resolution belongs to KAS-742.
 
 ## legacy Python/Orca controller
 
@@ -124,7 +124,7 @@ npm install
 pi --approve
 ```
 
-Use `/reload` after source changes, `/kas <objective>` to ask the model to create a lifecycle-only run, and `/kas-runs` to inspect active and preserved runs. The current KAS-740 slice owns lifecycle and durable ledger evidence only; worker RPC, policy reduction, and Worktrunk mutation land in follow-up issues.
+Use `/reload` after source changes, `/kas <objective>` to run one owned Pi worker attempt, and `/kas-runs` to inspect active and preserved runs. KAS-742 adds deterministic policy reduction and KAS-743 adds Worktrunk isolation.
 
 A finding can settle wrongly - most often because the supervisor lacked a word for what an
 adjudicator meant. `orkas reopen` sends it back to an earlier phase, retires the settled stages at

@@ -86,6 +86,41 @@ test("run creation snapshots policy and commits the event before its state proje
   }
 });
 
+test("owned process journal binds and clears one attempt idempotently", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const identity = {
+      pid: 6001,
+      processGroupId: 6001,
+      sessionFile: join(value.temporary, "worker.jsonl"),
+      attemptToken: "attempt-1",
+    };
+    const bound = value.ledger.journalOwnedProcess(run.runId, "attempt-1", identity);
+    assert.deepEqual(bound.ownedProcesses, [identity]);
+    assert.equal(
+      value.ledger.journalOwnedProcess(run.runId, "attempt-1", identity).sequence,
+      bound.sequence,
+    );
+    assert.throws(
+      () => value.ledger.journalOwnedProcess(run.runId, "attempt-1", { ...identity, pid: 6002 }),
+      /different ownership/u,
+    );
+    const cleared = value.ledger.journalOwnedProcess(run.runId, "attempt-1");
+    assert.deepEqual(cleared.ownedProcesses, []);
+    assert.equal(
+      value.ledger.journalOwnedProcess(run.runId, "attempt-1").sequence,
+      cleared.sequence,
+    );
+    assert.deepEqual(
+      value.ledger.events(run.runId).slice(-2).map((event) => event.type),
+      ["owned_process_bound", "owned_process_cleared"],
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
 test("a projection write failure preserves the already-fsynced authoritative event", () => {
   const temporary = mkdtempSync(join(tmpdir(), "orkastrator-ledger-failure-"));
   const repository = join(temporary, "repository");

@@ -13,9 +13,9 @@ pi --approve
 
 Use `/reload` after editing extension source. `/kas-runs` confirms that the extension loaded. The private package manifest also exposes the extension for local `pi install <path>` development, but there is no published package yet.
 
-## KAS-740 lifecycle slice
+## KAS-740 and KAS-741 slice
 
-The extension currently owns only session lifecycle and durable local run evidence:
+The extension owns session lifecycle, durable local run evidence, and one fresh owned Pi RPC worker attempt:
 
 - trusted-project run creation through `orkastrator_run_create`;
 - one nonterminal run per supervisor Pi session;
@@ -25,9 +25,13 @@ The extension currently owns only session lifecycle and durable local run eviden
 - same-session, same-process reload rebind when every recorded identity is proven;
 - fail-closed interruption when reload continuity is missing or mismatched;
 - resumable nonterminal `awaiting_owner` records and explicit owner answers;
-- interruption on new, resume, fork, quit, SIGTERM, and SIGHUP session boundaries.
+- interruption on new, resume, fork, quit, SIGTERM, and SIGHUP session boundaries;
+- strict LF-only Pi RPC framing, correlated prompt acceptance, `agent_settled`, usage, and bounded stderr;
+- PID, process group, unique session file, and attempt token recorded before the prompt is sent;
+- AbortSignal cancellation with process-group SIGTERM/SIGKILL escalation and absence proof;
+- shutdown waits for worker reap and durable ownership clear before recording interruption.
 
-It does not launch workers, mutate Worktrunk state, recover after crashes, merge branches, or publish to ClickClack.
+The worker currently runs in the trusted repository checkout. KAS-743 adds an isolated Worktrunk checkout and destructive-action identity checks. This slice does not implement policy reduction, review/fix waves, recovery, publication, merge, or ClickClack.
 
 ## Ledger layout
 
@@ -57,7 +61,7 @@ Pi session history and custom entries are status projections only. They are neve
 - recorded worker session files, PIDs, process groups, and attempt tokens;
 - recorded repository and Worktrunk identities.
 
-The replacement extension instance may rebind only when `session_start` also reports `reload`, session ID/generation/host PID/canonical repository root match exactly, and an injected identity verifier confirms every nonempty worker and worktree record. This KAS-740 slice has no workers, so the empty set can rebind. The default verifier rejects every nonempty resource set until KAS-743 supplies live identity checks. A missing marker, changed process, mismatch, or verifier error transitions the run to `interrupted` and preserves all evidence.
+The replacement extension instance may rebind only when `session_start` also reports `reload`, session ID/generation/host PID/canonical repository root match exactly, and an injected identity verifier confirms every nonempty worker and worktree record. A completed or cancelled KAS-741 attempt clears its owned process before shutdown. The default verifier rejects any nonempty process or worktree set until KAS-743 supplies live identity checks. A missing marker, changed process, mismatch, or verifier error transitions the run to `interrupted` and preserves all evidence.
 
 Normal startup after a crash never rebinds, even if the Pi session ID matches. It reports the run as stale and leaves it unchanged.
 
@@ -67,7 +71,7 @@ Normal startup after a crash never rebinds, even if the Pi session ID matches. I
 
 ## Extension surface
 
-- `orkastrator_run_create`: creates the lifecycle-only run and snapshots caller-supplied policy bytes. KAS-742 replaces this temporary seam with strict repository-owned `repo-default` resolution.
+- `orkastrator_run_create`: creates the run, snapshots caller-supplied policy bytes, and runs one fresh owned Pi RPC worker attempt. KAS-742 replaces the temporary policy seam with strict repository-owned `repo-default` resolution.
 - `orkastrator_owner_answer`: records an allowed answer for a run owned by the current session and resumes that same run.
 - `/kas <objective>`: starts a model turn that creates the Pi-native lifecycle run directly through `orkastrator_run_create`; it never invokes the legacy `orkas` CLI or Orca.
 - `/kas-runs`: reports the current session's run plus preserved runs from other sessions.

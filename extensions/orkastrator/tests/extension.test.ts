@@ -8,11 +8,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installOrkastrator, ENTRY_TYPE, STATUS_KEY } from "../index.ts";
 import { RunLedger } from "../ledger/file-ledger.ts";
 import { LifecycleCoordinator } from "../lifecycle.ts";
+import type { PiAttemptResult, PiAttemptSpec } from "../rpc/pi-attempt.ts";
 
 interface FakeContext {
   cwd: string;
   trusted: boolean;
   sessionManager: { getSessionId(): string };
+  model: { provider: string; id: string };
+  thinkingLevel: "low";
   isProjectTrusted(): boolean;
   statuses: Array<[string, string | undefined]>;
   notifications: Array<[string, string | undefined]>;
@@ -82,6 +85,8 @@ function context(repository: string, session = "session-1", trusted = true): Fak
     cwd: repository,
     trusted,
     sessionManager: { getSessionId: () => session },
+    model: { provider: "test", id: "worker" },
+    thinkingLevel: "low",
     isProjectTrusted: () => value.trusted,
     statuses: [],
     notifications: [],
@@ -93,7 +98,10 @@ function context(repository: string, session = "session-1", trusted = true): Fak
   return value;
 }
 
-function fixture(options: { canonicalizeRepository?: (path: string) => string } = {}): {
+function fixture(options: {
+  canonicalizeRepository?: (path: string) => string;
+  runAttempt?: (spec: PiAttemptSpec, signal: AbortSignal) => Promise<PiAttemptResult>;
+} = {}): {
   temporary: string;
   repository: string;
   ledger: RunLedger;
@@ -112,6 +120,15 @@ function fixture(options: { canonicalizeRepository?: (path: string) => string } 
     coordinator,
     hostPid: 4242,
     canonicalizeRepository: options.canonicalizeRepository ?? (() => repository),
+    randomAttemptToken: () => "attempt-token",
+    runAttempt: options.runAttempt ?? (async () => ({
+      status: "settled",
+      usage: { input: 1, output: 1, total: 2, cost: 0 },
+      stderr: "",
+      stderrTruncated: false,
+      exitCode: 143,
+      exitSignal: null,
+    })),
   });
   return {
     temporary,
@@ -123,7 +140,7 @@ function fixture(options: { canonicalizeRepository?: (path: string) => string } 
   };
 }
 
-test("kas command starts the Pi-native lifecycle flow without legacy Orca", async () => {
+test("kas command starts the Pi-native worker flow without legacy Orca", async () => {
   const value = fixture();
   try {
     const ctx = context(value.repository);
@@ -131,7 +148,7 @@ test("kas command starts the Pi-native lifecycle flow without legacy Orca", asyn
     assert.deepEqual(value.api.userMessages, [
       {
         content:
-          "Start a Pi-native Orkastrator v1 lifecycle run for this objective: Ship the lifecycle slice\n\nUse orkastrator_run_create directly. Do not use the legacy orkas CLI or Orca.",
+          "Start a Pi-native Orkastrator v1 worker attempt for this objective: Ship the lifecycle slice\n\nUse orkastrator_run_create directly. Do not use the legacy orkas CLI or Orca.",
         options: undefined,
       },
     ]);
@@ -199,6 +216,68 @@ test("untrusted sessions cannot create or inspect project-local run state", asyn
     await value.api.commands.get("kas-runs")?.handler("", ctx);
     assert.match(ctx.notifications.at(-1)?.[0] ?? "", /requires project trust/u);
     assert.equal(value.ledger.scanNonterminal().length, 0);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("shutdown awaits worker reap and ownership clear before the terminal transition", async () => {
+  const order: string[] = [];
+  const value = fixture({
+    runAttempt: async (spec, signal) => {
+      await spec.journalOwnership({
+        pid: 6001,
+        processGroupId: 6001,
+        sessionFile: join(value.repository, "worker.jsonl"),
+        attemptToken: spec.attemptToken,
+      });
+      order.push("ownership_bound");
+      await new Promise<void>((resolveAbort) => {
+        if (signal.aborted) resolveAbort();
+        else signal.addEventListener("abort", () => resolveAbort(), { once: true });
+      });
+      order.push("abort_received");
+      await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+      await spec.journalOwnership(null);
+      order.push("ownership_cleared");
+      return {
+        status: "cancelled",
+        stderr: "",
+        stderrTruncated: false,
+        exitCode: 143,
+        exitSignal: null,
+      };
+    },
+  });
+  try {
+    const ctx = context(value.repository);
+    const tool = value.api.tools.get("orkastrator_run_create");
+    assert.ok(tool);
+    const execution = tool.execute(
+      "tool-1",
+      { objective: "Wait for shutdown", policySnapshot: "version: 1\n" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    while (!order.includes("ownership_bound")) {
+      await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+    }
+    const runId = value.ledger.activeRunsForSession("session-1")[0]!.runId;
+    await value.api.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+    order.push("shutdown_returned");
+    await execution;
+    assert.deepEqual(order, [
+      "ownership_bound",
+      "abort_received",
+      "ownership_cleared",
+      "shutdown_returned",
+    ]);
+    assert.equal(value.ledger.activeRunsForSession("session-1").length, 0);
+    assert.deepEqual(
+      value.ledger.events(runId).slice(-2).map((event) => event.type),
+      ["owned_process_cleared", "run_state_transitioned"],
+    );
   } finally {
     value.cleanup();
   }

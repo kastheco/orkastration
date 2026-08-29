@@ -25,6 +25,7 @@ import {
   type CreateRunInput,
   type JsonObject,
   type OwnerAnswerInput,
+  type OwnedProcessIdentity,
   type OwnershipInput,
   RUN_STATES,
   type RunActor,
@@ -311,22 +312,50 @@ export class RunLedger {
     return this.#withWriterLock(() => this.#recordOwnership(runId, input));
   }
 
+  journalOwnedProcess(
+    runId: string,
+    attemptToken: string,
+    identity?: OwnedProcessIdentity,
+  ): RunRecord {
+    return this.#withWriterLock(() => {
+      const current = this.loadRun(runId).record;
+      if (TERMINAL_RUN_STATES.has(current.state)) {
+        throw new LedgerError(`terminal run ${runId} cannot change process ownership`);
+      }
+      const existing = current.ownedProcesses.find(
+        (processIdentity) => processIdentity.attemptToken === attemptToken,
+      );
+      if (identity !== undefined) {
+        if (identity.attemptToken !== attemptToken) throw new LedgerError("attempt token mismatch");
+        this.#assertOwnedProcess(identity);
+        if (existing !== undefined) {
+          if (JSON.stringify(existing) !== JSON.stringify(identity)) {
+            throw new LedgerError(`attempt ${attemptToken} already has different ownership`);
+          }
+          return current;
+        }
+      } else if (existing === undefined) {
+        return current;
+      }
+      const ownedProcesses = identity === undefined
+        ? current.ownedProcesses.filter((item) => item.attemptToken !== attemptToken)
+        : [...current.ownedProcesses, { ...identity }];
+      return this.#commit(current, { ...current, ownedProcesses }, {
+        type: identity === undefined ? "owned_process_cleared" : "owned_process_bound",
+        ruleId: "worker.process_ownership",
+        actor: "extension",
+        evidence: { attemptToken, pid: identity?.pid ?? null },
+      });
+    });
+  }
+
   #recordOwnership(runId: string, input: OwnershipInput): RunRecord {
     const current = this.loadRun(runId).record;
     if (TERMINAL_RUN_STATES.has(current.state)) {
       throw new LedgerError(`terminal run ${runId} cannot bind ownership`);
     }
     for (const processIdentity of input.ownedProcesses) {
-      if (
-        !Number.isInteger(processIdentity.pid) ||
-        processIdentity.pid < 2 ||
-        !Number.isInteger(processIdentity.processGroupId) ||
-        processIdentity.processGroupId < 2 ||
-        !isAbsolute(processIdentity.sessionFile) ||
-        processIdentity.attemptToken.length === 0
-      ) {
-        throw new LedgerError("owned process identity is incomplete");
-      }
+      this.#assertOwnedProcess(processIdentity);
     }
     for (const worktree of input.worktrees) {
       if (
@@ -574,6 +603,19 @@ export class RunLedger {
         },
       },
     );
+  }
+
+  #assertOwnedProcess(processIdentity: OwnedProcessIdentity): void {
+    if (
+      !Number.isInteger(processIdentity.pid) ||
+      processIdentity.pid < 2 ||
+      !Number.isInteger(processIdentity.processGroupId) ||
+      processIdentity.processGroupId < 2 ||
+      !isAbsolute(processIdentity.sessionFile) ||
+      processIdentity.attemptToken.length === 0
+    ) {
+      throw new LedgerError("owned process identity is incomplete");
+    }
   }
 
   runDirectory(runId: string): string {

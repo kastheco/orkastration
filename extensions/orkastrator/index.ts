@@ -1,10 +1,16 @@
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { RunLedger } from "./ledger/file-ledger.ts";
 import type { RunRecord } from "./ledger/types.ts";
 import { LifecycleCoordinator } from "./lifecycle.ts";
+import {
+  type PiAttemptResult,
+  runOwnedPiAttempt,
+} from "./rpc/pi-attempt.ts";
 
 export const STATUS_KEY = "orkastrator";
 export const ENTRY_TYPE = "orkastrator-lifecycle";
@@ -15,11 +21,14 @@ export interface OrkastratorExtensionDependencies {
   stateRoot?: string;
   hostPid?: number;
   canonicalizeRepository?: (path: string) => string;
+  piExecutable?: string;
+  randomAttemptToken?: () => string;
+  runAttempt?: typeof runOwnedPiAttempt;
 }
 
 type LifecycleContext = Pick<
   ExtensionContext,
-  "cwd" | "isProjectTrusted" | "sessionManager"
+  "cwd" | "isProjectTrusted" | "sessionManager" | "model" | "thinkingLevel"
 > & {
   ui: Pick<ExtensionContext["ui"], "notify" | "setStatus">;
 };
@@ -51,7 +60,14 @@ export function installOrkastrator(
   const coordinator = dependencies.coordinator ?? new LifecycleCoordinator(ledger);
   const hostPid = dependencies.hostPid ?? process.pid;
   const canonicalizeRepository = dependencies.canonicalizeRepository ?? realpathSync;
+  const piExecutable =
+    dependencies.piExecutable ?? resolve(import.meta.dirname, "../../../node_modules/.bin/pi");
+  const randomAttemptToken = dependencies.randomAttemptToken ?? randomUUID;
+  const runAttempt = dependencies.runAttempt ?? runOwnedPiAttempt;
   let claimedRunId: string | undefined;
+  let activeAttempt:
+    | { runId: string; controller: AbortController; promise: Promise<PiAttemptResult> }
+    | undefined;
 
   const requireTrust = (ctx: LifecycleContext): void => {
     if (!ctx.isProjectTrusted()) throw new Error("Orkastrator requires project trust");
@@ -135,8 +151,13 @@ export function installOrkastrator(
     refreshStatus(ctx);
   });
 
-  pi.on("session_shutdown", (event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     if (!ctx.isProjectTrusted()) return;
+    if (activeAttempt !== undefined) {
+      activeAttempt.controller.abort();
+      await activeAttempt.promise;
+      activeAttempt = undefined;
+    }
     if (claimedRunId === undefined) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       return;
@@ -174,8 +195,9 @@ export function installOrkastrator(
         const objective = args.trim();
         pi.sendUserMessage(
           objective.length === 0
-            ? "Start a Pi-native Orkastrator v1 lifecycle run. Ask me for the objective before calling orkastrator_run_create. Do not use the legacy orkas CLI or Orca."
-            : `Start a Pi-native Orkastrator v1 lifecycle run for this objective: ${objective}\n\nUse orkastrator_run_create directly. Do not use the legacy orkas CLI or Orca.`,
+            ? "Start a Pi-native Orkastrator v1 worker attempt. Ask me for the objective before calling orkastrator_run_create. Do not use the legacy orkas CLI or Orca."
+            : `Start a Pi-native Orkastrator v1 worker attempt for this objective: ${objective}\n\nUse orkastrator_run_create directly. Do not use the legacy orkas CLI or Orca.`,
+
         );
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -211,7 +233,7 @@ export function installOrkastrator(
     name: "orkastrator_run_create",
     label: "Create Orkastrator Run",
     description:
-      "Create one lifecycle-only Orkastrator v1 run for this trusted Pi session and durably snapshot the supplied effective policy. KAS-742 will replace the caller-supplied policy seam with repository profile resolution.",
+      "Create one Orkastrator v1 run, snapshot its effective policy, and execute one fresh owned Pi RPC worker attempt. KAS-742 will replace the caller-supplied policy seam with repository profile resolution.",
     parameters: Type.Object(
       {
         objective: Type.String({ minLength: 1, maxLength: 8_000 }),
@@ -219,8 +241,9 @@ export function installOrkastrator(
       },
       { additionalProperties: false },
     ),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       requireTrust(ctx);
+      if (ctx.model === undefined) throw new Error("Orkastrator requires an active Pi model");
       const record = coordinator.startRun({
         objective: params.objective,
         policySnapshot: params.policySnapshot,
@@ -235,15 +258,44 @@ export function installOrkastrator(
         policyHash: record.policyHash,
       });
       refreshStatus(ctx);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Created Orkastrator run ${record.runId} in state ${record.state}.`,
+      const attemptToken = randomAttemptToken();
+      const controller = new AbortController();
+      const onToolAbort = (): void => controller.abort();
+      signal?.addEventListener("abort", onToolAbort, { once: true });
+      const promise = runAttempt(
+        {
+          executable: piExecutable,
+          cwd: record.repositoryRoot,
+          sessionFile: join(ledger.runDirectory(record.runId), `worker-${attemptToken}.jsonl`),
+          attemptToken,
+          prompt: record.objective,
+          model: `${ctx.model.provider}/${ctx.model.id}`,
+          thinking: ctx.thinkingLevel ?? "off",
+          journalOwnership: (identity) => {
+            ledger.journalOwnedProcess(record.runId, attemptToken, identity ?? undefined);
           },
-        ],
-        details: { run: record },
-      };
+          recordEvent: (event) => {
+            pi.appendEntry(ENTRY_TYPE, { action: "worker_event", runId: record.runId, event });
+          },
+        },
+        controller.signal,
+      );
+      activeAttempt = { runId: record.runId, controller, promise };
+      try {
+        const attempt = await promise;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Created Orkastrator run ${record.runId}; worker attempt ${attempt.status}.`,
+            },
+          ],
+          details: { run: ledger.loadRun(record.runId).record, attempt },
+        };
+      } finally {
+        signal?.removeEventListener("abort", onToolAbort);
+        if (activeAttempt?.runId === record.runId) activeAttempt = undefined;
+      }
     },
   });
 
