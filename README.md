@@ -20,17 +20,29 @@ pi install npm:pi-subagents
 pi install git:github.com/kastheco/orkastrator
 ```
 
-Run Pi from a trusted Git repository with a clean, committed change, then use:
+Run Pi from a trusted Git repository, then choose the amount of ceremony:
 
 ```text
-/kas <review objective>
+/kas <implementation request>
+/kas:cook <implementation request>
+/kas:check <review objective>
 ```
 
-`/kas` is a shorthand for starting the `orkastrator-review` workflow. It resolves
-the repository's exact committed `HEAD` and refuses to guess when the worktree is
-dirty. `/kas-runs` reports the active or most recent workflow run.
+- `/kas` explicitly runs the installed `implement` skill. It skips
+  `grill-with-docs`, doing only the planning or clarification the request actually
+  needs, then automatically runs `/kas:check` after the implementation is tested,
+  reviewed, and committed.
+- `/kas:cook` explicitly runs Matt Pocock's `grill-with-docs` skill across as many
+  user turns as needed. Once the plan and domain docs are accepted, it runs the
+  installed `implement` skill and then automatically runs `/kas:check`.
+- `/kas:check` starts the `orkastrator-review` workflow against the repository's
+  exact committed `HEAD`. It refuses to guess when the worktree is dirty.
+- `/kas-runs` reports the active or most recent review workflow run.
 
-The direct equivalent is:
+`/kas` requires `/skill:implement`. `/kas:cook` also requires
+`/skill:grill-with-docs`; missing skills fail closed before work starts.
+
+The direct `/kas:check` equivalent is:
 
 ```text
 /workflow orkastrator-review --input-json {
@@ -89,8 +101,9 @@ extensions/orkastrator-workflows/review-runtime.ts
 extensions/orkastrator-workflows/review-wave.ts
 ```
 
-The extension registers `/kas`, `/kas-runs`, and the bridge between Pi Workflows
-and `pi-subagents`. The workflow definition remains the durable control graph.
+The extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, and the
+bridge between Pi Workflows and `pi-subagents`. The workflow definition remains
+the durable review control graph.
 
 ## Development
 

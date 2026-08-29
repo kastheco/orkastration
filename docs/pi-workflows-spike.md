@@ -11,6 +11,20 @@ choices, source identity, and result delivery. `pi-subagents` owns bounded
 reviewer and fixer sessions. Orkastrator owns only the review-and-repair rules
 that are specific to this project.
 
+## Command surface
+
+- `/kas <request>` expands the installed `implement` skill, allows only the
+  planning needed by the request, and automatically applies the `/kas:check`
+  contract after the implementation is reviewed, tested, and committed.
+- `/kas:cook <request>` expands `grill-with-docs`, keeps its interview and domain
+  documentation phase active across user turns, then follows the exact installed
+  `implement` skill and the `/kas:check` contract.
+- `/kas:check <objective>` runs only the durable `orkastrator-review` workflow
+  against a clean, exact committed revision.
+
+Required skills are discovered through Pi's command registry. Missing
+`implement` or `grill-with-docs` resources fail closed before the pipeline starts.
+
 ## Why the custom runtime was removed
 
 The original implementation directly built a lifecycle engine, JSONL ledger,
@@ -41,7 +55,8 @@ The run demonstrated:
 - a clean final worktree with all fixture tests passing;
 - durable Pi Workflows completion with no unresolved groups.
 
-The first real `/kas` dogfood run,
+The first real review dogfood run (triggered by the former `/kas` review-only
+command, now `/kas:check`),
 `20260829T215431995Z-orkastrator-review-053a7221`, reviewed the cutover itself.
 It found and repaired three blocking boundary defects in `4e6f478`: finding
 identity after sorting, deferred evidence across a rejected round, and rename
