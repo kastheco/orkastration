@@ -134,8 +134,14 @@ test("blocking status is derived from review context instead of reviewer discret
       },
     ],
   });
-  assert.equal(reReview.introducedFindings[0]?.blocking, false);
-  assert.equal(reReview.introducedFindings[1]?.blocking, true);
+  assert.equal(
+    reReview.introducedFindings.find((finding) => finding.id === "unrelated")?.blocking,
+    false,
+  );
+  assert.equal(
+    reReview.introducedFindings.find((finding) => finding.id === "regression")?.blocking,
+    true,
+  );
 });
 
 test("delegation bridge correlates one terminal response and cancels on abort", async () => {
@@ -315,6 +321,167 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
   assert.match(repeated.unresolved[0]!.reason, /final reconciliation/);
   assert.equal(await git(repository, ["rev-parse", "HEAD"]), integratedHead);
   assert.equal(fixerRequests, 2, "a resumed action adopts existing exact fixer commits");
+  uninstall();
+});
+
+test("a novel deferred finding from a rejected round blocks later acceptance", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-deferred-"));
+  const repository = join(root, "repo");
+  await git(root, ["init", "--initial-branch=main", repository]);
+  await git(repository, ["config", "user.name", "Orkastrator Test"]);
+  await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+  await writeFile(join(repository, "a.txt"), "broken\n", "utf8");
+  await git(repository, ["add", "a.txt"]);
+  await git(repository, ["commit", "-m", "worker change"]);
+  const reviewRevision = await git(repository, ["rev-parse", "HEAD"]);
+  const plan = planReviewWaves([{
+    id: "finding-a",
+    severity: "high",
+    category: "correctness",
+    contract: "a.txt must be fixed",
+    evidence: ["a.txt is broken"],
+    implicatedPaths: ["a.txt"],
+    writablePaths: ["a.txt"],
+    blocking: true,
+  }], 1);
+  const events = new FakeEvents();
+  const uninstall = installDelegationBridge(events, {});
+  let fixerRequests = 0;
+  events.on(SUBAGENT_DELEGATION_REQUEST_EVENT, (payload) => {
+    const request = payload as SubagentDelegationRequest;
+    void (async () => {
+      if (request.nodeId.includes(":fix:")) {
+        fixerRequests += 1;
+        await writeFile(join(request.cwd, "a.txt"), "fixed\n", "utf8");
+        await git(request.cwd, ["add", "a.txt"]);
+        await git(request.cwd, ["commit", "-m", "fix a"]);
+        respond(events, request, { kind: "text", text: "committed" });
+        return;
+      }
+      if (request.nodeId.includes(":re-review:1")) {
+        respond(events, request, {
+          kind: "structured",
+          value: {
+            verdict: "reject",
+            reason: "fix introduced a regression",
+            introducedFindings: [
+              {
+                id: "novel-deferred",
+                severity: "high",
+                category: "correctness",
+                contract: "novel.txt must preserve its contract",
+                evidence: ["novel defect"],
+                implicatedPaths: ["novel.txt"],
+                writablePaths: ["novel.txt"],
+                introducedByFix: false,
+              },
+              {
+                id: "introduced-regression",
+                severity: "high",
+                category: "correctness",
+                contract: "a.txt must not regress",
+                evidence: ["regression"],
+                implicatedPaths: ["a.txt"],
+                writablePaths: ["a.txt"],
+                introducedByFix: true,
+              },
+            ],
+          },
+        });
+        return;
+      }
+      if (request.nodeId.includes(":re-review:2")) {
+        respond(events, request, {
+          kind: "structured",
+          value: { verdict: "accept", reason: "fixed", introducedFindings: [] },
+        });
+        return;
+      }
+      throw new Error(`unexpected delegation ${request.nodeId}`);
+    })().catch((error: unknown) => {
+      events.emit(SUBAGENT_DELEGATION_RESPONSE_EVENT, {
+        requestId: request.requestId,
+        ownerRunId: request.ownerRunId,
+        nodeId: request.nodeId,
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      } satisfies SubagentDelegationResponse);
+    });
+  });
+
+  const result = await runFixWaves(actionContext({
+    objective: "repair a",
+    repository,
+    reviewRevision,
+    maxParallelFixers: 1,
+    stateRoot: join(root, "state"),
+  }, "deferred-run"), plan);
+
+  assert.equal(fixerRequests, 2);
+  assert.equal(result.accepted[0]?.rounds, 2);
+  assert.deepEqual(result.accepted[0]?.deferredFindings.map((finding) => finding.id), ["novel-deferred"]);
+  assert.equal(result.status, "needs_owner");
+  assert.match(result.unresolved[0]?.reason ?? "", /final reconciliation/);
+  uninstall();
+});
+
+test("scope enforcement includes paths removed by a rename", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-scope-"));
+  const repository = join(root, "repo");
+  await git(root, ["init", "--initial-branch=main", repository]);
+  await git(repository, ["config", "user.name", "Orkastrator Test"]);
+  await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+  await git(repository, ["config", "diff.renames", "true"]);
+  await writeFile(join(repository, "out-of-scope.txt"), "content\n", "utf8");
+  await git(repository, ["add", "out-of-scope.txt"]);
+  await git(repository, ["commit", "-m", "worker change"]);
+  const reviewRevision = await git(repository, ["rev-parse", "HEAD"]);
+  const plan = planReviewWaves([{
+    id: "finding",
+    severity: "high",
+    category: "correctness",
+    contract: "writable.txt must exist",
+    evidence: ["missing file"],
+    implicatedPaths: ["writable.txt"],
+    writablePaths: ["writable.txt"],
+    blocking: true,
+  }], 1);
+  const events = new FakeEvents();
+  const uninstall = installDelegationBridge(events, {});
+  let reReviews = 0;
+  events.on(SUBAGENT_DELEGATION_REQUEST_EVENT, (payload) => {
+    const request = payload as SubagentDelegationRequest;
+    void (async () => {
+      if (request.nodeId.includes(":fix:")) {
+        await git(request.cwd, ["mv", "out-of-scope.txt", "writable.txt"]);
+        await git(request.cwd, ["commit", "-m", "rename into scope"]);
+        respond(events, request, { kind: "text", text: "committed" });
+        return;
+      }
+      if (request.nodeId.includes(":re-review:")) reReviews += 1;
+      throw new Error(`unexpected delegation ${request.nodeId}`);
+    })().catch((error: unknown) => {
+      events.emit(SUBAGENT_DELEGATION_RESPONSE_EVENT, {
+        requestId: request.requestId,
+        ownerRunId: request.ownerRunId,
+        nodeId: request.nodeId,
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      } satisfies SubagentDelegationResponse);
+    });
+  });
+
+  await assert.rejects(
+    runFixWaves(actionContext({
+      objective: "create writable file",
+      repository,
+      reviewRevision,
+      maxParallelFixers: 1,
+      stateRoot: join(root, "state"),
+    }, "scope-run"), plan),
+    /outside declared scope: out-of-scope\.txt/u,
+  );
+  assert.equal(reReviews, 0);
   uninstall();
 });
 

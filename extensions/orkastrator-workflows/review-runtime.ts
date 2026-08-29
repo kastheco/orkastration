@@ -228,6 +228,7 @@ async function runFixerGroup(
 ): Promise<AcceptedFix | UnresolvedFix> {
   const worktree = await ensureFixerWorktree(input, context.state.runId, group.groupId, context.signal);
   let rejectionEvidence: string[] = [];
+  const deferredFindings = new Map<string, InitialReviewFinding>();
   for (let round = 1; round <= 2; round += 1) {
     let head = await git(worktree, ["rev-parse", "HEAD"], context.signal);
     if (head === input.reviewRevision) {
@@ -282,9 +283,11 @@ async function runFixerGroup(
     const introducedBlocking = verdict.introducedFindings.filter(
       (finding) => finding.introducedByFix && finding.blocking,
     );
-    const deferredFindings = verdict.introducedFindings
-      .filter((finding) => !finding.introducedByFix)
-      .map(({ introducedByFix: _, ...finding }) => finding);
+    for (const finding of verdict.introducedFindings) {
+      if (finding.introducedByFix || deferredFindings.has(finding.id)) continue;
+      const { introducedByFix: _, ...deferredFinding } = finding;
+      deferredFindings.set(deferredFinding.id, deferredFinding);
+    }
     if (verdict.verdict === "accept" && introducedBlocking.length === 0) {
       return {
         groupId: group.groupId,
@@ -292,7 +295,7 @@ async function runFixerGroup(
         changedPaths,
         rounds: round,
         worktree,
-        deferredFindings,
+        deferredFindings: [...deferredFindings.values()],
       };
     }
     rejectionEvidence = [
@@ -380,7 +383,7 @@ async function inspectExactFixCommit(
   }
   const count = await git(worktree, ["rev-list", "--count", `${base}..${head}`], signal);
   if (count !== "1") throw new Error(`fixer must return exactly one commit, observed ${count}`);
-  const changedPaths = (await git(worktree, ["diff", "--name-only", base, head], signal))
+  const changedPaths = (await git(worktree, ["diff", "--name-only", "--no-renames", base, head], signal))
     .split("\n")
     .filter(Boolean)
     .sort((left, right) => left.localeCompare(right));
@@ -491,27 +494,33 @@ export function parseReReviewVerdict(value: unknown): ReReviewVerdict {
   if (!Array.isArray(introducedFindings)) {
     throw new Error("re-review introducedFindings must be an array");
   }
+  const introducedByFix = new Map<string, boolean>();
   const parsed = parseInitialReviewOutput(JSON.stringify({
     findings: introducedFindings.map((finding) => {
       if (finding === null || typeof finding !== "object" || Array.isArray(finding)) {
         throw new Error("introduced finding must be an object");
       }
-      const { introducedByFix: _, ...rest } = finding as Record<string, unknown>;
+      const record = finding as Record<string, unknown>;
+      if (typeof record.introducedByFix !== "boolean") {
+        throw new Error("introduced finding requires introducedByFix boolean");
+      }
+      if (typeof record.id === "string") introducedByFix.set(record.id, record.introducedByFix);
+      const { introducedByFix: _, ...rest } = record;
       return { ...rest, blocking: rest.category !== "style" };
     }),
   }), 1).findings;
   return {
     verdict: result.verdict,
     reason: result.reason,
-    introducedFindings: parsed.map((finding, index) => {
-      const original = introducedFindings[index] as Record<string, unknown>;
-      if (typeof original.introducedByFix !== "boolean") {
+    introducedFindings: parsed.map((finding) => {
+      const isIntroducedByFix = introducedByFix.get(finding.id);
+      if (isIntroducedByFix === undefined) {
         throw new Error("introduced finding requires introducedByFix boolean");
       }
       return {
         ...finding,
-        blocking: original.introducedByFix && finding.category !== "style",
-        introducedByFix: original.introducedByFix,
+        blocking: isIntroducedByFix && finding.category !== "style",
+        introducedByFix: isIntroducedByFix,
       };
     }),
   };
