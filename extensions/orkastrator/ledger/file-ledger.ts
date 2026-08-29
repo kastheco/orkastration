@@ -16,7 +16,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { constants as osConstants, homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -25,6 +25,7 @@ import {
   type CreateRunInput,
   type JsonObject,
   type OwnerAnswerInput,
+  type OwnedProcessExitEvidence,
   type OwnedProcessIdentity,
   type OwnershipInput,
   RUN_STATES,
@@ -35,10 +36,14 @@ import {
   type RunState,
   TERMINAL_RUN_STATES,
   type TransitionInput,
+  type WorkerEvent,
 } from "./types.ts";
 
 const MAX_POLICY_BYTES = 1_048_576;
 const MAX_OBJECTIVE_CHARS = 8_000;
+const MAX_WORKER_EVENT_BYTES = 32 * 1024;
+const MAX_WORKER_EVENT_TEXT_CHARS = 4_000;
+const EXIT_SIGNAL_SET = new Set<string>(Object.keys(osConstants.signals));
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const RUN_STATE_SET = new Set<string>(RUN_STATES);
 const RUN_ACTOR_SET = new Set<string>([
@@ -316,6 +321,7 @@ export class RunLedger {
     runId: string,
     attemptToken: string,
     identity?: OwnedProcessIdentity,
+    exitEvidence?: OwnedProcessExitEvidence,
   ): RunRecord {
     return this.#withWriterLock(() => {
       const current = this.loadRun(runId).record;
@@ -326,6 +332,9 @@ export class RunLedger {
         (processIdentity) => processIdentity.attemptToken === attemptToken,
       );
       if (identity !== undefined) {
+        if (exitEvidence !== undefined) {
+          throw new LedgerError("exit evidence is valid only when clearing process ownership");
+        }
         if (identity.attemptToken !== attemptToken) throw new LedgerError("attempt token mismatch");
         this.#assertOwnedProcess(identity);
         if (existing !== undefined) {
@@ -337,6 +346,7 @@ export class RunLedger {
       } else if (existing === undefined) {
         return current;
       }
+      if (exitEvidence !== undefined) this.#assertExitEvidence(exitEvidence);
       const ownedProcesses = identity === undefined
         ? current.ownedProcesses.filter((item) => item.attemptToken !== attemptToken)
         : [...current.ownedProcesses, { ...identity }];
@@ -344,7 +354,29 @@ export class RunLedger {
         type: identity === undefined ? "owned_process_cleared" : "owned_process_bound",
         ruleId: "worker.process_ownership",
         actor: "extension",
-        evidence: { attemptToken, pid: identity?.pid ?? null },
+        evidence: identity === undefined
+          ? {
+              identity: { ...existing! },
+              processGroupAbsent: true,
+              ...(exitEvidence === undefined ? {} : exitEvidence),
+            }
+          : { identity: { ...identity } },
+      });
+    });
+  }
+
+  appendWorkerEvent(runId: string, event: WorkerEvent): RunRecord {
+    return this.#withWriterLock(() => {
+      const current = this.loadRun(runId).record;
+      if (TERMINAL_RUN_STATES.has(current.state)) {
+        throw new LedgerError(`terminal run ${runId} cannot record worker events`);
+      }
+      const evidence = this.#workerEventEvidence(event);
+      return this.#commit(current, current, {
+        type: "worker_event",
+        ruleId: "worker.event_observed",
+        actor: "worker",
+        evidence,
       });
     });
   }
@@ -616,6 +648,25 @@ export class RunLedger {
     ) {
       throw new LedgerError("owned process identity is incomplete");
     }
+  }
+
+  #assertExitEvidence(evidence: OwnedProcessExitEvidence): void {
+    if (
+      (evidence.exitCode !== null &&
+        (!Number.isInteger(evidence.exitCode) || evidence.exitCode < 0)) ||
+      !isExitSignal(evidence.exitSignal)
+    ) {
+      throw new LedgerError("owned process exit evidence is invalid");
+    }
+  }
+
+  #workerEventEvidence(event: WorkerEvent): JsonObject {
+    assertWorkerEvent(event);
+    const serialized = JSON.stringify(event);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_WORKER_EVENT_BYTES) {
+      throw new LedgerError(`worker event exceeds ${MAX_WORKER_EVENT_BYTES} bytes`);
+    }
+    return { event: JSON.parse(serialized) as JsonObject };
   }
 
   runDirectory(runId: string): string {
@@ -1038,6 +1089,83 @@ function isOwnerWait(value: unknown): boolean {
     typeof value.response.answeredAt === "string" &&
     isIsoTimestamp(value.response.answeredAt)
   );
+}
+
+function assertWorkerEvent(value: unknown): asserts value is WorkerEvent {
+  if (!isObject(value) || typeof value.type !== "string") {
+    throw new LedgerError("worker event is not an object with a type");
+  }
+  switch (value.type) {
+    case "started":
+      if (
+        !hasExactKeys(value, ["type", "identity"]) ||
+        !isOwnedProcessIdentity(value.identity) ||
+        !isObject(value.identity) ||
+        !hasExactKeys(value.identity, ["pid", "processGroupId", "sessionFile", "attemptToken"])
+      ) {
+        throw new LedgerError("worker started event has invalid identity evidence");
+      }
+      return;
+    case "prompt_accepted":
+    case "settled":
+    case "abort":
+      if (!hasExactKeys(value, ["type"])) {
+        throw new LedgerError(`worker ${value.type} event has unsupported fields`);
+      }
+      return;
+    case "tool_activity":
+      if (
+        !hasExactKeys(value, ["type", "toolName"]) ||
+        typeof value.toolName !== "string" ||
+        value.toolName.length > MAX_WORKER_EVENT_TEXT_CHARS
+      ) {
+        throw new LedgerError("worker tool activity event is invalid");
+      }
+      return;
+    case "usage":
+      if (
+        !hasExactKeys(value, ["type", "input", "output", "total", "cost"]) ||
+        ![value.input, value.output, value.total, value.cost].every(
+          (amount) => typeof amount === "number" && Number.isFinite(amount) && amount >= 0,
+        )
+      ) {
+        throw new LedgerError("worker usage event is invalid");
+      }
+      return;
+    case "blocked":
+    case "error":
+      if (
+        !hasExactKeys(value, ["type", "message"]) ||
+        typeof value.message !== "string" ||
+        value.message.length > MAX_WORKER_EVENT_TEXT_CHARS
+      ) {
+        throw new LedgerError(`worker ${value.type} event is invalid`);
+      }
+      return;
+    case "exit":
+      if (
+        !hasExactKeys(value, ["type", "code", "signal"]) ||
+        (value.code !== null &&
+          (typeof value.code !== "number" || !Number.isInteger(value.code) || value.code < 0)) ||
+        !isExitSignal(value.signal)
+      ) {
+        throw new LedgerError("worker exit event is invalid");
+      }
+      return;
+    default:
+      throw new LedgerError(`unsupported worker event type: ${value.type}`);
+  }
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...expected].sort();
+  return keys.length === expectedKeys.length &&
+    keys.every((key, index) => key === expectedKeys[index]);
+}
+
+function isExitSignal(value: unknown): value is NodeJS.Signals | null {
+  return value === null || (typeof value === "string" && EXIT_SIGNAL_SET.has(value));
 }
 
 function isIsoTimestamp(value: string): boolean {

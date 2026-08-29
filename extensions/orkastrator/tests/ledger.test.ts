@@ -116,15 +116,78 @@ test("owned process journal binds and clears one attempt idempotently", () => {
       () => value.ledger.journalOwnedProcess(run.runId, "attempt-1", { ...identity, pid: 6002 }),
       /different ownership/u,
     );
-    const cleared = value.ledger.journalOwnedProcess(run.runId, "attempt-1");
+    const cleared = value.ledger.journalOwnedProcess(
+      run.runId,
+      "attempt-1",
+      undefined,
+      { exitCode: 143, exitSignal: null },
+    );
     assert.deepEqual(cleared.ownedProcesses, []);
     assert.equal(
       value.ledger.journalOwnedProcess(run.runId, "attempt-1").sequence,
       cleared.sequence,
     );
+    const ownershipEvents = value.ledger.events(run.runId).slice(-2);
     assert.deepEqual(
-      value.ledger.events(run.runId).slice(-2).map((event) => event.type),
+      ownershipEvents.map((event) => event.type),
       ["owned_process_bound", "owned_process_cleared"],
+    );
+    assert.deepEqual(ownershipEvents[1]?.evidence, {
+      identity,
+      processGroupAbsent: true,
+      exitCode: 143,
+      exitSignal: null,
+    });
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("worker events survive reload with ledger-authoritative sequence and unchanged run state", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const started = value.ledger.appendWorkerEvent(run.runId, {
+      type: "started",
+      identity: {
+        pid: 6001,
+        processGroupId: 6001,
+        sessionFile: join(value.temporary, "worker.jsonl"),
+        attemptToken: "attempt-1",
+      },
+    });
+    const accepted = value.ledger.appendWorkerEvent(run.runId, { type: "prompt_accepted" });
+    const settled = value.ledger.appendWorkerEvent(run.runId, { type: "settled" });
+
+    assert.deepEqual(
+      [started, accepted, settled].map((record) => ({ sequence: record.sequence, state: record.state })),
+      [
+        { sequence: 2, state: "submitted" },
+        { sequence: 3, state: "submitted" },
+        { sequence: 4, state: "submitted" },
+      ],
+    );
+
+    const reloaded = new RunLedger({ root: value.ledger.root });
+    const workerEvents = reloaded.events(run.runId).filter((event) => event.type === "worker_event");
+    assert.deepEqual(workerEvents.map((event) => event.sequence), [2, 3, 4]);
+    assert.deepEqual(workerEvents.map((event) => event.evidence.event), [
+      {
+        type: "started",
+        identity: {
+          pid: 6001,
+          processGroupId: 6001,
+          sessionFile: join(value.temporary, "worker.jsonl"),
+          attemptToken: "attempt-1",
+        },
+      },
+      { type: "prompt_accepted" },
+      { type: "settled" },
+    ]);
+    assert.equal(reloaded.loadRun(run.runId).record.state, "submitted");
+    assert.throws(
+      () => reloaded.appendWorkerEvent(run.runId, { type: "error", message: "x".repeat(4_001) }),
+      /worker error event is invalid/u,
     );
   } finally {
     value.cleanup();

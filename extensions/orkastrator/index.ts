@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 
 import { RunLedger } from "./ledger/file-ledger.ts";
-import type { RunRecord } from "./ledger/types.ts";
+import type { OwnedProcessExitEvidence, RunRecord } from "./ledger/types.ts";
 import { LifecycleCoordinator } from "./lifecycle.ts";
 import {
   type PiAttemptResult,
@@ -279,6 +279,7 @@ export function installOrkastrator(
       signal?.addEventListener("abort", onToolAbort, { once: true });
       if (signal?.aborted) controller.abort();
       const cleanup = { reapAndOwnershipClearProven: false };
+      let exitEvidence: OwnedProcessExitEvidence | undefined;
       const promise = runAttempt(
         {
           executable: piExecutable,
@@ -291,12 +292,26 @@ export function installOrkastrator(
           // Stage 2 resolves this from the validated worker role before run creation.
           fast: false,
           journalOwnership: (identity) => {
-            ledger.journalOwnedProcess(record.runId, attemptToken, identity ?? undefined);
+            ledger.journalOwnedProcess(
+              record.runId,
+              attemptToken,
+              identity ?? undefined,
+              identity === null ? exitEvidence : undefined,
+            );
             // runOwnedPiAttempt clears only after proving process-group absence.
             if (identity === null) cleanup.reapAndOwnershipClearProven = true;
           },
           recordEvent: (event) => {
-            pi.appendEntry(ENTRY_TYPE, { action: "worker_event", runId: record.runId, event });
+            if (event.type === "exit") {
+              exitEvidence = { exitCode: event.code, exitSignal: event.signal };
+            }
+            const durable = ledger.appendWorkerEvent(record.runId, event);
+            pi.appendEntry(ENTRY_TYPE, {
+              action: "worker_event",
+              runId: record.runId,
+              sequence: durable.sequence,
+              event,
+            });
           },
         },
         controller.signal,

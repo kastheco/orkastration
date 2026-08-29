@@ -302,7 +302,7 @@ test("an ambiguous durable bind is confirmed idempotently before prompting", asy
   }
 });
 
-test("post-reap cleanup survives telemetry and projection failures", async () => {
+test("a durable event append failure cannot yield a successful attempt and cleanup still completes", async () => {
   const value = fixture(settledBody());
   let bound = false;
   let clearCalls = 0;
@@ -318,10 +318,10 @@ test("post-reap cleanup survives telemetry and projection failures", async () =>
         if (clearCalls === 1) throw new Error("state projection failed after durable clear");
       }, {
         recordEvent: (event) => {
-          if (event.type === "exit") throw new Error("telemetry projection failed");
+          if (event.type === "exit") throw new Error("ledger event append failed");
         },
       }),
-      /telemetry projection failed/u,
+      /ledger event append failed/u,
     );
     assert.equal(clearCalls, 2);
     assert.equal(bound, false);

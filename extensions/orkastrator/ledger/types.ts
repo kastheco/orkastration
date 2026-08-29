@@ -35,6 +35,23 @@ export interface OwnedProcessIdentity {
   attemptToken: string;
 }
 
+export interface OwnedProcessExitEvidence {
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+}
+
+/** The closed set of normalized observations emitted by one owned Pi worker attempt. */
+export type WorkerEvent =
+  | { type: "started"; identity: OwnedProcessIdentity }
+  | { type: "prompt_accepted" }
+  | { type: "tool_activity"; toolName: string }
+  | { type: "usage"; input: number; output: number; total: number; cost: number }
+  | { type: "settled" }
+  | { type: "blocked"; message: string }
+  | { type: "error"; message: string }
+  | { type: "abort" }
+  | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
+
 export interface WorktreeIdentity {
   repositoryRoot: string;
   path: string;

@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
-import type { OwnedProcessIdentity } from "../ledger/types.ts";
+import type { OwnedProcessIdentity, WorkerEvent } from "../ledger/types.ts";
 import { serializeJsonLine } from "./jsonl.ts";
 
 const STDERR_LIMIT = 32 * 1024;
@@ -15,16 +15,8 @@ const KILL_GRACE_MS = 2_000;
 const POLL_MS = 25;
 const OPENAI_FAST_EXTENSION = fileURLToPath(new URL("./openai-fast.ts", import.meta.url));
 
-export type PiAttemptEvent =
-  | { type: "started"; identity: OwnedProcessIdentity }
-  | { type: "prompt_accepted" }
-  | { type: "tool_activity"; toolName: string }
-  | { type: "usage"; input: number; output: number; total: number; cost: number }
-  | { type: "settled" }
-  | { type: "blocked"; message: string }
-  | { type: "error"; message: string }
-  | { type: "abort" }
-  | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
+// Preserve the adapter's established type import while keeping one worker-event definition.
+export type { WorkerEvent as PiAttemptEvent } from "../ledger/types.ts";
 
 export interface PiAttemptSpec {
   executable: string;
@@ -36,7 +28,7 @@ export interface PiAttemptSpec {
   thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   fast: boolean;
   journalOwnership(identity: OwnedProcessIdentity | null): Promise<void> | void;
-  recordEvent(event: PiAttemptEvent): Promise<void> | void;
+  recordEvent(event: WorkerEvent): Promise<void> | void;
 }
 
 export interface PiAttemptResult {
@@ -171,7 +163,7 @@ export async function runOwnedPiAttempt(
     outcome.resolve(value);
   };
   let telemetryError: unknown;
-  const emit = async (event: PiAttemptEvent): Promise<void> => {
+  const emit = async (event: WorkerEvent): Promise<void> => {
     try {
       await spec.recordEvent(event);
     } catch (error) {

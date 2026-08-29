@@ -195,6 +195,142 @@ test("trusted run tool creates one durable run and rejects a second active run",
   }
 });
 
+test("worker events are ledgered before Pi history and clear ownership with reap evidence", async () => {
+  const value = fixture({
+    runAttempt: async (spec) => {
+      const identity = {
+        pid: 6001,
+        processGroupId: 6001,
+        sessionFile: spec.sessionFile,
+        attemptToken: spec.attemptToken,
+      };
+      await spec.journalOwnership(identity);
+      await spec.recordEvent({ type: "started", identity });
+      await spec.recordEvent({ type: "prompt_accepted" });
+      await spec.recordEvent({ type: "exit", code: 143, signal: null });
+      await spec.journalOwnership(null);
+      return {
+        status: "settled",
+        stderr: "",
+        stderrTruncated: false,
+        exitCode: 143,
+        exitSignal: null,
+      };
+    },
+  });
+  const durableBeforeMirror: boolean[] = [];
+  const appendEntry = value.api.appendEntry.bind(value.api);
+  value.api.appendEntry = (customType, data) => {
+    const entry = data as { action?: string; runId?: string; sequence?: number };
+    if (entry.action === "worker_event" && entry.runId !== undefined) {
+      durableBeforeMirror.push(
+        value.ledger.events(entry.runId).some((event) => event.sequence === entry.sequence),
+      );
+    }
+    appendEntry(customType, data);
+  };
+  try {
+    const ctx = context(value.repository);
+    const tool = value.api.tools.get("orkastrator_run_create");
+    assert.ok(tool);
+    await tool.execute(
+      "tool-1",
+      { objective: "Persist worker events", policySnapshot: "version: 1\n" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const run = value.ledger.activeRunsForSession("session-1")[0]!;
+    const events = value.ledger.events(run.runId);
+    const durableWorkerEvents = events.filter((event) => event.type === "worker_event");
+    const historyWorkerEntries = value.api.entries.filter(
+      (entry) => (entry.data as { action?: string }).action === "worker_event",
+    );
+
+    assert.deepEqual(durableWorkerEvents.map((event) => event.sequence), [3, 4, 5]);
+    assert.deepEqual(durableBeforeMirror, [true, true, true]);
+    assert.deepEqual(
+      historyWorkerEntries.map((entry) => (entry.data as { sequence: number }).sequence),
+      [3, 4, 5],
+    );
+    assert.deepEqual(
+      historyWorkerEntries.map((entry) => (entry.data as { event: unknown }).event),
+      durableWorkerEvents.map((event) => event.evidence.event),
+    );
+    assert.deepEqual(events.at(-1)?.evidence, {
+      identity: {
+        pid: 6001,
+        processGroupId: 6001,
+        sessionFile: join(value.ledger.runDirectory(run.runId), "worker-attempt-token.jsonl"),
+        attemptToken: "attempt-token",
+      },
+      processGroupAbsent: true,
+      exitCode: 143,
+      exitSignal: null,
+    });
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("a ledger worker-event append failure cannot produce a successful tool result", async () => {
+  let ownershipCleared = false;
+  const value = fixture({
+    runAttempt: async (spec) => {
+      const identity = {
+        pid: 6003,
+        processGroupId: 6003,
+        sessionFile: spec.sessionFile,
+        attemptToken: spec.attemptToken,
+      };
+      await spec.journalOwnership(identity);
+      let telemetryError: unknown;
+      try {
+        await spec.recordEvent({ type: "settled" });
+      } catch (error) {
+        telemetryError = error;
+      }
+      await spec.journalOwnership(null);
+      ownershipCleared = true;
+      if (telemetryError !== undefined) throw telemetryError;
+      return {
+        status: "settled",
+        stderr: "",
+        stderrTruncated: false,
+        exitCode: 0,
+        exitSignal: null,
+      };
+    },
+  });
+  value.ledger.appendWorkerEvent = () => {
+    throw new Error("simulated ledger append failure");
+  };
+  try {
+    const ctx = context(value.repository);
+    const tool = value.api.tools.get("orkastrator_run_create");
+    assert.ok(tool);
+    await assert.rejects(
+      tool.execute(
+        "tool-1",
+        { objective: "Fail closed", policySnapshot: "version: 1\n" },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /simulated ledger append failure/u,
+    );
+    assert.equal(ownershipCleared, true);
+    assert.equal(
+      value.api.entries.some(
+        (entry) => (entry.data as { action?: string }).action === "worker_event",
+      ),
+      false,
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
 test("untrusted sessions cannot create or inspect project-local run state", async () => {
   const value = fixture();
   try {
