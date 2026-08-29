@@ -396,6 +396,7 @@ function initialReviewPrompt(input: ReviewWorkflowInput): string {
     "Inspect only the committed changes and relevant repository context. Do not modify files.",
     "Report correctness, security, data_loss, scope, and acceptance failures as blocking.",
     "Report minor style issues as nonblocking style findings. Every blocking finding needs exact writable file paths.",
+    "Every implicatedPaths value must be repository-relative, such as src/count.js. Never return an absolute path or a path containing . or .. segments.",
   ].join("\n\n");
 }
 
@@ -516,7 +517,16 @@ function findingSchema() {
       category: { enum: ["correctness", "security", "data_loss", "scope", "acceptance", "style"] },
       contract: { type: "string", minLength: 1, maxLength: 4_000 },
       evidence: { type: "array", maxItems: 50, items: { type: "string", minLength: 1, maxLength: 4_000 } },
-      implicatedPaths: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 512 } },
+      implicatedPaths: {
+        type: "array",
+        maxItems: 100,
+        items: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          pattern: "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*//)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*\\/\\.\\.?(?:\\/|$)).+$",
+        },
+      },
       blocking: { type: "boolean" },
     },
   } as const;
