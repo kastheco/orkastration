@@ -14,7 +14,9 @@
     "types": ["node"]
   },
   "include": [
+    ".pi/workflows/**/*.ts",
     "extensions/orkastrator-monitors/**/*.ts",
+    "extensions/orkastrator-workflows/**/*.ts",
     "extensions/orkastrator/**/*.ts"
   ]
 }

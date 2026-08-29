@@ -1,8 +1,10 @@
 # orkastrator
 
-orkastrator v1 is a Pi-native supervision extension. KAS-740 owns trusted run creation and durable lifecycle evidence. KAS-741 adds one fresh owned Pi RPC worker attempt with strict framing, durable process identity before prompt delivery, bounded usage/error evidence, and verified process-group reap.
+orkastrator is moving to a thin policy layer over [`@osolmaz/pi-workflows`](https://github.com/osolmaz/pi-workflows) and `pi-subagents`. Pi Workflows owns the durable graph, run state, recovery, checkpoints, and presentation. Orkastrator keeps strict review contracts, scoped fixer worktrees, and integration policy.
 
-Use `/kas <objective>` to ask the active model to create a run through `orkastrator_run_create`. Use `/kas-runs` to inspect the run owned by this Pi session and preserved runs from other sessions. The worker still runs in the trusted checkout until KAS-743 adds Worktrunk isolation. The caller-supplied policy snapshot is temporary; repository-owned `repo-default` resolution belongs to KAS-742.
+The first migration spike is [`.pi/workflows/orkastrator-review.workflow.ts`](.pi/workflows/orkastrator-review.workflow.ts). It runs an immutable initial review, deterministically clumps overlapping findings, dispatches at most three disjoint fixer worktrees through the public `pi-subagents` delegation contract, requires scoped re-review, integrates accepted commits serially, and opens one protected owner decision when risk remains. See [`docs/pi-workflows-spike.md`](docs/pi-workflows-spike.md) for proven behavior and remaining gaps.
+
+The custom Pi-native lifecycle, reducer, ledger, Worktrunk, and owned-RPC implementation remains in [`extensions/orkastrator`](extensions/orkastrator) only as migration reference until the live workflow proof succeeds. `/kas` and `/kas-runs` still exercise that reference implementation; they are not the target architecture.
 
 ## legacy Python/Orca controller
 
