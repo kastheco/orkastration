@@ -27,6 +27,8 @@ import {
   type DelegationEvents,
 } from "../delegation-bridge.ts";
 import {
+  parseInitialReviewResult,
+  parseReReviewVerdict,
   parseReviewWorkflowInput,
   runFixWaves,
   type ReviewWorkflowInput,
@@ -78,6 +80,58 @@ test("workflow definition is valid and rejects ambiguous input", () => {
     }),
     /integer from 1 to 3/u,
   );
+});
+
+test("blocking status is derived from review context instead of reviewer discretion", () => {
+  const initial = parseInitialReviewResult({
+    findings: [
+      {
+        id: "bug",
+        severity: "high",
+        category: "correctness",
+        contract: "Fix the bug.",
+        evidence: ["test fails"],
+        implicatedPaths: ["src/bug.js"],
+      },
+      {
+        id: "style",
+        severity: "low",
+        category: "style",
+        contract: "Optional rename.",
+        evidence: ["name is awkward"],
+        implicatedPaths: [],
+      },
+    ],
+  }, 2);
+  assert.equal(initial.findings.find((finding) => finding.id === "bug")?.blocking, true);
+  assert.equal(initial.findings.find((finding) => finding.id === "style")?.blocking, false);
+
+  const reReview = parseReReviewVerdict({
+    verdict: "accept",
+    reason: "scoped contract passes",
+    introducedFindings: [
+      {
+        id: "unrelated",
+        severity: "high",
+        category: "correctness",
+        contract: "Another fixer owns this defect.",
+        evidence: ["other test fails"],
+        implicatedPaths: ["src/other.js"],
+        introducedByFix: false,
+      },
+      {
+        id: "regression",
+        severity: "high",
+        category: "correctness",
+        contract: "The fix introduced a regression.",
+        evidence: ["new scoped test fails"],
+        implicatedPaths: ["src/bug.js"],
+        introducedByFix: true,
+      },
+    ],
+  });
+  assert.equal(reReview.introducedFindings[0]?.blocking, false);
+  assert.equal(reReview.introducedFindings[1]?.blocking, true);
 });
 
 test("delegation bridge correlates one terminal response and cancels on abort", async () => {

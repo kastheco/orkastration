@@ -74,7 +74,7 @@ export interface FixWaveResult {
   unresolved: UnresolvedFix[];
 }
 
-interface ReReviewVerdict {
+export interface ReReviewVerdict {
   verdict: "accept" | "reject";
   reason: string;
   introducedFindings: Array<InitialReviewFinding & { introducedByFix: boolean }>;
@@ -139,7 +139,7 @@ export async function runInitialReview(
     result: { kind: "structured", schema: INITIAL_REVIEW_SCHEMA },
   }, context.signal);
   const value = requireStructuredResult(response, "initial reviewer");
-  return parseInitialReviewOutput(JSON.stringify(value), input.maxParallelFixers);
+  return parseInitialReviewResult(value, input.maxParallelFixers);
 }
 
 export async function runFixWaves(
@@ -395,7 +395,7 @@ function initialReviewPrompt(input: ReviewWorkflowInput): string {
     input.objective,
     "Inspect only the committed changes and relevant repository context. Do not modify files.",
     "Report correctness, security, data_loss, scope, and acceptance failures as blocking.",
-    "Report minor style issues as nonblocking style findings. Every blocking finding needs exact writable file paths.",
+    "Use category style only for minor style findings. Orkastrator derives blocking status from category. Every non-style finding needs exact writable file paths.",
     "Every implicatedPaths value must be repository-relative, such as src/count.js. Never return an absolute path or a path containing . or .. segments.",
   ].join("\n\n");
 }
@@ -434,7 +434,7 @@ function reReviewPrompt(
   ].join("\n\n");
 }
 
-function parseReReviewVerdict(value: unknown): ReReviewVerdict {
+export function parseReReviewVerdict(value: unknown): ReReviewVerdict {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("re-review result must be an object");
   }
@@ -459,7 +459,7 @@ function parseReReviewVerdict(value: unknown): ReReviewVerdict {
         throw new Error("introduced finding must be an object");
       }
       const { introducedByFix: _, ...rest } = finding as Record<string, unknown>;
-      return rest;
+      return { ...rest, blocking: rest.category !== "style" };
     }),
   }), 1).findings;
   return {
@@ -470,7 +470,41 @@ function parseReReviewVerdict(value: unknown): ReReviewVerdict {
       if (typeof original.introducedByFix !== "boolean") {
         throw new Error("introduced finding requires introducedByFix boolean");
       }
-      return { ...finding, introducedByFix: original.introducedByFix };
+      return {
+        ...finding,
+        blocking: original.introducedByFix && finding.category !== "style",
+        introducedByFix: original.introducedByFix,
+      };
+    }),
+  };
+}
+
+export function parseInitialReviewResult(
+  value: unknown,
+  maxParallelFixers: number,
+): FrozenReviewPlan {
+  return parseInitialReviewOutput(
+    JSON.stringify(withDerivedInitialBlocking(value)),
+    maxParallelFixers,
+  );
+}
+
+function withDerivedInitialBlocking(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("initial reviewer result must be an object");
+  }
+  const envelope = value as Record<string, unknown>;
+  if (!Array.isArray(envelope.findings)) {
+    throw new Error("initial reviewer findings must be an array");
+  }
+  return {
+    ...envelope,
+    findings: envelope.findings.map((finding) => {
+      if (finding === null || typeof finding !== "object" || Array.isArray(finding)) {
+        throw new Error("initial reviewer finding must be an object");
+      }
+      const record = finding as Record<string, unknown>;
+      return { ...record, blocking: record.category !== "style" };
     }),
   };
 }
@@ -511,7 +545,7 @@ function findingSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["id", "severity", "category", "contract", "evidence", "implicatedPaths", "blocking"],
+    required: ["id", "severity", "category", "contract", "evidence", "implicatedPaths"],
     properties: {
       id: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
       severity: { enum: ["critical", "high", "medium", "low", "info"] },
@@ -528,7 +562,6 @@ function findingSchema() {
           pattern: "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*//)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*\\/\\.\\.?(?:\\/|$)).+$",
         },
       },
-      blocking: { type: "boolean" },
     },
   } as const;
 }
