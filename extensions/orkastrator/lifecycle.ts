@@ -6,17 +6,18 @@ import {
 } from "./ledger/file-ledger.ts";
 import {
   type CreateRunInput,
+  type CurrentWorktreeIdentity,
   type OwnedProcessIdentity,
   type RunRecord,
-  type WorktreeIdentity,
 } from "./ledger/types.ts";
+import { isCurrentWorktreeIdentity } from "./ledger/worktree-identity.ts";
 
 export type SessionStartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type SessionShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export interface RebindIdentityVerifier {
   verifyProcess(identity: OwnedProcessIdentity): Promise<boolean> | boolean;
-  verifyWorktree(identity: WorktreeIdentity): Promise<boolean> | boolean;
+  verifyWorktree(identity: CurrentWorktreeIdentity): Promise<boolean> | boolean;
 }
 
 export interface SessionStartResult {
@@ -178,8 +179,11 @@ export class LifecycleCoordinator {
         run.ownedProcesses.map((identity) => this.#verifier.verifyProcess(identity)),
       );
       if (processProofs.some((verified) => !verified)) return false;
+      if (run.worktrees.some((identity) => !isCurrentWorktreeIdentity(identity))) return false;
       const worktreeProofs = await Promise.all(
-        run.worktrees.map((identity) => this.#verifier.verifyWorktree(identity)),
+        run.worktrees.map((identity) => this.#verifier.verifyWorktree(
+          identity as CurrentWorktreeIdentity,
+        )),
       );
       return worktreeProofs.every(Boolean);
     } catch {

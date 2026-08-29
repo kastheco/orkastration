@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import type { WorktreeIdentity } from "../ledger/types.ts";
-import {
-  createWorktrunkForTesting,
-  type WorktreeObservation,
-} from "../worktrunk.ts";
+import type { CurrentWorktreeIdentity, WorktreeIdentity } from "../ledger/types.ts";
+import { createWorktrunkForTesting } from "../worktrunk.ts";
 
 const RUN_ID = "00000000-0000-4000-8000-000000000743";
 const BRANCH = `orkastrator/${RUN_ID}/worker`;
@@ -132,40 +137,36 @@ function schema(
 
 function harness(results: Result[]) {
   const calls: Call[] = [];
-  const module = createWorktrunkForTesting(async (request) => {
+  const module = createWorktrunkForTesting({ commandRunner: async (request) => {
     calls.push({ ...request });
     const result = results.shift();
     assert.ok(result, "unexpected Worktrunk command");
     return result;
-  });
+  } });
   return { module, calls, remaining: results };
 }
 
-function identity(repository: string, worktree: string, overrides: Partial<WorktreeIdentity> = {}): WorktreeIdentity {
+function identity(
+  repository: string,
+  worktree: string,
+  overrides: Partial<CurrentWorktreeIdentity> = {},
+): CurrentWorktreeIdentity {
+  const repositoryStat = statSync(repository);
+  const worktreeStat = statSync(worktree);
   return {
+    version: 2,
     repositoryRoot: repository,
+    repositoryFs: { device: repositoryStat.dev, inode: repositoryStat.ino },
     remoteUrl: "https://example.com/team/repository",
     branch: BRANCH,
     path: worktree,
+    worktreeFs: { device: worktreeStat.dev, inode: worktreeStat.ino },
     baseSha: BASE_SHA,
     headSha: BASE_SHA,
     operation: null,
     clean: true,
     ...overrides,
   };
-}
-
-async function rejectedObservation(
-  operation: Promise<unknown>,
-): Promise<Exclude<WorktreeObservation, { status: "ready" }>> {
-  try {
-    await operation;
-    assert.fail("expected owned worktree operation to fail closed");
-  } catch (error) {
-    assert.ok(error instanceof Error && "observation" in error);
-    return (error as Error & { observation: Exclude<WorktreeObservation, { status: "ready" }> })
-      .observation;
-  }
 }
 
 test("ensure lists, creates with exact argv, ignores create JSON, and lists freshly for identity", async () => {
@@ -182,6 +183,8 @@ test("ensure lists, creates with exact argv, ignores create JSON, and lists fres
     const result = await testModule.module.ensureOwnedWorktree(input);
 
     assert.deepEqual(input, snapshot);
+    assert.equal(result.status, "ready");
+    if (result.status !== "ready") assert.fail("expected ready worktree");
     assert.equal(result.recovered, false);
     assert.deepEqual(result.identity, identity(value.repository, value.worktree));
     assert.deepEqual(testModule.calls.map((call) => call.argv), [
@@ -209,6 +212,8 @@ test("an existing deterministic branch is verified as create-before-record recov
       repositoryRoot: value.repository,
       runId: RUN_ID.toUpperCase(),
     });
+    assert.equal(result.status, "ready");
+    if (result.status !== "ready") assert.fail("expected recovered worktree");
     assert.equal(result.recovered, true);
     assert.equal(result.identity.branch, BRANCH);
     assert.equal(testModule.calls.length, 1);
@@ -232,6 +237,8 @@ test("ensure canonicalizes repository and worktree real paths without mutating i
     ]);
     const result = await testModule.module.ensureOwnedWorktree(input);
     assert.equal(input.repositoryRoot, repositoryAlias);
+    assert.equal(result.status, "ready");
+    if (result.status !== "ready") assert.fail("expected canonical worktree");
     assert.equal(result.identity.repositoryRoot, value.repository);
     assert.equal(result.identity.path, value.worktree);
     assert.equal(testModule.calls[0]?.argv[1], value.repository);
@@ -334,7 +341,7 @@ for (const [name, expectedIdentity, options, expected] of [
         await testModule.module.inspectOwnedWorktree(identity(
           value.repository,
           value.worktree,
-          expectedIdentity as Partial<WorktreeIdentity>,
+          expectedIdentity as Partial<CurrentWorktreeIdentity>,
         )),
         expected,
       );
@@ -412,10 +419,10 @@ test("missing default branch and malformed schema/JSON fail closed before create
     ] as const) {
       const testModule = harness([exited(output)]);
       assert.deepEqual(
-        await rejectedObservation(testModule.module.ensureOwnedWorktree({
+        await testModule.module.ensureOwnedWorktree({
           repositoryRoot: value.repository,
           runId: RUN_ID,
-        })),
+        }),
         expected,
       );
       assert.equal(testModule.calls.length, 1);
@@ -448,11 +455,11 @@ test("invalid run IDs fail before any Worktrunk command and naming uses only the
     for (const runId of ["../escape", `${RUN_ID}/extra`, "KAS-743"]) {
       const testModule = harness([]);
       assert.equal(
-        (await rejectedObservation(testModule.module.ensureOwnedWorktree({
+        (await testModule.module.ensureOwnedWorktree({
           repositoryRoot: value.repository,
           runId,
-        }))).status,
-        "malformed_output",
+        })).status,
+        "invalid_input",
       );
       assert.equal(testModule.calls.length, 0);
     }
@@ -475,12 +482,15 @@ for (const [command, results] of [
     const value = fixture();
     try {
       const queued = [...results] as Result[];
-      if (command === "create") queued[0] = exited(schema(value.repository, value.worktree, { includeFeature: false }));
+      if (command === "create") {
+        queued[0] = exited(schema(value.repository, value.worktree, { includeFeature: false }));
+        queued.push(exited(schema(value.repository, value.worktree, { includeFeature: false })));
+      }
       const testModule = harness(queued);
-      const observation = await rejectedObservation(testModule.module.ensureOwnedWorktree({
+      const observation = await testModule.module.ensureOwnedWorktree({
         repositoryRoot: value.repository,
         runId: RUN_ID,
-      }));
+      });
       assert.equal(observation.status, "command_failed");
       if (observation.status === "command_failed") {
         assert.equal(observation.command, command);
@@ -541,9 +551,268 @@ test("inspect rejects tampered inactive/clean identity fields without mutation",
       const testModule = harness([]);
       assert.equal(
         (await testModule.module.inspectOwnedWorktree(corrupted as unknown as WorktreeIdentity)).status,
-        "malformed_output",
+        "invalid_input",
       );
       assert.equal(testModule.calls.length, 0);
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("combined pinned rebase-conflict shape prioritizes conflict over active operation", async () => {
+  const value = fixture();
+  try {
+    const testModule = harness([exited(schema(value.repository, value.worktree, {
+      feature: { operation: "rebase", change: "conflicted" },
+    }))]);
+    assert.deepEqual(
+      await testModule.module.inspectOwnedWorktree(identity(value.repository, value.worktree)),
+      { status: "conflicted" },
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("every uncertain create result is followed by one list and exact identity recovers", async () => {
+  const value = fixture();
+  try {
+    for (const creation of [
+      exited("side effect then failure", 17, "create raced"),
+      { type: "timeout", stdout: "partial", stderr: "late" } as const,
+      { type: "output_limit", stream: "stdout", stdout: "large", stderr: "" } as const,
+    ]) {
+      const testModule = harness([
+        exited(schema(value.repository, value.worktree, { includeFeature: false })),
+        creation,
+        exited(schema(value.repository, value.worktree)),
+      ]);
+      const result = await testModule.module.ensureOwnedWorktree({
+        repositoryRoot: value.repository,
+        runId: RUN_ID,
+      });
+      assert.equal(result.status, "ready");
+      if (result.status !== "ready") assert.fail("expected uncertain-create recovery");
+      assert.equal(result.recovered, true);
+      assert.equal(testModule.calls.length, 3);
+      assert.equal(testModule.calls[2]?.argv.includes("list"), true);
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("concurrent creator is recovered, while absent identity preserves original create failure", async () => {
+  const value = fixture();
+  try {
+    const concurrent = harness([
+      exited(schema(value.repository, value.worktree, { includeFeature: false })),
+      exited("", 1, "branch already exists"),
+      exited(schema(value.repository, value.worktree)),
+    ]);
+    const recovered = await concurrent.module.ensureOwnedWorktree({ repositoryRoot: value.repository, runId: RUN_ID });
+    assert.equal(recovered.status, "ready");
+    if (recovered.status === "ready") assert.equal(recovered.recovered, true);
+
+    const absent = harness([
+      exited(schema(value.repository, value.worktree, { includeFeature: false })),
+      exited("original", 23, "original failure"),
+      exited(schema(value.repository, value.worktree, { includeFeature: false })),
+    ]);
+    const failure = await absent.module.ensureOwnedWorktree({ repositoryRoot: value.repository, runId: RUN_ID });
+    assert.equal(failure.status, "command_failed");
+    if (failure.status === "command_failed") {
+      assert.equal(failure.command, "create");
+      assert.equal(failure.exitCode, 23);
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("post-create schema list is still attempted when create replaces the repository pathname", async () => {
+  const value = fixture();
+  try {
+    const calls: Call[] = [];
+    const module = createWorktrunkForTesting({ commandRunner: async (request) => {
+      calls.push({ ...request });
+      if (calls.length === 1) {
+        return exited(schema(value.repository, value.worktree, { includeFeature: false }));
+      }
+      if (calls.length === 2) {
+        rmSync(value.repository, { recursive: true, force: true });
+        return { type: "timeout", stdout: "", stderr: "" };
+      }
+      return exited("", 1, "repository disappeared");
+    } });
+    const result = await module.ensureOwnedWorktree({ repositoryRoot: value.repository, runId: RUN_ID });
+    assert.equal(result.status, "identity_changed");
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2]?.argv.includes("list"), true);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("fresh post-create list returns a stronger identity mismatch over original failure", async () => {
+  const value = fixture();
+  try {
+    const testModule = harness([
+      exited(schema(value.repository, value.worktree, { includeFeature: false })),
+      exited("", 19, "uncertain"),
+      exited(schema(value.repository, value.worktree, { feature: { change: "modified" } })),
+    ]);
+    assert.deepEqual(
+      await testModule.module.ensureOwnedWorktree({ repositoryRoot: value.repository, runId: RUN_ID }),
+      { status: "dirty", change: "modified" },
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("repository/worktree equality and ancestor overlap fail closed in every direction", async () => {
+  const value = fixture();
+  try {
+    const descendant = join(value.repository, "nested-worktree");
+    mkdirSync(descendant);
+    for (const path of [value.repository, value.temporary, descendant]) {
+      const testModule = harness([exited(schema(value.repository, path))]);
+      assert.deepEqual(
+        await testModule.module.ensureOwnedWorktree({ repositoryRoot: value.repository, runId: RUN_ID }),
+        { status: "path_overlap", repositoryRoot: value.repository, worktreePath: path },
+      );
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("multiple main:true items are rejected even when only one names the default branch", async () => {
+  const value = fixture();
+  try {
+    const otherMain = join(value.temporary, "other-main");
+    mkdirSync(otherMain);
+    const testModule = harness([exited(schema(value.repository, value.worktree, {
+      extraItems: [item("other", otherMain, { main: true })],
+    }))]);
+    const result = await testModule.module.inspectOwnedWorktree(identity(value.repository, value.worktree));
+    assert.deepEqual(result, {
+      status: "malformed_output",
+      reason: "main/default branch worktree is not unique",
+    });
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("legacy exact identity remains inspectable but explicitly cannot authorize", async () => {
+  const value = fixture();
+  try {
+    const legacy = {
+      repositoryRoot: value.repository,
+      path: value.worktree,
+      branch: BRANCH,
+      headSha: BASE_SHA,
+    };
+    const testModule = harness([exited(schema(value.repository, value.worktree))]);
+    assert.deepEqual(await testModule.module.inspectOwnedWorktree(legacy), {
+      status: "legacy_ready",
+      identity: legacy,
+      authorization: "inspect_only",
+    });
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("fresh inspection detects directory and symlink pathname replacement by filesystem identity", async () => {
+  const value = fixture();
+  try {
+    const expected = identity(value.repository, value.worktree);
+    const replacement = join(value.temporary, "replacement");
+    mkdirSync(replacement);
+    for (const symlink of [false, true]) {
+      rmSync(value.worktree, { recursive: true, force: true });
+      mkdirSync(value.worktree);
+      const current = identity(value.repository, value.worktree);
+      const module = createWorktrunkForTesting({ commandRunner: async () => {
+        rmSync(value.worktree, { recursive: true, force: true });
+        if (symlink) symlinkSync(replacement, value.worktree, "dir");
+        else mkdirSync(value.worktree);
+        return exited(schema(value.repository, value.worktree));
+      } });
+      const result = await module.inspectOwnedWorktree(current);
+      assert.equal(result.status, "identity_changed");
+      if (result.status === "identity_changed") assert.equal(result.target, "worktree");
+    }
+    assert.equal(expected.version, 2);
+    rmSync(value.worktree, { recursive: true, force: true });
+    mkdirSync(value.worktree);
+    const repositoryExpected = identity(value.repository, value.worktree);
+    const repositoryModule = createWorktrunkForTesting({ commandRunner: async () => {
+      rmSync(value.repository, { recursive: true, force: true });
+      mkdirSync(value.repository);
+      return exited(schema(value.repository, value.worktree));
+    } });
+    const repositoryResult = await repositoryModule.inspectOwnedWorktree(repositoryExpected);
+    assert.equal(repositoryResult.status, "identity_changed");
+    if (repositoryResult.status === "identity_changed") {
+      assert.equal(repositoryResult.target, "repository");
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("fresh inspection rejects persisted dev/inode tamper before invoking Worktrunk", async () => {
+  const value = fixture();
+  try {
+    for (const changedIdentity of [
+      identity(value.repository, value.worktree, {
+        repositoryFs: { ...identity(value.repository, value.worktree).repositoryFs, inode: 1 },
+      }),
+      identity(value.repository, value.worktree, {
+        worktreeFs: { ...identity(value.repository, value.worktree).worktreeFs, inode: 1 },
+      }),
+    ]) {
+      const testModule = harness([]);
+      const result = await testModule.module.inspectOwnedWorktree(changedIdentity);
+      assert.equal(result.status, "identity_changed");
+      assert.equal(testModule.calls.length, 0);
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("production runner kills hangs and independently caps stdout and stderr", async () => {
+  const value = fixture();
+  try {
+    for (const [name, source, expectedStream] of [
+      ["hang", "setInterval(() => {}, 1000);", null],
+      ["stdout", "process.stdout.write('x'.repeat(4096));", "stdout"],
+      ["stderr", "process.stderr.write('x'.repeat(4096));", "stderr"],
+    ] as const) {
+      const executable = join(value.temporary, `helper-${name}`);
+      writeFileSync(executable, `#!/usr/bin/env node\n${source}\n`);
+      chmodSync(executable, 0o700);
+      const module = createWorktrunkForTesting({
+        executable,
+        timeoutMs: 100,
+        maxStdoutBytes: 1024,
+        maxStderrBytes: 256,
+      });
+      const started = Date.now();
+      const result = await module.inspectOwnedWorktree(identity(value.repository, value.worktree));
+      assert.ok(Date.now() - started < 2_000);
+      assert.equal(result.status, name === "hang" ? "timeout" : "output_limit");
+      if (result.status === "output_limit") {
+        assert.equal(result.stream, expectedStream);
+        assert.ok(Buffer.byteLength(result.stdout) <= 1024);
+        assert.ok(Buffer.byteLength(result.stderr) <= 256);
+      }
     }
   } finally {
     value.cleanup();

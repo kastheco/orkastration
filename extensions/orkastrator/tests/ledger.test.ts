@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -21,7 +22,7 @@ import {
   LedgerError,
   RunLedger,
 } from "../ledger/file-ledger.ts";
-import type { RunRecord, WorktreeIdentity } from "../ledger/types.ts";
+import type { CurrentWorktreeIdentity, RunRecord } from "../ledger/types.ts";
 import { POLICY_SNAPSHOT } from "./policy-fixture.ts";
 
 function ids(): () => string {
@@ -63,13 +64,18 @@ function create(ledger: RunLedger, repository: string, session = "session-1") {
   });
 }
 
-function worktreeIdentity(run: RunRecord, path: string): WorktreeIdentity {
+function worktreeIdentity(run: RunRecord, path: string): CurrentWorktreeIdentity {
   mkdirSync(path);
+  const repositoryStat = statSync(run.repositoryRoot);
+  const worktreeStat = statSync(path);
   return {
+    version: 2,
     repositoryRoot: run.repositoryRoot,
+    repositoryFs: { device: repositoryStat.dev, inode: repositoryStat.ino },
     remoteUrl: "https://github.com/kastheco/orkastrator",
     branch: `orkastrator/${run.runId}/worker`,
     path,
+    worktreeFs: { device: worktreeStat.dev, inode: worktreeStat.ino },
     baseSha: "a".repeat(40),
     headSha: "a".repeat(40),
     operation: null,
@@ -149,6 +155,12 @@ for (const [name, tamper] of [
   ["unclean marker", (identity: Record<string, unknown>) => {
     identity.clean = false;
   }],
+  ["invalid repository inode", (identity: Record<string, unknown>) => {
+    (identity.repositoryFs as Record<string, unknown>).inode = -1;
+  }],
+  ["worktree device", (identity: Record<string, unknown>) => {
+    (identity.worktreeFs as Record<string, unknown>).device = -1;
+  }],
   ["extra field", (identity: Record<string, unknown>) => {
     identity.unexpected = true;
   }],
@@ -175,6 +187,63 @@ for (const [name, tamper] of [
   });
 }
 
+test("handcrafted old worktree identity remains loadable and cleanable but cannot bind", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const current = worktreeIdentity(run, join(value.temporary, "owned-worktree"));
+    value.ledger.recordOwnership(run.runId, { ownedProcesses: [], worktrees: [current] });
+    const legacy = {
+      repositoryRoot: run.repositoryRoot,
+      path: current.path,
+      branch: "historical-feature",
+      headSha: current.headSha,
+    };
+    rewriteEvents(value.ledger, run.runId, (events) => {
+      const projection = events.at(-1)!.projection as { worktrees: unknown[] };
+      projection.worktrees = [legacy];
+    });
+    const reloaded = new RunLedger({ root: value.ledger.root });
+    assert.deepEqual(reloaded.loadRun(run.runId).record.worktrees, [legacy]);
+    assert.throws(
+      () => reloaded.recordOwnership(run.runId, { ownedProcesses: [], worktrees: [legacy] }),
+      /current worktree identity is incomplete/u,
+    );
+    assert.deepEqual(
+      reloaded.recordOwnership(run.runId, { ownedProcesses: [], worktrees: [] }).worktrees,
+      [],
+    );
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("persisted validation rejects repository/worktree overlap in all directions", () => {
+  const value = fixture();
+  try {
+    const run = create(value.ledger, value.repository);
+    const normal = worktreeIdentity(run, join(value.temporary, "owned-worktree"));
+    const descendant = join(value.repository, "nested");
+    mkdirSync(descendant);
+    for (const path of [run.repositoryRoot, value.temporary, descendant]) {
+      const facts = statSync(path);
+      assert.throws(
+        () => value.ledger.recordOwnership(run.runId, {
+          ownedProcesses: [],
+          worktrees: [{
+            ...normal,
+            path,
+            worktreeFs: { device: facts.dev, inode: facts.ino },
+          }],
+        }),
+        /current worktree identity is incomplete/u,
+      );
+    }
+  } finally {
+    value.cleanup();
+  }
+});
+
 test("ledger mutation rejects incomplete or noncanonical worktree identity", () => {
   const value = fixture();
   try {
@@ -185,7 +254,7 @@ test("ledger mutation rejects incomplete or noncanonical worktree identity", () 
         ownedProcesses: [],
         worktrees: [{ ...valid, path: `${value.temporary}/x/../owned-worktree` }],
       }),
-      /worktree identity is incomplete/u,
+      /current worktree identity is incomplete/u,
     );
   } finally {
     value.cleanup();

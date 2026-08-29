@@ -54,21 +54,37 @@ export type WorkerEvent =
   | { type: "abort" }
   | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
 
-export interface WorktreeIdentity {
-  /** Canonical real path of the repository whose Worktrunk list established ownership. */
+export interface FilesystemIdentity {
+  device: number;
+  inode: number;
+}
+
+/** Exact pre-KAS-743 shape. It is retained for inspection and cleanup, never authorization. */
+export interface LegacyWorktreeIdentity {
   repositoryRoot: string;
+  path: string;
+  branch: string;
+  headSha: string;
+}
+
+export interface CurrentWorktreeIdentity {
+  version: 2;
+  /** Canonical real path and stable filesystem identity of the owning repository. */
+  repositoryRoot: string;
+  repositoryFs: FilesystemIdentity;
   /** Canonical forge URL from schema-2 repo.forge, or null when the repository has no forge. */
   remoteUrl: string | null;
   branch: string;
-  /** Canonical real path of the owned feature worktree. */
+  /** Canonical real path and stable filesystem identity of the owned feature worktree. */
   path: string;
+  worktreeFs: FilesystemIdentity;
   baseSha: string;
   headSha: string;
-  /** Ownership is valid only while Worktrunk reports no in-progress operation. */
   operation: null;
-  /** Ownership is valid only while all schema-2 change bits remain false. */
   clean: true;
 }
+
+export type WorktreeIdentity = LegacyWorktreeIdentity | CurrentWorktreeIdentity;
 
 export interface ReloadMarker {
   sessionId: string;

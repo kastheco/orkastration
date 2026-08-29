@@ -23,6 +23,10 @@ import { isDeepStrictEqual } from "node:util";
 
 import { parsePolicyV1, type PolicyV1 } from "../policy.ts";
 import {
+  isCurrentWorktreeIdentity,
+  isPersistedWorktreeIdentity,
+} from "./worktree-identity.ts";
+import {
   reducePolicy,
   type PolicyAction,
   type PolicyCheckpoint,
@@ -563,15 +567,22 @@ export class RunLedger {
       this.#assertOwnedProcess(processIdentity);
     }
     for (const worktree of input.worktrees) {
-      if (!isWorktreeIdentity(worktree, current.runId, current.repositoryRoot)) {
-        throw new LedgerError("worktree identity is incomplete");
+      // Legacy identities remain loadable and removable from the ledger, but cannot bind ownership.
+      if (!isCurrentWorktreeIdentity(worktree, current.runId, current.repositoryRoot)) {
+        throw new LedgerError("current worktree identity is incomplete");
       }
       try {
+        const repository = statSync(worktree.repositoryRoot);
+        const path = statSync(worktree.path);
         if (
           realpathSync(worktree.repositoryRoot) !== worktree.repositoryRoot ||
-          realpathSync(worktree.path) !== worktree.path
+          realpathSync(worktree.path) !== worktree.path ||
+          repository.dev !== worktree.repositoryFs.device ||
+          repository.ino !== worktree.repositoryFs.inode ||
+          path.dev !== worktree.worktreeFs.device ||
+          path.ino !== worktree.worktreeFs.inode
         ) {
-          throw new LedgerError("worktree identity paths must be canonical real paths");
+          throw new LedgerError("worktree identity paths or filesystem identities changed");
         }
       } catch (error) {
         if (error instanceof LedgerError) throw error;
@@ -1389,7 +1400,7 @@ export class RunLedger {
     if (
       !value.ownedProcesses.every(isOwnedProcessIdentity) ||
       !value.worktrees.every((identity) =>
-        isWorktreeIdentity(identity, value.runId as string, value.repositoryRoot as string)
+        isPersistedWorktreeIdentity(identity, value.runId as string, value.repositoryRoot as string)
       ) ||
       (value.reload !== undefined &&
         !isReloadMarker(
@@ -1449,61 +1460,6 @@ function isOwnedProcessIdentity(value: unknown): value is OwnedProcessIdentity {
     typeof value.attemptToken === "string" &&
     value.attemptToken.length > 0
   );
-}
-
-function isWorktreeIdentity(
-  value: unknown,
-  runId: string,
-  repositoryRoot: string,
-): boolean {
-  if (
-    !isObject(value) ||
-    !hasExactKeys(value, [
-      "repositoryRoot",
-      "remoteUrl",
-      "branch",
-      "path",
-      "baseSha",
-      "headSha",
-      "operation",
-      "clean",
-    ]) ||
-    value.repositoryRoot !== repositoryRoot ||
-    !isAbsolute(repositoryRoot) ||
-    resolve(repositoryRoot) !== repositoryRoot ||
-    (value.remoteUrl !== null &&
-      (typeof value.remoteUrl !== "string" || canonicalRemoteUrl(value.remoteUrl) !== value.remoteUrl)) ||
-    value.branch !== `orkastrator/${runId.toLowerCase()}/worker` ||
-    typeof value.path !== "string" ||
-    !isAbsolute(value.path) ||
-    resolve(value.path) !== value.path ||
-    value.path === repositoryRoot ||
-    typeof value.baseSha !== "string" ||
-    !/^[0-9a-f]{40}$/u.test(value.baseSha) ||
-    value.headSha !== value.baseSha ||
-    value.operation !== null ||
-    value.clean !== true
-  ) {
-    return false;
-  }
-  return true;
-}
-
-function canonicalRemoteUrl(value: string): string | null {
-  try {
-    const parsed = new URL(value);
-    if (!new Set(["https:", "http:", "ssh:"]).has(parsed.protocol)) return null;
-    if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
-      return null;
-    }
-    parsed.hostname = parsed.hostname.toLowerCase();
-    let pathname = parsed.pathname.replace(/\/+$/u, "").replace(/\.git$/u, "");
-    if (pathname === "") pathname = "/";
-    parsed.pathname = pathname;
-    return parsed.toString().replace(/\/$/u, "");
-  } catch {
-    return null;
-  }
 }
 
 function isReloadMarker(

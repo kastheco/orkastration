@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { RunLedger } from "../ledger/file-ledger.ts";
-import type { RunRecord, WorktreeIdentity } from "../ledger/types.ts";
+import type { CurrentWorktreeIdentity, RunRecord } from "../ledger/types.ts";
 import {
   LifecycleCoordinator,
   type RebindIdentityVerifier,
@@ -60,13 +67,22 @@ function create(
   });
 }
 
-function worktreeIdentity(run: RunRecord, path: string, sha: string): WorktreeIdentity {
+function worktreeIdentity(
+  run: RunRecord,
+  path: string,
+  sha: string,
+): CurrentWorktreeIdentity {
   mkdirSync(path);
+  const repositoryStat = statSync(run.repositoryRoot);
+  const worktreeStat = statSync(path);
   return {
+    version: 2,
     repositoryRoot: run.repositoryRoot,
+    repositoryFs: { device: repositoryStat.dev, inode: repositoryStat.ino },
     remoteUrl: null,
     branch: `orkastrator/${run.runId}/worker`,
     path,
+    worktreeFs: { device: worktreeStat.dev, inode: worktreeStat.ino },
     baseSha: sha,
     headSha: sha,
     operation: null,
@@ -142,6 +158,44 @@ test("same-session same-process reload rebinds when every recorded identity is p
     assert.equal(result.rebound?.reload, undefined);
     assert.equal(result.interrupted, undefined);
     assert.deepEqual(result.stale, []);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("legacy worktree identity can never authorize reload rebind", async () => {
+  let worktreeVerifierCalled = false;
+  const value = fixture({
+    verifyProcess: () => true,
+    verifyWorktree: () => {
+      worktreeVerifierCalled = true;
+      return true;
+    },
+  });
+  try {
+    const created = create(value.coordinator, value.repository);
+    const current = worktreeIdentity(created, join(value.temporary, "legacy-worktree"), "a".repeat(40));
+    value.ledger.recordOwnership(created.runId, { ownedProcesses: [], worktrees: [current] });
+    const eventsPath = join(value.ledger.runDirectory(created.runId), "events.jsonl");
+    const events = readFileSync(eventsPath, "utf8").trimEnd().split("\n")
+      .map((line) => JSON.parse(line) as { projection: { worktrees: unknown[] } });
+    events.at(-1)!.projection.worktrees = [{
+      repositoryRoot: current.repositoryRoot,
+      path: current.path,
+      branch: current.branch,
+      headSha: current.headSha,
+    }];
+    writeFileSync(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+    value.coordinator.sessionShutdown("reload", "supervisor-session", 4242, value.repository);
+    const result = await value.coordinator.sessionStart(
+      "reload",
+      "supervisor-session",
+      4242,
+      value.repository,
+    );
+    assert.equal(result.rebound, undefined);
+    assert.equal(result.interrupted?.reason, "reload_continuity_unproven");
+    assert.equal(worktreeVerifierCalled, false);
   } finally {
     value.cleanup();
   }

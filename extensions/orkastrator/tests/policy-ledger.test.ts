@@ -46,7 +46,9 @@ function handcraftedLegacyLedger() {
   const runId = "00000000-0000-4000-8000-000000000001";
   const timestamp = "2026-08-28T22:00:00.000Z";
   const policySnapshot = "version: 0\nmode: historical-lifecycle\n";
+  const worktree = join(temporary, "historical-worktree");
   mkdirSync(repository);
+  mkdirSync(worktree);
   const ledger = new RunLedger({ root });
   const directory = join(root, runId);
   mkdirSync(directory);
@@ -66,7 +68,12 @@ function handcraftedLegacyLedger() {
     createdAt: timestamp,
     updatedAt: timestamp,
     ownedProcesses: [],
-    worktrees: [],
+    worktrees: [{
+      repositoryRoot: repository,
+      path: worktree,
+      branch: "historical-feature",
+      headSha: "a".repeat(40),
+    }],
   } as const;
   const event = {
     schemaVersion: 1,
@@ -89,6 +96,7 @@ function handcraftedLegacyLedger() {
     ledger,
     runId,
     policySnapshot,
+    worktree,
     cleanup: () => rmSync(temporary, { recursive: true, force: true }),
   };
 }
@@ -131,7 +139,18 @@ test("a handcrafted pre-stage run hash-verifies but does not parse its non-v1 po
   try {
     const legacy = value.ledger.loadRun(value.runId).record;
     assert.equal(Object.hasOwn(legacy, "policyCheckpoint"), false);
+    assert.deepEqual(legacy.worktrees, [{
+      repositoryRoot: legacy.repositoryRoot,
+      path: value.worktree,
+      branch: "historical-feature",
+      headSha: "a".repeat(40),
+    }]);
     assert.equal(value.ledger.policySnapshot(value.runId), value.policySnapshot);
+    const withoutLegacyOwnership = value.ledger.recordOwnership(value.runId, {
+      ownedProcesses: [],
+      worktrees: [],
+    });
+    assert.deepEqual(withoutLegacyOwnership.worktrees, []);
     const cleaned = value.ledger.transition(value.runId, {
       state: "interrupted",
       reason: "legacy_cleanup",
