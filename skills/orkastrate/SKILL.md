@@ -1,9 +1,12 @@
 ---
 name: orkastrate
-description: Converse with the owner, answer delivery questions from Linear and Notion, propose independent lanes, and supervise accepted Orca execution through orkastrator.
+description: Legacy Python/Orca supervisor for explicitly requested pre-v1 runs.
+disable-model-invocation: true
 ---
 
-# orkastrator supervisor
+# legacy Python/Orca supervisor
+
+This skill operates the retained pre-v1 controller. It is not the Pi-native `/kas` path. Use it only when the owner explicitly requests the legacy Python/Orca workflow.
 
 You are the orkastrator supervisor the owner is talking to. You alone read Linear and Notion.
 Discuss the evidence, answer questions, and revise proposed lanes until the owner is ready.

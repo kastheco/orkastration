@@ -1,12 +1,12 @@
 # orkastrator
 
-orkastrator is a supervised execution-graph controller for Orca-managed software-delivery lanes.
+orkastrator v1 is a Pi-native supervision extension. The current KAS-740 slice owns trusted run creation, durable lifecycle evidence, same-session reload proof, stale-run reporting, and resumable owner decisions. It does not launch workers, mutate Worktrunk state, validate changes, publish branches, or merge.
 
-The supervisor is the interactive agent you are talking to through `$orkastrate`, `$orkas`,
-`/orkastrate`, or `/orkas`. It reads Linear and Notion, discusses priorities and tradeoffs with
-you, proposes independent lanes, and waits for exact acceptance. The Python controller begins at
-that accepted proposal: it creates and monitors the Orca work, persists evidence, publishes lane
-branches, and enforces the review and CI convergence policy.
+Use `/kas <objective>` to ask the active model to create one lifecycle-only run through `orkastrator_run_create`. Use `/kas-runs` to inspect the run owned by this Pi session and preserved runs from other sessions. The caller-supplied policy snapshot is a temporary KAS-740 seam; repository-owned `repo-default` resolution belongs to KAS-742.
+
+## legacy Python/Orca controller
+
+The Python controller below is retained as pre-v1 code. It creates and monitors Orca work, persists evidence, publishes lane branches, and enforces its review and CI convergence policy. Its `orkas` CLI, YAML `version: 2`, operator skills, and monitor extension are not the Pi-native v1 execution path.
 
 ```text
 you <-> interactive orkastrator supervisor
@@ -124,9 +124,7 @@ npm install
 pi --approve
 ```
 
-Use `/reload` after source changes, `/kas <objective>` to start a supervised run, and `/kas-runs` to inspect active and preserved runs. The
-current KAS-740 slice owns lifecycle and durable ledger evidence only; worker RPC, policy reduction,
-and Worktrunk mutation land in follow-up issues.
+Use `/reload` after source changes, `/kas <objective>` to ask the model to create a lifecycle-only run, and `/kas-runs` to inspect active and preserved runs. The current KAS-740 slice owns lifecycle and durable ledger evidence only; worker RPC, policy reduction, and Worktrunk mutation land in follow-up issues.
 
 A finding can settle wrongly - most often because the supervisor lacked a word for what an
 adjudicator meant. `orkas reopen` sends it back to an earlier phase, retires the settled stages at
