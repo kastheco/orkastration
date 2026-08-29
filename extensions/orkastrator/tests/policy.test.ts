@@ -132,6 +132,21 @@ test("duplicate and malformed YAML identify a path without echoing source", () =
   assert.equal(message.includes(secret), false);
 });
 
+test("handwritten YAML rejects aliases, multiple documents, and unresolved tags", () => {
+  assert.throws(
+    () => parsePolicyV1(Buffer.from("version: &one 1\ncopy: *one\n", "utf8")),
+    /^Error: Policy \$: YAML aliases are not supported$/u,
+  );
+  assert.throws(
+    () => parsePolicyV1(Buffer.from("version: 1\n---\nversion: 1\n", "utf8")),
+    /Policy \$: malformed YAML \(MULTIPLE_DOCS\)/u,
+  );
+  assert.throws(
+    () => parsePolicyV1(Buffer.from("version: !orkastrator.dev/custom 1\n", "utf8")),
+    /Policy \$: malformed YAML \(TAG_RESOLVE_FAILED\)/u,
+  );
+});
+
 test("wrong scalar types fail at the scalar path", () => {
   const cases: Array<[string, (value: Record<string, unknown>) => void]> = [
     ["$.version", (value) => { value.version = "1"; }],
@@ -209,7 +224,14 @@ test("fast mode is explicit and limited to the Pi-supported Codex provider", () 
   expectPath(bytes(unsupported), "$.roles.initial_reviewer.fast");
 });
 
-test("invalid UTF-8 and empty policy bytes fail at the policy root", () => {
+test("handwritten byte inputs enforce UTF-8 and policy size limits", () => {
   expectPath(new Uint8Array(), "$");
-  expectPath(Uint8Array.of(0xc3, 0x28), "$");
+  assert.throws(
+    () => parsePolicyV1(Uint8Array.of(0xc3, 0x28)),
+    /^Error: Policy \$: must be valid UTF-8$/u,
+  );
+  assert.throws(
+    () => parsePolicyV1(new Uint8Array(1_048_577)),
+    /^Error: Policy \$: must contain 1-1048576 UTF-8 bytes$/u,
+  );
 });

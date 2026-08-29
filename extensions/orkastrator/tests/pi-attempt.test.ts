@@ -175,6 +175,8 @@ test("Pi launch argv loads only the pinned fast extension when requested", async
     const standardArgv = JSON.parse(readFileSync(standardMarker, "utf8")) as string[];
     assert.equal(fastArgv.includes("--fast"), false);
     assert.equal(standardArgv.includes("--fast"), false);
+    assert.equal(fastArgv.includes("--no-extensions"), true);
+    assert.equal(standardArgv.includes("--no-extensions"), true);
     assert.equal(fastArgv.filter((argument) => argument === "--extension").length, 1);
     const extensionIndex = fastArgv.indexOf("--extension");
     assert.match(fastArgv[extensionIndex + 1] ?? "", /\/rpc\/openai-fast\.ts$/u);

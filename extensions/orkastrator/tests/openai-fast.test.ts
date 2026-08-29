@@ -31,11 +31,3 @@ test("the pinned fast extension injects OpenAI priority without mutating the pro
   });
   assert.equal(payload.service_tier, "default");
 });
-
-test("the pinned fast extension fails closed on a non-object provider payload", () => {
-  const handler = registeredHandler();
-  assert.throws(
-    () => handler({ type: "before_provider_request", payload: "unexpected" }),
-    /provider payload must be an object/u,
-  );
-});

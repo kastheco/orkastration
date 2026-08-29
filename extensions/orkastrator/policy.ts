@@ -108,11 +108,11 @@ export function parsePolicyV1(bytes: Uint8Array): PolicyV1 {
     strict: true,
     uniqueKeys: false,
   });
-  if (document.errors.length > 0) {
-    const first = document.errors[0]!;
-    const line = first.pos[0] === undefined ? undefined : lines.linePos(first.pos[0]).line;
+  const yamlProblem = document.errors[0] ?? document.warnings[0];
+  if (yamlProblem !== undefined) {
+    const line = yamlProblem.pos[0] === undefined ? undefined : lines.linePos(yamlProblem.pos[0]).line;
     const location = line === undefined ? "" : ` at line ${line}`;
-    throw policyError("$", `malformed YAML (${first.code})${location}`);
+    throw policyError("$", `malformed YAML (${yamlProblem.code})${location}`);
   }
 
   assertNoDuplicateKeys(document.contents, "$", new Set());
