@@ -66,6 +66,91 @@ function completeReReview(reduction: PolicyReduction, accepted: boolean): Policy
   });
 }
 
+function startedEvent(): Extract<PolicyEvent, { type: "started" }> {
+  return {
+    type: "started",
+    sequence: 1,
+    observation: { elapsedMs: 0, totalTokens: 0, totalCostMicros: 0 },
+  };
+}
+
+test("a null checkpoint canonically starts worker attempt one with exact configured settings", () => {
+  const inputPolicy = structuredClone(policy) as PolicyV1;
+  const event = startedEvent();
+  const before = structuredClone({ inputPolicy, event });
+
+  const left = reducePolicy({ policy: inputPolicy, checkpoint: null, event });
+  const right = reducePolicy({ policy: inputPolicy, checkpoint: null, event });
+
+  assert.deepEqual(left, right);
+  assert.deepEqual({ inputPolicy, event }, before);
+  assert.deepEqual(left, {
+    checkpoint: {
+      revision: 1,
+      elapsedMs: 0,
+      totalTokens: 0,
+      totalCostMicros: 0,
+      cursor: { phase: "worker", attempt: 1 },
+    },
+    action: {
+      actionId: "1:worker.started:action",
+      type: "run_worker",
+      attempt: 1,
+      role: {
+        model: policy.roles.worker.model,
+        thinking: policy.roles.worker.thinking,
+        fast: policy.roles.worker.fast,
+      },
+    },
+    ruleId: "worker.started",
+    occurrenceId: "1:worker.started",
+    trace: ["event.legal", "observation.valid", "worker.started"],
+  });
+  assert.equal(Array.isArray((left as unknown as { actions?: unknown }).actions), false);
+});
+
+test("start requires sequence one and exact zero finite observation totals", () => {
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: null,
+    event: { ...startedEvent(), sequence: 0 },
+  }), /sequence must equal 1/u);
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: null,
+    event: { ...startedEvent(), sequence: 2 },
+  }), /sequence must equal 1/u);
+
+  for (const field of ["elapsedMs", "totalTokens", "totalCostMicros"] as const) {
+    for (const value of [1, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      assert.throws(() => reducePolicy({
+        policy,
+        checkpoint: null,
+        event: { ...startedEvent(), observation: { ...startedEvent().observation, [field]: value } },
+      }), new RegExp(`started observation ${field} must be zero`, "u"));
+    }
+  }
+});
+
+test("start is closed and is legal only with a null checkpoint", () => {
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: null,
+    event: { type: "worker_completed", sequence: 1, observation: observation() },
+  }), /null checkpoint requires a started event/u);
+
+  const started = reducePolicy({ policy, checkpoint: null, event: startedEvent() });
+  assert.throws(() => reducePolicy({ policy, checkpoint: started.checkpoint, event: startedEvent() }), /requires a null checkpoint/u);
+  assert.throws(() => reducePolicy({
+    policy,
+    checkpoint: checkpoint({ phase: "terminal", outcome: "stopped" }),
+    event: startedEvent(),
+  }), /requires a null checkpoint/u);
+
+  const extra = { ...startedEvent(), cursor: { phase: "worker", attempt: 99 } } as unknown as PolicyEvent;
+  assert.throws(() => reducePolicy({ policy, checkpoint: null, event: extra }), /started has unknown or missing keys/u);
+});
+
 test("is deterministic, does not mutate inputs, and emits one identified action", () => {
   const inputPolicy = structuredClone(policy) as PolicyV1;
   const inputCheckpoint = checkpoint();

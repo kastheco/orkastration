@@ -65,6 +65,7 @@ type ReviewGroupResult = { groupId: string; findings: Array<{ id: string; accept
 
 /** One closed observation consumed by one reduction. */
 export type PolicyEvent =
+  | (EventBase & { type: "started" })
   | (EventBase & { type: "worker_completed" })
   | (EventBase & { type: "worker_retryable_failure" })
   | (EventBase & { type: "worker_blocked" })
@@ -98,6 +99,7 @@ const INCIDENTS: readonly Incident[] = [
   "worker_blocked",
 ];
 const EVENT_PHASES: Readonly<Record<PolicyEvent["type"], readonly Cursor["phase"][]>> = {
+  started: [],
   worker_completed: ["worker"],
   worker_retryable_failure: ["worker"],
   worker_blocked: ["worker"],
@@ -118,10 +120,12 @@ export function reducePolicy({
   event,
 }: {
   policy: PolicyV1;
-  checkpoint: PolicyCheckpoint;
+  checkpoint: PolicyCheckpoint | null;
   event: PolicyEvent;
 }): PolicyReduction {
   validatePolicy(policy);
+  if (checkpoint === null) return reduceStart(policy, event);
+  if (isRecord(event) && event.type === "started") throw new Error("started event requires a null checkpoint");
   validateCheckpoint(policy, checkpoint);
   validateEventEnvelope(checkpoint, event);
   validateEventPayload(checkpoint, event);
@@ -164,6 +168,37 @@ export function reducePolicy({
     case "decision":
       return reduceDecision(policy, base, event);
   }
+}
+
+function reduceStart(policy: PolicyV1, event: PolicyEvent): PolicyReduction {
+  if (!isRecord(event) || event.type !== "started") throw new Error("null checkpoint requires a started event");
+  assertExactKeys(event, ["observation", "sequence", "type"], "started");
+  if (!Number.isSafeInteger(event.sequence) || event.sequence !== 1) throw new Error("event sequence must equal 1");
+  assertExactKeys(event.observation, ["elapsedMs", "totalCostMicros", "totalTokens"], "observation");
+  for (const key of ["elapsedMs", "totalTokens", "totalCostMicros"] as const) {
+    const value = event.observation[key];
+    if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value !== 0) {
+      throw new Error(`started observation ${key} must be zero`);
+    }
+  }
+
+  const checkpoint: PolicyCheckpoint = {
+    revision: 1,
+    elapsedMs: 0,
+    totalTokens: 0,
+    totalCostMicros: 0,
+    cursor: { phase: "worker", attempt: 1 },
+  };
+  return reduction(checkpoint, { phase: "worker", attempt: 1 }, "worker.started", [
+    "event.legal",
+    "observation.valid",
+    "worker.started",
+  ], (actionId) => ({
+    actionId,
+    type: "run_worker",
+    attempt: 1,
+    role: role(policy, "worker"),
+  }));
 }
 
 function reduceWorkerRetry(policy: PolicyV1, checkpoint: PolicyCheckpoint): PolicyReduction {
