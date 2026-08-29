@@ -132,6 +132,11 @@ export async function runOwnedPiAttempt(
     attemptToken: spec.attemptToken,
   };
 
+  // A cancellation can close the child side while a backpressured prompt is still pending.
+  // writeRecord observes callback errors; this listener prevents the stream's parallel error
+  // event from becoming an uncaught exception.
+  child.stdin.on("error", () => undefined);
+
   let stderr = Buffer.alloc(0);
   let stderrTruncated = false;
   child.stderr.on("data", (chunk: Buffer) => {
@@ -160,7 +165,14 @@ export async function runOwnedPiAttempt(
     outcomeSet = true;
     outcome.resolve(value);
   };
-  const emit = async (event: PiAttemptEvent): Promise<void> => spec.recordEvent(event);
+  let telemetryError: unknown;
+  const emit = async (event: PiAttemptEvent): Promise<void> => {
+    try {
+      await spec.recordEvent(event);
+    } catch (error) {
+      telemetryError ??= error;
+    }
+  };
 
   const reader = (async () => {
     const decoder = new StrictPiDecoder();
@@ -228,56 +240,78 @@ export async function runOwnedPiAttempt(
     }
   })();
 
-  let journaled = false;
+  const aborted = new Deferred<Outcome>();
+  const onAbort = (): void => aborted.resolve({ status: "cancelled" });
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+
+  let ownershipMayBeDurable = false;
   let selected: Outcome;
   try {
-    await spec.journalOwnership(identity);
-    journaled = true;
+    ownershipMayBeDurable = true;
+    try {
+      await spec.journalOwnership(identity);
+    } catch {
+      // The event append may have committed before its state projection failed. Repeating the
+      // same bind both repairs that projection and proves which identity is durably recorded.
+      await spec.journalOwnership(identity);
+    }
     await emit({ type: "started", identity });
     if (signal.aborted) {
-      await emit({ type: "abort" });
       selected = { status: "cancelled" };
     } else {
-      await writeRecord(child.stdin, { type: "prompt", id: promptId, message: spec.prompt });
-      const aborted = new Deferred<Outcome>();
-      const onAbort = (): void => aborted.resolve({ status: "cancelled" });
-      signal.addEventListener("abort", onAbort, { once: true });
-      selected = await Promise.race([
-        outcome.promise,
-        aborted.promise,
-        closed.promise.then((): Outcome => ({
-          status: "error",
-          error: "Pi worker exited before settlement",
-        })),
-      ]);
-      signal.removeEventListener("abort", onAbort);
-      if (selected.status === "cancelled") {
-        await emit({ type: "abort" });
-        if (promptAccepted && child.stdin.writable) {
-          await writeRecord(child.stdin, { type: "abort", id: `abort-${spec.attemptToken}` }).catch(
-            () => undefined,
-          );
-        }
+      const workerOutcome = (async (): Promise<Outcome> => {
+        await writeRecord(child.stdin, { type: "prompt", id: promptId, message: spec.prompt });
+        return Promise.race([
+          outcome.promise,
+          closed.promise.then((): Outcome => ({
+            status: "error",
+            error: "Pi worker exited before settlement",
+          })),
+        ]);
+      })();
+      selected = await Promise.race([workerOutcome, aborted.promise]);
+    }
+    if (selected.status === "cancelled") {
+      await emit({ type: "abort" });
+      if (promptAccepted && child.stdin.writable) {
+        await writeRecord(child.stdin, { type: "abort", id: `abort-${spec.attemptToken}` }).catch(
+          () => undefined,
+        );
       }
     }
   } catch (error) {
     selected = { status: "error", error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 
+  // No durable ownership mutation is permitted below until group absence has been proven.
+  // If reaping fails, the ownership evidence deliberately remains in the ledger.
   const exit = await terminateProcessGroup(identity.processGroupId, closed.promise);
-  await reader.catch(() => undefined);
+  await reader;
   if (protocolError !== undefined) selected = { status: "error", error: protocolError };
   if (selected.status === "error" && !errorEmitted) {
     await emit({ type: "error", message: selected.error ?? "Pi worker failed" });
   }
-  let exitEventError: unknown;
-  try {
-    await emit({ type: "exit", code: exit.code, signal: exit.signal });
-  } catch (error) {
-    exitEventError = error;
+  await emit({ type: "exit", code: exit.code, signal: exit.signal });
+
+  let cleanupError: unknown;
+  if (ownershipMayBeDurable) {
+    try {
+      await spec.journalOwnership(null);
+    } catch {
+      try {
+        // Clearing is idempotent, including when the first clear appended durably but its
+        // projection write failed.
+        await spec.journalOwnership(null);
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
   }
-  if (journaled) await spec.journalOwnership(null);
-  if (exitEventError !== undefined) throw exitEventError;
+  if (cleanupError !== undefined) throw cleanupError;
+  if (telemetryError !== undefined) throw telemetryError;
   return {
     status: selected.status,
     ...(selected.usage === undefined ? {} : { usage: selected.usage }),

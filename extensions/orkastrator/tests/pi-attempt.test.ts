@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -29,10 +29,19 @@ function fixture(body: string): Fixture {
   };
 }
 
-function settledBody(options: { split?: boolean; stderr?: number; grandchild?: boolean } = {}): string {
+function settledBody(options: {
+  split?: boolean;
+  stderr?: number;
+  grandchild?: boolean;
+  ignoreTerm?: boolean;
+  promptMarker?: string;
+  readyMarker?: string;
+} = {}): string {
   return `
 const fs = require("node:fs");
 const cp = require("node:child_process");
+${options.ignoreTerm ? 'process.on("SIGTERM", () => {});' : ""}
+${options.readyMarker ? `fs.writeFileSync(${JSON.stringify(options.readyMarker)}, "ready\\n");` : ""}
 const args = process.argv.slice(2);
 const session = args[args.indexOf("--session") + 1];
 fs.writeFileSync(session, "preserved\\n");
@@ -51,6 +60,7 @@ process.stdin.on("data", (chunk) => {
     const record = JSON.parse(buffer.slice(0, at));
     buffer = buffer.slice(at + 1);
     if (record.type === "prompt") {
+      ${options.promptMarker ? `fs.writeFileSync(${JSON.stringify(options.promptMarker)}, "prompted\\n");` : ""}
       send({ type: "response", id: record.id, success: true });
       send({ type: "agent_end" });
       send({ type: "tool_execution_start", toolName: "read" });
@@ -70,18 +80,23 @@ async function run(
   events: PiAttemptEvent[],
   signal = new AbortController().signal,
   journal?: (bound: boolean) => Promise<void> | void,
+  options: {
+    prompt?: string;
+    recordEvent?: (event: PiAttemptEvent) => Promise<void> | void;
+  } = {},
 ) {
   return runOwnedPiAttempt({
     executable: value.executable,
     cwd: value.root,
     sessionFile: value.sessionFile,
     attemptToken: "attempt-1",
-    prompt: "do one thing",
+    prompt: options.prompt ?? "do one thing",
     model: "provider/model",
     thinking: "low",
     journalOwnership: async (identity) => journal?.(identity !== null),
-    recordEvent: (event) => {
+    recordEvent: async (event) => {
       events.push(event);
+      await options.recordEvent?.(event);
     },
   }, signal);
 }
@@ -98,7 +113,11 @@ for (const [name, output, expected] of [
     try {
       const result = await run(value, events);
       assert.equal(result.status, "error");
-      assert.match(events.find((event) => event.type === "error")?.message ?? result.error ?? "", expected);
+      const message = events.find((event) => event.type === "error")?.message ?? result.error ?? "";
+      assert.match(message, expected);
+      if (name === "unterminated EOF") {
+        assert.equal(result.error, "Pi RPC ended with an unterminated record");
+      }
     } finally {
       value.cleanup();
     }
@@ -106,13 +125,20 @@ for (const [name, output, expected] of [
 }
 
 test("durable ownership gates prompt, split frames settle, and agent_end is not terminal", async () => {
-  const value = fixture(settledBody({ split: true }));
+  const markerToken = `${process.pid}-${Date.now()}`;
+  const promptMarker = join(tmpdir(), `orkastrator-prompt-${markerToken}`);
+  const readyMarker = join(tmpdir(), `orkastrator-ready-${markerToken}`);
+  const value = fixture(settledBody({ split: true, promptMarker, readyMarker }));
   const events: PiAttemptEvent[] = [];
   let journaled = false;
   try {
     const result = await run(value, events, undefined, async (bound) => {
       if (!bound) return;
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      while (!existsSync(readyMarker)) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(existsSync(promptMarker), false);
       journaled = true;
     });
     assert.equal(result.status, "settled");
@@ -122,6 +148,8 @@ test("durable ownership gates prompt, split frames settle, and agent_end is not 
     assert.equal(events.filter((event) => event.type === "settled").length, 1);
     assert.equal(readFileSync(value.sessionFile, "utf8"), "preserved\n");
   } finally {
+    rmSync(promptMarker, { force: true });
+    rmSync(readyMarker, { force: true });
     value.cleanup();
   }
 });
@@ -142,6 +170,22 @@ test("cancellation before launch gate and after settlement is idempotent", async
   } finally {
     before.cleanup();
     after.cleanup();
+  }
+});
+
+test("abort during a pending prompt write cancels and reaps the worker", async () => {
+  const value = fixture("setInterval(() => {}, 1000);");
+  const controller = new AbortController();
+  try {
+    setTimeout(() => controller.abort(), 50);
+    const startedAt = Date.now();
+    const result = await run(value, [], controller.signal, undefined, {
+      prompt: "x".repeat(16 * 1024 * 1024),
+    });
+    assert.equal(result.status, "cancelled");
+    assert.ok(Date.now() - startedAt < 1_500);
+  } finally {
+    value.cleanup();
   }
 });
 
@@ -184,6 +228,70 @@ test("stderr is bounded and worker crashes are typed", async () => {
   } finally {
     flood.cleanup();
     crash.cleanup();
+  }
+});
+
+test("SIGTERM-resistant workers are escalated to SIGKILL", async () => {
+  const value = fixture(settledBody({ ignoreTerm: true }));
+  try {
+    const result = await run(value, []);
+    assert.equal(result.status, "settled");
+    assert.equal(result.exitSignal, "SIGKILL");
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("an ambiguous durable bind is confirmed idempotently before prompting", async () => {
+  const value = fixture(settledBody());
+  let bound = false;
+  let bindCalls = 0;
+  let clearCalls = 0;
+  try {
+    const result = await run(value, [], undefined, (isBound) => {
+      if (isBound) {
+        bindCalls += 1;
+        if (bound) return;
+        bound = true;
+        throw new Error("state projection failed after durable bind");
+      }
+      clearCalls += 1;
+      bound = false;
+    });
+    assert.equal(result.status, "settled");
+    assert.equal(bindCalls, 2);
+    assert.equal(clearCalls, 1);
+    assert.equal(bound, false);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("post-reap cleanup survives telemetry and projection failures", async () => {
+  const value = fixture(settledBody());
+  let bound = false;
+  let clearCalls = 0;
+  try {
+    await assert.rejects(
+      run(value, [], undefined, (isBound) => {
+        if (isBound) {
+          bound = true;
+          return;
+        }
+        clearCalls += 1;
+        bound = false;
+        if (clearCalls === 1) throw new Error("state projection failed after durable clear");
+      }, {
+        recordEvent: (event) => {
+          if (event.type === "exit") throw new Error("telemetry projection failed");
+        },
+      }),
+      /telemetry projection failed/u,
+    );
+    assert.equal(clearCalls, 2);
+    assert.equal(bound, false);
+  } finally {
+    value.cleanup();
   }
 });
 

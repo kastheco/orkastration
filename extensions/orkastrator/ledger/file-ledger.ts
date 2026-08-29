@@ -329,7 +329,7 @@ export class RunLedger {
         if (identity.attemptToken !== attemptToken) throw new LedgerError("attempt token mismatch");
         this.#assertOwnedProcess(identity);
         if (existing !== undefined) {
-          if (JSON.stringify(existing) !== JSON.stringify(identity)) {
+          if (!sameOwnedProcessIdentity(existing, identity)) {
             throw new LedgerError(`attempt ${attemptToken} already has different ownership`);
           }
           return current;
@@ -946,6 +946,18 @@ export class RunLedger {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sameOwnedProcessIdentity(
+  left: OwnedProcessIdentity,
+  right: OwnedProcessIdentity,
+): boolean {
+  return (
+    left.pid === right.pid &&
+    left.processGroupId === right.processGroupId &&
+    left.sessionFile === right.sessionFile &&
+    left.attemptToken === right.attemptToken
+  );
 }
 
 function isOwnedProcessIdentity(value: unknown): boolean {

@@ -102,6 +102,16 @@ test("owned process journal binds and clears one attempt idempotently", () => {
       value.ledger.journalOwnedProcess(run.runId, "attempt-1", identity).sequence,
       bound.sequence,
     );
+    const reorderedIdentity = {
+      attemptToken: identity.attemptToken,
+      sessionFile: identity.sessionFile,
+      processGroupId: identity.processGroupId,
+      pid: identity.pid,
+    };
+    assert.equal(
+      value.ledger.journalOwnedProcess(run.runId, "attempt-1", reorderedIdentity).sequence,
+      bound.sequence,
+    );
     assert.throws(
       () => value.ledger.journalOwnedProcess(run.runId, "attempt-1", { ...identity, pid: 6002 }),
       /different ownership/u,

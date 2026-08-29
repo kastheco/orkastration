@@ -61,7 +61,7 @@ export function installOrkastrator(
   const hostPid = dependencies.hostPid ?? process.pid;
   const canonicalizeRepository = dependencies.canonicalizeRepository ?? realpathSync;
   const piExecutable =
-    dependencies.piExecutable ?? resolve(import.meta.dirname, "../../../node_modules/.bin/pi");
+    dependencies.piExecutable ?? resolve(import.meta.dirname, "../../node_modules/.bin/pi");
   const randomAttemptToken = dependencies.randomAttemptToken ?? randomUUID;
   const runAttempt = dependencies.runAttempt ?? runOwnedPiAttempt;
   let claimedRunId: string | undefined;
@@ -262,6 +262,7 @@ export function installOrkastrator(
       const controller = new AbortController();
       const onToolAbort = (): void => controller.abort();
       signal?.addEventListener("abort", onToolAbort, { once: true });
+      if (signal?.aborted) controller.abort();
       const promise = runAttempt(
         {
           executable: piExecutable,

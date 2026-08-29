@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -216,6 +216,45 @@ test("untrusted sessions cannot create or inspect project-local run state", asyn
     await value.api.commands.get("kas-runs")?.handler("", ctx);
     assert.match(ctx.notifications.at(-1)?.[0] ?? "", /requires project trust/u);
     assert.equal(value.ledger.scanNonterminal().length, 0);
+  } finally {
+    value.cleanup();
+  }
+});
+
+test("the default Pi path is repository-local and a pre-aborted tool signal reaches the adapter", async () => {
+  let executable = "";
+  let adapterAborted = false;
+  const value = fixture({
+    runAttempt: async (spec, signal) => {
+      executable = spec.executable;
+      adapterAborted = signal.aborted;
+      return {
+        status: "cancelled",
+        stderr: "",
+        stderrTruncated: false,
+        exitCode: null,
+        exitSignal: "SIGTERM",
+      };
+    },
+  });
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    const ctx = context(value.repository);
+    const tool = value.api.tools.get("orkastrator_run_create");
+    assert.ok(tool);
+    await tool.execute(
+      "tool-1",
+      { objective: "Respect cancellation", policySnapshot: "version: 1\n" },
+      controller.signal,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      executable,
+      resolve(import.meta.dirname, "../../../node_modules/.bin/pi"),
+    );
+    assert.equal(adapterAborted, true);
   } finally {
     value.cleanup();
   }
