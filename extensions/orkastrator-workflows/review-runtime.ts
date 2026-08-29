@@ -417,6 +417,7 @@ function fixerPrompt(
     })))}`,
     rejectionEvidence.length === 0 ? "" : `Previous rejection evidence: ${JSON.stringify(rejectionEvidence)}`,
     "Change only the declared writable paths. Validate the fix, leave the worktree clean, and create exactly one commit.",
+    "Do not ask the supervisor to widen scope. If scoped validation passes while the full suite fails only in another declared fixer group's paths, commit the scoped fix and record that out-of-scope failure.",
   ].filter(Boolean).join("\n\n");
 }
 

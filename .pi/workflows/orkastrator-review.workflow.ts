@@ -17,6 +17,8 @@ import {
   type ReviewWorkflowInput,
 } from "../../extensions/orkastrator-workflows/review-runtime.ts";
 
+const IMPLEMENTATION_REVISION = 3;
+
 const ownerChoices = defineHumanChoices({
   accept_partial: choice({ label: "Accept integrated fixes" }),
   stop: choice({ label: "Stop and preserve evidence" }),
@@ -26,7 +28,7 @@ export default defineWorkflow<ReviewWorkflowInput>({
   name: "orkastrator-review",
   input: parseReviewWorkflowInput,
   presentationPrompt: ({ finalOutput }) => [
-    "Report the Orkastrator review workflow result concisely.",
+    `Report the Orkastrator review workflow result concisely (implementation revision ${IMPLEMENTATION_REVISION}).`,
     "State whether review was clean, all fixes integrated, or owner intervention remains.",
     "Name unresolved fixer groups and preserved worktrees when present.",
     JSON.stringify(finalOutput),
