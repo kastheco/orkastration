@@ -41,10 +41,17 @@ The run demonstrated:
 - a clean final worktree with all fixture tests passing;
 - durable Pi Workflows completion with no unresolved groups.
 
-Automated tests additionally cover strict schemas, path escape rejection,
-parallel caps, transitive clumping, exact commit identity, idempotent effect
-adoption, owner escalation, cancellation, and novel deferred-finding
-reconciliation.
+The first real `/kas` dogfood run,
+`20260829T215431995Z-orkastrator-review-053a7221`, reviewed the cutover itself.
+It found and repaired three blocking boundary defects in `4e6f478`: finding
+identity after sorting, deferred evidence across a rejected round, and rename
+scope enforcement. The cleanup commit `11d33cd` removed the last unused reducer
+seam.
+
+The current 21-test suite additionally covers strict schemas, path escape
+rejection, parallel caps, transitive clumping, exact commit identity, idempotent
+effect adoption, owner escalation, cancellation, novel deferred-finding
+reconciliation, and paths removed by renames.
 
 ## Retained policy
 
@@ -81,3 +88,9 @@ completion until reconciliation.
 
 These are bounded adapter limitations, not reasons to restore the removed
 workflow engine.
+
+## Canonical records
+
+- [Notion: orkastrator](https://app.notion.com/p/orkastrator-3c8b3a0a9c198166ab2bc9a3f9c1c3cb)
+- [Linear project: orkastrator](https://linear.app/kashub/project/orkastrator-aae24ed01e8e)
+- [GitHub repository](https://github.com/kastheco/orkastrator)

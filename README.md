@@ -12,6 +12,14 @@ workflow engine, process manager, ledger, or recovery system.
 
 ## Use it
 
+Install the three Pi packages once:
+
+```bash
+pi install npm:@osolmaz/pi-workflows
+pi install npm:pi-subagents
+pi install git:github.com/kastheco/orkastrator
+```
+
 Run Pi from a trusted Git repository with a clean, committed change, then use:
 
 ```text
@@ -56,6 +64,20 @@ A finding observed during scoped re-review follows one of four routes:
 - introduced by this fix: blocks the fixer;
 - novel and relevant: blocks final completion for reconciliation;
 - unrelated repository issue: preserved as evidence without widening the fix.
+
+## Proof
+
+A live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed
+each exact commit, and integrated both serially at `a543512`. The first real `/kas`
+dogfood run then found and repaired three policy-boundary defects in `4e6f478`:
+finding identity after sorting, deferred evidence across rejected rounds, and scope
+enforcement across renames. The current suite passes 21 tests plus TypeScript
+checking.
+
+Durable architecture context lives in the
+[orkastrator Notion page](https://app.notion.com/p/orkastrator-3c8b3a0a9c198166ab2bc9a3f9c1c3cb).
+Tracked implementation history lives in the
+[Linear project](https://linear.app/kashub/project/orkastrator-aae24ed01e8e).
 
 ## Files
 
