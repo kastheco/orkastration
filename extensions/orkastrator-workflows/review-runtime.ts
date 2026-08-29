@@ -19,7 +19,7 @@ import { delegateSubagent, type DelegationSpec } from "./delegation-bridge.ts";
 const execFileAsync = promisify(execFile);
 const SHA = /^[0-9a-f]{40}$/u;
 const MAX_GIT_OUTPUT = 1_048_576;
-const INITIAL_REVIEW_SCHEMA = reviewEnvelopeSchema(false);
+const INITIAL_REVIEW_SCHEMA = reviewEnvelopeSchema();
 const RE_REVIEW_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -618,7 +618,7 @@ function pathArraySchema() {
   } as const;
 }
 
-function reviewEnvelopeSchema(_introduced: boolean) {
+function reviewEnvelopeSchema() {
   return {
     type: "object",
     additionalProperties: false,

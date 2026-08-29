@@ -6,7 +6,6 @@ import {
   type InitialReviewFinding,
   parseInitialReviewOutput,
   planReviewWaves,
-  reducerFindings,
 } from "../review-wave.ts";
 
 function finding(
@@ -125,25 +124,6 @@ test("shared evidence paths do not clump disjoint writable scopes", () => {
     plan.fixerGroups.map((group) => group.writablePaths).sort(),
     [["src/a.ts"], ["src/b.ts"]],
   );
-});
-
-test("reducer findings preserve the frozen IDs, categories, and deterministic clumps", () => {
-  const plan = planReviewWaves([
-    finding("security-1", ["src/auth.ts"], { category: "security" }),
-    finding("scope-1", ["src/auth.ts"], { category: "scope" }),
-    finding("acceptance-1", ["src/output.ts"], { category: "acceptance" }),
-    finding("style-1", [], { category: "style", blocking: false }),
-  ], 3);
-
-  const reduced = reducerFindings(plan);
-
-  assert.deepEqual(reduced.map((item) => item.id), [
-    "acceptance-1",
-    "scope-1",
-    "security-1",
-  ]);
-  assert.equal(reduced[1]?.groupId, reduced[2]?.groupId);
-  assert.notEqual(reduced[0]?.groupId, reduced[1]?.groupId);
 });
 
 test("re-review packet contains only the frozen contracts, exact diff, and validation evidence", () => {

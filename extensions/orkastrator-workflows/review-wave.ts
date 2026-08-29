@@ -159,27 +159,6 @@ export function planReviewWaves(
   });
 }
 
-/** Convert the frozen blocking set to the reducer's exact initial-review input. */
-export function reducerFindings(plan: FrozenReviewPlan): Array<{
-  id: string;
-  category: Exclude<FindingCategory, "style">;
-  groupId: string;
-}> {
-  const groupByFinding = new Map<string, string>();
-  for (const group of plan.fixerGroups) {
-    for (const finding of group.findings) groupByFinding.set(finding.id, group.groupId);
-  }
-  return plan.findings
-    .filter((finding): finding is FrozenFinding & {
-      category: Exclude<FindingCategory, "style">;
-    } => finding.blocking)
-    .map((finding) => ({
-      id: finding.id,
-      category: finding.category,
-      groupId: groupByFinding.get(finding.id)!,
-    }));
-}
-
 /** Validate one exact fixer commit and build the narrow mandatory re-review packet. */
 export function buildReReviewPacket(
   plan: FrozenReviewPlan,
