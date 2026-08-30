@@ -1,8 +1,13 @@
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { installDelegationBridge } from "./delegation-bridge.ts";
+
+const REVIEW_WORKFLOW_PATH = fileURLToPath(
+  new URL("../../.pi/workflows/orkastrator-review.workflow.ts", import.meta.url),
+);
 
 function requestLine(kind: "implementation" | "cook" | "review", request: string): string {
   if (request.length === 0) {
@@ -15,7 +20,7 @@ function checkInstructions(objective: string): string {
   return [
     "After implementation is complete, including the implement skill's tests, code review, and commit, automatically perform `/kas:check` without waiting for another user message.",
     "The `/kas:check` contract is: inspect the current Git repository, require a clean worktree, and resolve its absolute top-level path and exact HEAD revision.",
-    `Use the workflow tool with action=start and workflow=orkastrator-review. Pass objective=${JSON.stringify(objective)}, repository, reviewRevision, and maxParallelFixers=3 as workflow input.`,
+    `Use the workflow tool with action=start and workflow=${JSON.stringify(REVIEW_WORKFLOW_PATH)}. Pass objective=${JSON.stringify(objective)}, repository, reviewRevision, and maxParallelFixers=3 as workflow input.`,
     "If the worktree is dirty or HEAD is not the intended committed implementation, stop and ask for the missing decision instead of guessing.",
     "Do not use orkastrator_run_create, the legacy orkas CLI, or the retired custom lifecycle.",
   ].join("\n");
@@ -34,7 +39,7 @@ function checkPrompt(objective: string): string {
   return [
     "Run the repository's Orkastrator review policy now. This is `/kas:check`; do not run an implementation or grilling skill first.",
     requestLine("review", objective),
-    "Use the workflow tool with action=start and workflow=orkastrator-review.",
+    `Use the workflow tool with action=start and workflow=${JSON.stringify(REVIEW_WORKFLOW_PATH)}.`,
     "Before starting, inspect the current Git repository. Require a clean worktree and resolve its absolute top-level path and exact HEAD revision.",
     "Pass objective, repository, reviewRevision, and maxParallelFixers=3 as workflow input.",
     "If the worktree is dirty or HEAD is not the intended committed change, stop and ask for the missing decision instead of guessing.",

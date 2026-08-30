@@ -35,8 +35,10 @@ Run Pi from a trusted Git repository, then choose the amount of ceremony:
 - `/kas:cook` explicitly runs Matt Pocock's `grill-with-docs` skill across as many
   user turns as needed. Once the plan and domain docs are accepted, it runs the
   installed `implement` skill and then automatically runs `/kas:check`.
-- `/kas:check` starts the `orkastrator-review` workflow against the repository's
-  exact committed `HEAD`. It refuses to guess when the worktree is dirty.
+- `/kas:check` starts the packaged `orkastrator-review.workflow.ts` by its exact
+  installed file path against the repository's committed `HEAD`. It doesn't rely
+  on project/global workflow-name discovery and refuses to guess when the
+  worktree is dirty.
 - `/kas-runs` reports the active or most recent review workflow run.
 
 `/kas` requires `/skill:implement`. `/kas:cook` also requires
@@ -45,7 +47,7 @@ Run Pi from a trusted Git repository, then choose the amount of ceremony:
 The direct `/kas:check` equivalent is:
 
 ```text
-/workflow orkastrator-review --input-json {
+/workflow /absolute/path/to/orkastrator/.pi/workflows/orkastrator-review.workflow.ts --input-json {
   "objective": "preserve the parser contract",
   "repository": "/absolute/path/to/repository",
   "reviewRevision": "<40-character commit SHA>",

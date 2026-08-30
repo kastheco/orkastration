@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -73,7 +75,11 @@ test("/kas invokes implement directly and automatically checks the committed res
   assert.match(messages[0]!.message, /add durable retries/);
   assert.match(messages[0]!.message, /do not invoke.*grill-with-docs/i);
   assert.match(messages[0]!.message, /automatically perform.*\/kas:check/i);
-  assert.match(messages[0]!.message, /workflow=orkastrator-review/);
+  const workflowPath = messages[0]!.message.match(
+    /workflow="([^"]+orkastrator-review\.workflow\.ts)"/,
+  )?.[1];
+  assert.ok(workflowPath, "automatic check must use the packaged workflow path");
+  assert.equal(existsSync(workflowPath), true);
   assert.deepEqual(messages[0]!.options, { expandPromptTemplates: true });
   assert.equal(notifications.length, 0);
 
@@ -94,7 +100,11 @@ test("/kas:cook grills with docs, implements the accepted plan, then checks it",
   assert.match(messages[0]!.message, /Implement from the accepted plan/);
   assert.doesNotMatch(messages[0]!.message, /name: implement/);
   assert.match(messages[0]!.message, /automatically perform.*\/kas:check/i);
-  assert.match(messages[0]!.message, /workflow=orkastrator-review/);
+  const workflowPath = messages[0]!.message.match(
+    /workflow="([^"]+orkastrator-review\.workflow\.ts)"/,
+  )?.[1];
+  assert.ok(workflowPath, "cook must converge on the packaged workflow path");
+  assert.equal(existsSync(workflowPath), true);
   assert.deepEqual(messages[0]!.options, { expandPromptTemplates: true });
   assert.equal(notifications.length, 0);
 });
@@ -107,12 +117,33 @@ test("/kas:check runs only the Orkastrator review workflow", async () => {
   await check.handler("preserve the parser contract", trustedContext(notifications));
 
   assert.equal(messages.length, 1);
-  assert.match(messages[0]!.message, /workflow=orkastrator-review/);
+  const workflowPath = messages[0]!.message.match(
+    /workflow="([^"]+orkastrator-review\.workflow\.ts)"/,
+  )?.[1];
+  assert.ok(workflowPath, "/kas:check must use the packaged workflow path");
+  assert.equal(existsSync(workflowPath), true);
   assert.match(messages[0]!.message, /preserve the parser contract/);
   assert.match(messages[0]!.message, /clean worktree/);
   assert.doesNotMatch(messages[0]!.message, /skill:implement|grill-with-docs/);
   assert.equal(messages[0]!.options, undefined);
   assert.equal(notifications.length, 0);
+});
+
+test("the published package includes the workflow addressed by the command", () => {
+  const packageRoot = fileURLToPath(new URL("../../../", import.meta.url));
+  const pack = JSON.parse(
+    execFileSync("npm", ["pack", "--dry-run", "--json"], {
+      cwd: packageRoot,
+      encoding: "utf8",
+    }),
+  ) as Array<{ files: Array<{ path: string }> }>;
+
+  assert.equal(
+    pack[0]?.files.some(
+      (file) => file.path === ".pi/workflows/orkastrator-review.workflow.ts",
+    ),
+    true,
+  );
 });
 
 test("implementation commands fail closed when their required skills are missing", async () => {

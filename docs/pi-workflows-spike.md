@@ -20,7 +20,10 @@ that are specific to this project.
   documentation phase active across user turns, then follows the exact installed
   `implement` skill and the `/kas:check` contract.
 - `/kas:check <objective>` runs only the durable `orkastrator-review` workflow
-  against a clean, exact committed revision.
+  against a clean, exact committed revision. The command passes the workflow's
+  exact file path inside the installed Orkastrator package because Pi Workflows
+  discovers names only from project `.pi/workflows`, global
+  `~/.pi/agent/workflows`, and built-ins.
 
 Required skills are discovered through Pi's command registry. Missing
 `implement` or `grill-with-docs` resources fail closed before the pipeline starts.
