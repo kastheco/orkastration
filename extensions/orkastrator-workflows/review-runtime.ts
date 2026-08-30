@@ -1,8 +1,6 @@
-import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import type { WorkflowActionContext } from "@osolmaz/pi-workflows";
@@ -15,10 +13,19 @@ import {
   type InitialReviewFinding,
 } from "./review-wave.ts";
 import { delegateSubagent, type DelegationSpec } from "./delegation-bridge.ts";
+import {
+  ensureOwnedFixerWorktree,
+  recordFixerWorktreeOutcome,
+  sweepExpiredFixerWorktrees,
+} from "./worktree-retention.ts";
+
+export { sweepExpiredFixerWorktrees } from "./worktree-retention.ts";
 
 const execFileAsync = promisify(execFile);
 const SHA = /^[0-9a-f]{40}$/u;
 const MAX_GIT_OUTPUT = 1_048_576;
+const DEFAULT_WORKTREE_RETENTION_DAYS = 30;
+const MAX_WORKTREE_RETENTION_DAYS = 365;
 const INITIAL_REVIEW_SCHEMA = reviewEnvelopeSchema();
 const RE_REVIEW_SCHEMA = {
   type: "object",
@@ -47,6 +54,7 @@ export interface ReviewWorkflowInput {
   repository: string;
   reviewRevision: string;
   maxParallelFixers: number;
+  worktreeRetentionDays: number;
   stateRoot?: string;
 }
 
@@ -72,6 +80,7 @@ export interface FixWaveResult {
   integratedHead: string;
   accepted: AcceptedFix[];
   unresolved: UnresolvedFix[];
+  retentionWarnings: string[];
 }
 
 export interface ReReviewVerdict {
@@ -91,6 +100,7 @@ export function parseReviewWorkflowInput(value: unknown): ReviewWorkflowInput {
     "repository",
     "reviewRevision",
     "stateRoot",
+    "worktreeRetentionDays",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown !== undefined) throw new Error(`review workflow input has unknown field ${unknown}`);
@@ -107,6 +117,14 @@ export function parseReviewWorkflowInput(value: unknown): ReviewWorkflowInput {
   if (!Number.isSafeInteger(maxParallelFixers) || (maxParallelFixers as number) < 1 || (maxParallelFixers as number) > 3) {
     throw new Error("review workflow maxParallelFixers must be an integer from 1 to 3");
   }
+  const worktreeRetentionDays = input.worktreeRetentionDays ?? DEFAULT_WORKTREE_RETENTION_DAYS;
+  if (
+    !Number.isSafeInteger(worktreeRetentionDays)
+    || (worktreeRetentionDays as number) < 1
+    || (worktreeRetentionDays as number) > MAX_WORKTREE_RETENTION_DAYS
+  ) {
+    throw new Error("review workflow worktreeRetentionDays must be an integer from 1 to 365");
+  }
   if (input.stateRoot !== undefined && (typeof input.stateRoot !== "string" || !isAbsolute(input.stateRoot))) {
     throw new Error("review workflow stateRoot must be an absolute path");
   }
@@ -115,6 +133,7 @@ export function parseReviewWorkflowInput(value: unknown): ReviewWorkflowInput {
     repository: input.repository,
     reviewRevision: input.reviewRevision,
     maxParallelFixers: maxParallelFixers as number,
+    worktreeRetentionDays: worktreeRetentionDays as number,
     ...(input.stateRoot === undefined ? {} : { stateRoot: input.stateRoot as string }),
   };
 }
@@ -124,6 +143,7 @@ export async function runInitialReview(
 ): Promise<FrozenReviewPlan> {
   const input = parseReviewWorkflowInput(context.input);
   const repository = await verifyReviewRepository(input, context.signal, true);
+  await sweepExpiredFixerWorktrees(input, context.signal);
   const response = await delegateSubagent({
     ownerRunId: context.state.runId,
     nodeId: "initial-review",
@@ -206,12 +226,47 @@ export async function runFixWaves(
     }
   }
   integratedHead = await git(repository, ["rev-parse", "HEAD"], context.signal);
+  const retentionWarnings: string[] = [];
+  const preserveByGroup = new Map(
+    unresolved.map((item) => [item.groupId, { worktree: item.worktree }]),
+  );
+  for (const fix of accepted) {
+    if (!(await isAncestor(repository, fix.commitSha, integratedHead, context.signal))) {
+      preserveByGroup.set(fix.groupId, { worktree: fix.worktree });
+    }
+  }
+  for (const fix of accepted) {
+    if (preserveByGroup.has(fix.groupId)) continue;
+    try {
+      await recordFixerWorktreeOutcome(input, context.state.runId, {
+        status: "integrated",
+        groupId: fix.groupId,
+        worktree: fix.worktree,
+        commitSha: fix.commitSha,
+        integratedHead,
+      }, context.signal);
+    } catch (error) {
+      retentionWarnings.push(`could not schedule ${fix.groupId} cleanup: ${boundedError(error)}`);
+    }
+  }
+  for (const [groupId, item] of preserveByGroup) {
+    try {
+      await recordFixerWorktreeOutcome(input, context.state.runId, {
+        status: "unresolved",
+        groupId,
+        worktree: item.worktree,
+      }, context.signal);
+    } catch (error) {
+      retentionWarnings.push(`could not preserve ${groupId} retention state: ${boundedError(error)}`);
+    }
+  }
   return {
     status: unresolved.length === 0 ? "completed" : "needs_owner",
     baseRevision: input.reviewRevision,
     integratedHead,
     accepted,
     unresolved,
+    retentionWarnings,
   };
 }
 
@@ -226,7 +281,7 @@ async function runFixerGroup(
     writablePaths: string[];
   }>,
 ): Promise<AcceptedFix | UnresolvedFix> {
-  const worktree = await ensureFixerWorktree(input, context.state.runId, group.groupId, context.signal);
+  const worktree = await ensureOwnedFixerWorktree(input, context.state.runId, group.groupId, context.signal);
   let rejectionEvidence: string[] = [];
   const deferredFindings = new Map<string, InitialReviewFinding>();
   for (let round = 1; round <= 2; round += 1) {
@@ -335,39 +390,6 @@ async function verifyReviewRepository(
     throw new Error("review worktree must be clean before review or integration");
   }
   return repository;
-}
-
-async function ensureFixerWorktree(
-  input: ReviewWorkflowInput,
-  runId: string,
-  groupId: string,
-  signal: AbortSignal,
-): Promise<string> {
-  const repositoryDigest = createHash("sha256").update(input.repository).digest("hex").slice(0, 12);
-  const root = input.stateRoot ?? join(homedir(), ".pi", "agent", "orkastrator-worktrees");
-  const path = join(root, `${basename(input.repository)}-${repositoryDigest}`, runId, groupId);
-  await mkdir(resolve(path, ".."), { recursive: true });
-  try {
-    await stat(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await git(input.repository, ["worktree", "add", "--detach", path, input.reviewRevision], signal);
-  }
-  const actual = await realpath(path);
-  const repositoryCommonDir = await gitCommonDir(input.repository, signal);
-  const worktreeCommonDir = await gitCommonDir(actual, signal);
-  if (repositoryCommonDir !== worktreeCommonDir) {
-    throw new Error(`fixer worktree ${groupId} belongs to another repository`);
-  }
-  const head = await git(actual, ["rev-parse", "HEAD"], signal);
-  const count = Number.parseInt(
-    await git(actual, ["rev-list", "--count", `${input.reviewRevision}..${head}`], signal),
-    10,
-  );
-  if (head !== input.reviewRevision && count !== 1) {
-    throw new Error(`fixer worktree ${groupId} has unexpected commit history`);
-  }
-  return actual;
 }
 
 async function inspectExactFixCommit(

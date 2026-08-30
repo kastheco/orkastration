@@ -91,6 +91,13 @@ unrelated repository issue. Only the first may be ignored at the current fixer
 boundary without further action. A novel deferred finding prevents workflow
 completion until reconciliation.
 
+Runtime-owned fixer worktrees now carry retention manifests outside the Git
+worktree. Worktrees stay locked while active or unresolved. Fully integrated
+worktrees become eligible for cleanup after 30 days by default, but a later
+review removes one only when its marker identity, repository ownership, exact
+HEAD, merged ancestry, clean status, unlocked state, and inactive process check
+all still pass. Legacy and unmarked worktrees are never swept automatically.
+
 ## Remaining limitations
 
 - The extension-to-extension delegation bridge is currently an interactive Pi
@@ -99,8 +106,6 @@ completion until reconciliation.
 - Rejected-round reviewer evidence is not its own workflow node, so an
   interruption may repeat a reviewer call. Git effects are still observed and
   adopted idempotently.
-- Fixer worktrees are preserved for evidence; automated retention cleanup is
-  not yet implemented.
 - Integration conflicts stop for owner intervention rather than invoking an
   automatic conflict resolver.
 

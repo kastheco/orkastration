@@ -51,7 +51,8 @@ The direct `/kas:check` equivalent is:
   "objective": "preserve the parser contract",
   "repository": "/absolute/path/to/repository",
   "reviewRevision": "<40-character commit SHA>",
-  "maxParallelFixers": 3
+  "maxParallelFixers": 3,
+  "worktreeRetentionDays": 30
 }
 ```
 
@@ -72,6 +73,13 @@ The workflow executes this graph:
 Evidence location is not write authority. Shared tests may support multiple
 findings without forcing their source fixes into one group.
 
+Fixer worktrees are locked while a run owns them. A completed, fully integrated
+fix is unlocked and scheduled for cleanup after 30 days by default. Future
+reviews remove only runtime-marked worktrees whose exact commit remains merged,
+whose worktree is clean and unchanged, and which have no active process using
+them. Unresolved, dirty, active, unmarked, and cross-repository worktrees remain
+preserved. `worktreeRetentionDays` may be set from 1 to 365 days.
+
 A finding observed during scoped re-review follows one of four routes:
 
 - known sibling finding: handled by its existing fixer group;
@@ -85,7 +93,7 @@ A live fixture produced two disjoint fixer groups in one parallel wave, re-revie
 each exact commit, and integrated both serially at `a543512`. The first real `/kas`
 dogfood run then found and repaired three policy-boundary defects in `4e6f478`:
 finding identity after sorting, deferred evidence across rejected rounds, and scope
-enforcement across renames. The current suite passes 21 tests plus TypeScript
+enforcement across renames. The current suite passes 26 tests plus TypeScript
 checking.
 
 Durable architecture context lives in the
@@ -101,6 +109,7 @@ extensions/orkastrator-workflows/index.ts
 extensions/orkastrator-workflows/delegation-bridge.ts
 extensions/orkastrator-workflows/review-runtime.ts
 extensions/orkastrator-workflows/review-wave.ts
+extensions/orkastrator-workflows/worktree-retention.ts
 ```
 
 The extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, and the

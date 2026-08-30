@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -31,6 +32,7 @@ import {
   parseReReviewVerdict,
   parseReviewWorkflowInput,
   runFixWaves,
+  sweepExpiredFixerWorktrees,
   type ReviewWorkflowInput,
 } from "../review-runtime.ts";
 
@@ -62,6 +64,7 @@ test("workflow definition is valid and rejects ambiguous input", () => {
     repository: "/tmp/repository",
     reviewRevision: "a".repeat(40),
     maxParallelFixers: 3,
+    worktreeRetentionDays: 30,
   });
   assert.throws(
     () => parseReviewWorkflowInput({
@@ -79,6 +82,15 @@ test("workflow definition is valid and rejects ambiguous input", () => {
       maxParallelFixers: 4,
     }),
     /integer from 1 to 3/u,
+  );
+  assert.throws(
+    () => parseReviewWorkflowInput({
+      objective: "fix it",
+      repository: "/tmp/repository",
+      reviewRevision: "a".repeat(40),
+      worktreeRetentionDays: 0,
+    }),
+    /integer from 1 to 365/u,
   );
 });
 
@@ -299,6 +311,7 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
     repository,
     reviewRevision,
     maxParallelFixers: 2,
+    worktreeRetentionDays: 30,
     stateRoot: join(root, "state"),
   };
   const result = await runFixWaves(actionContext(input, "workflow-run-1"), plan);
@@ -321,6 +334,39 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
   assert.match(repeated.unresolved[0]!.reason, /final reconciliation/);
   assert.equal(await git(repository, ["rev-parse", "HEAD"]), integratedHead);
   assert.equal(fixerRequests, 2, "a resumed action adopts existing exact fixer commits");
+  assert.deepEqual(repeated.retentionWarnings, []);
+
+  const repositoryDigest = createHash("sha256").update(repository).digest("hex").slice(0, 12);
+  const markerDirectory = join(
+    input.stateRoot!,
+    `repo-${repositoryDigest}`,
+    "workflow-run-1",
+    ".retention",
+  );
+  const markerFiles = await readdir(markerDirectory);
+  assert.equal(markerFiles.length, 2);
+  let integratedWorktree: string | undefined;
+  for (const markerFile of markerFiles) {
+    const markerPath = join(markerDirectory, markerFile);
+    const record = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+    if (record.status === "integrated") {
+      integratedWorktree = record.worktree as string;
+      record.deleteAfter = new Date(0).toISOString();
+      await writeFile(markerPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    }
+  }
+  assert.ok(integratedWorktree);
+  await writeFile(join(integratedWorktree, "untracked-evidence.txt"), "preserve me\n", "utf8");
+  const dirtySweep = await sweepExpiredFixerWorktrees(input, new AbortController().signal);
+  assert.equal(dirtySweep.removed.length, 0);
+  assert.equal(dirtySweep.preserved.length, 2);
+  await rm(join(integratedWorktree, "untracked-evidence.txt"));
+
+  const sweep = await sweepExpiredFixerWorktrees(input, new AbortController().signal);
+  assert.equal(sweep.removed.length, 1);
+  assert.equal(sweep.preserved.length, 1);
+  await assert.rejects(access(sweep.removed[0]!), /ENOENT/u);
+  await access(repeated.unresolved[0]!.worktree);
   uninstall();
 });
 
@@ -414,6 +460,7 @@ test("a novel deferred finding from a rejected round blocks later acceptance", a
     repository,
     reviewRevision,
     maxParallelFixers: 1,
+    worktreeRetentionDays: 30,
     stateRoot: join(root, "state"),
   }, "deferred-run"), plan);
 
@@ -477,6 +524,7 @@ test("scope enforcement includes paths removed by a rename", async () => {
       repository,
       reviewRevision,
       maxParallelFixers: 1,
+      worktreeRetentionDays: 30,
       stateRoot: join(root, "state"),
     }, "scope-run"), plan),
     /outside declared scope: out-of-scope\.txt/u,

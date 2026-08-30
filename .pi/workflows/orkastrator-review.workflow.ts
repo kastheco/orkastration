@@ -17,7 +17,7 @@ import {
   type ReviewWorkflowInput,
 } from "../../extensions/orkastrator-workflows/review-runtime.ts";
 
-const IMPLEMENTATION_REVISION = 6;
+const IMPLEMENTATION_REVISION = 7;
 
 const ownerChoices = defineHumanChoices({
   accept_partial: choice({ label: "Accept integrated fixes" }),
