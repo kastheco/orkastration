@@ -21,9 +21,11 @@ import cookWorkflow from "../../../.pi/workflows/orkastrator-cook.workflow.ts";
 import implementWorkflow from "../../../.pi/workflows/orkastrator-implement.workflow.ts";
 import reviewWorkflow from "../../../.pi/workflows/orkastrator-review.workflow.ts";
 import {
+  createImplementationWorktree,
   parseLifecycleInput,
   parseOwnerResolvedStatus,
   resolveReviewTarget,
+  type WorktrunkRunner,
 } from "../lifecycle-runtime.ts";
 import { planReviewWaves } from "../review-wave.ts";
 import {
@@ -116,6 +118,26 @@ test("workflow definitions are valid and reject ambiguous input", () => {
   );
 });
 
+test("implementation workflows create Worktrunk isolation at the required stage", () => {
+  assert.equal(implementWorkflow.startAt, "createWorktree");
+  assert.deepEqual(implementWorkflow.edges.slice(0, 2), [
+    { from: "createWorktree", to: "plan" },
+    { from: "plan", to: "classifyPlan" },
+  ]);
+  assert.equal(
+    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "planning.ready" && edge.to === "createWorktree"),
+    true,
+  );
+  assert.equal(
+    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "createWorktree" && edge.to === "implementation"),
+    true,
+  );
+  assert.equal(
+    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "planning.ready" && edge.to === "implementation"),
+    false,
+  );
+});
+
 test("owner-resolved lifecycle status preserves partial acceptance and stop", () => {
   assert.equal(
     parseOwnerResolvedStatus({ status: "owner_accepted_partial" }),
@@ -126,6 +148,55 @@ test("owner-resolved lifecycle status preserves partial acceptance and stop", ()
     () => parseOwnerResolvedStatus({ status: "completed" }),
     /must be owner_accepted_partial or stopped/u,
   );
+});
+
+test("Worktrunk creates and recovers one deterministic implementation worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-worktrunk-"));
+  const repository = join(root, "repo");
+  const worktree = join(root, "implementation");
+  await git(root, ["init", "--initial-branch=main", repository]);
+  await git(repository, ["config", "user.name", "Orkastrator Test"]);
+  await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+  await writeFile(join(repository, "base.txt"), "base\n", "utf8");
+  await git(repository, ["add", "base.txt"]);
+  await git(repository, ["commit", "-m", "base"]);
+
+  const calls: string[][] = [];
+  const runner: WorktrunkRunner = async (source, args) => {
+    calls.push(args);
+    const branch = args.includes("--create")
+      ? args[args.indexOf("--create") + 1]!
+      : args[1]!;
+    if (args.includes("--create")) {
+      if (calls.length > 1) throw new Error("branch already exists");
+      await git(source, ["worktree", "add", "-b", branch, worktree, "HEAD"]);
+    }
+    return JSON.stringify({ action: "created", branch, path: worktree });
+  };
+
+  const first = await createImplementationWorktree(
+    repository,
+    "workflow-run",
+    new AbortController().signal,
+    runner,
+  );
+  const repeated = await createImplementationWorktree(
+    repository,
+    "workflow-run",
+    new AbortController().signal,
+    runner,
+  );
+
+  assert.equal(first.repository, worktree);
+  assert.deepEqual(repeated, first);
+  assert.match(first.branch, /^orkastrator\/[0-9a-f]{16}\/worker$/u);
+  assert.equal(calls[0]?.includes("--base"), true);
+  assert.equal(calls[0]?.includes("@"), true);
+  assert.equal(calls[0]?.includes("--no-hooks"), true);
+  assert.equal(calls[0]?.includes("--no-cd"), true);
+  assert.equal(calls[1]?.includes("--create"), true);
+  assert.equal(calls[2]?.includes("--create"), false);
+  assert.equal(await git(worktree, ["rev-parse", "HEAD"]), first.baseRevision);
 });
 
 test("review target requires one reported clean implementation repository", async () => {

@@ -43,12 +43,14 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 /kas:check <review objective>
 ```
 
-- `/kas` starts `orkastrator-implement.workflow.ts`. one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result.
-- `/kas:cook` starts `orkastrator-cook.workflow.ts`. it combines pi workflows planning, canonical documentation, required operator approval, implementation, verification, delivery, and the full orkastrator review policy in one run.
+- `/kas` starts `orkastrator-implement.workflow.ts`. it immediately creates an isolated Worktrunk branch and worktree, then one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result there.
+- `/kas:cook` starts `orkastrator-cook.workflow.ts`. planning, canonical documentation, and required operator approval stay on the invoking checkout. once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree for implementation, verification, delivery, and the full orkastrator review policy.
 - `/kas:check` starts `orkastrator-review.workflow.ts` against the repository's committed `HEAD`. it won't guess when the worktree is dirty.
 - `/kas-runs` reports the active or most recent workflow visible to the current pi session. it doesn't perform a name-filtered orkastrator run lookup.
 
 each command addresses its packaged workflow by exact installed file path. the command turn only resolves the repository and launches the workflow. planning, implementation, grilling, and review stay inside the graph.
+
+implementation worktrees use deterministic per-run branches based on the invoking `HEAD`. Worktrunk runs non-interactively with hooks disabled, and the workflow verifies the returned root, branch, base revision, and clean state before passing it to autoimplementation. creation or identity failures block the run instead of falling back to the invoking checkout.
 
 the direct equivalent of `/kas:check` is:
 
@@ -92,7 +94,7 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-a later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. the current suite passes 39 tests plus typescript checking.
+a later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. the current suite passes 41 tests plus typescript checking.
 
 the composed `/kas` and `/kas:cook` workflows have static definition coverage, package-inclusion tests, and passing typescript checks. they don't yet have a live end-to-end dogfood run.
 
