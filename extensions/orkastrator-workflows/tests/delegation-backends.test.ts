@@ -224,7 +224,21 @@ test("Herdr fails clearly without captured context and uninstall invalidates del
   });
   await assert.rejects(delegateSubagent(spec, new AbortController().signal), /before Pi session context is available/u);
   uninstall();
-  await assert.rejects(delegateSubagent(spec, new AbortController().signal), /bridge is not installed/u);
+  let usedHostedRunner = false;
+  const response = await delegateSubagent(spec, new AbortController().signal, async (request) => {
+    usedHostedRunner = true;
+    return {
+      requestId: "hosted",
+      ownerRunId: request.ownerRunId,
+      nodeId: request.nodeId,
+      status: "completed",
+      agent: request.agent,
+      exitCode: 0,
+      result: { kind: "text", text: "done" },
+    };
+  });
+  assert.equal(usedHostedRunner, true);
+  assert.equal(response.status, "completed");
 });
 
 test("delegation bridge contains no Herdr TypeScript runtime import", () => {

@@ -4,6 +4,7 @@ import {
   defineWorkflow,
   includeWorkflow,
   includedResult,
+  type WorkflowNodeContext,
 } from "@osolmaz/pi-workflows";
 import {
   autoimplementWorkflow,
@@ -12,6 +13,7 @@ import {
 } from "@osolmaz/pi-workflows/builtins";
 
 import {
+  createImplementationWorktree,
   parseLifecycleInput,
   parseOwnerResolvedStatus,
   resolveReviewTarget,
@@ -52,7 +54,7 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
         return {
           task: request.task,
           plan: planning.output.plan,
-          repository: request.repository,
+          repository: (outputs.createWorktree as { repository: string }).repository,
           documents: planning.output.documents,
           documentation: {
             status: "current",
@@ -82,9 +84,36 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
   },
   nodes: {
     start: compute({ run: () => ({ route: "plan" }) }),
+    createWorktree: action({
+      statusDetail: "creating the isolated implementation worktree",
+      timeoutMs: 30_000,
+      effect: {
+        type: "orkastrator.create-implementation-worktree",
+        idempotencyKey: (context) => `${context.state.runId}:create-implementation-worktree`,
+        request: (context: WorkflowNodeContext) => ({
+          repository: (context.input as OrkastratorLifecycleInput).repository,
+          runId: context.state.runId,
+        }),
+        recovery: "idempotent",
+      },
+      run: async (context) => await createImplementationWorktree(
+        (context.input as OrkastratorLifecycleInput).repository,
+        context.state.runId,
+        context.signal,
+      ),
+    }),
     prepareReview: action({
       statusDetail: "freezing the committed review target",
       timeoutMs: 30_000,
+      effect: {
+        type: "orkastrator.prepare-review",
+        idempotencyKey: (context) => `${context.state.runId}:prepare-review`,
+        request: (context: WorkflowNodeContext) => ({
+          implementation: context.outputs.implementation,
+        }),
+        // Resolving the committed review target only reads git state.
+        recovery: "idempotent",
+      },
       run: async (context) => {
         const result = includedResult(autoimplementWorkflow, context.outputs.implementation);
         if (result.exit !== "completed") {
@@ -126,7 +155,8 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
   },
   edges: [
     { from: "start", to: "planning" },
-    { from: "planning.ready", to: "implementation" },
+    { from: "planning.ready", to: "createWorktree" },
+    { from: "createWorktree", to: "implementation" },
     { from: "planning.blocked", to: "blocked" },
     { from: "implementation.completed", to: "prepareReview" },
     { from: "implementation.blocked", to: "blocked" },

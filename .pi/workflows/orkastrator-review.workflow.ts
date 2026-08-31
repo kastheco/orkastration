@@ -6,6 +6,7 @@ import {
   defineWorkflow,
   humanDecision,
   humanDecisionEdge,
+  type WorkflowNodeContext,
 } from "@osolmaz/pi-workflows";
 
 import type { FrozenReviewPlan } from "../../extensions/orkastrator-workflows/review-wave.ts";
@@ -50,6 +51,26 @@ export default defineWorkflow<ReviewWorkflowInput>({
     initialReview: action({
       statusDetail: "running immutable initial review",
       timeoutMs: 35 * 60_000,
+      effect: {
+        type: "orkastrator.initial-review",
+        // The review target is an immutable commit, so the same run reviewing
+        // the same revision is the same effect.
+        idempotencyKey: (context) => {
+          const input = context.input as ReviewWorkflowInput;
+          return `${context.state.runId}:initial-review:${input.reviewRevision}`;
+        },
+        request: (context: WorkflowNodeContext) => {
+          const input = context.input as ReviewWorkflowInput;
+          return {
+            repository: input.repository,
+            reviewRevision: input.reviewRevision,
+            objective: input.objective,
+          };
+        },
+        // Reviewing only reads the repository and spawns a reviewer child, so an
+        // uncertain exit is safe to retry.
+        recovery: "idempotent",
+      },
       run: async (context) => await runInitialReview(
         context as Parameters<typeof runInitialReview>[0],
       ),
@@ -70,6 +91,30 @@ export default defineWorkflow<ReviewWorkflowInput>({
     fixWaves: action({
       statusDetail: "running bounded fixer and re-review waves",
       timeoutMs: 4 * 60 * 60_000,
+      effect: {
+        type: "orkastrator.fix-waves",
+        // Frozen finding IDs identify the exact repair attempt, so a resumed run
+        // cannot be confused with a different plan over the same revision.
+        idempotencyKey: (context) => {
+          const input = context.input as ReviewWorkflowInput;
+          const plan = context.outputs.initialReview as FrozenReviewPlan;
+          const groups = plan.fixerGroups.map((group) => group.groupId).join(",");
+          return `${context.state.runId}:fix-waves:${input.reviewRevision}:${groups}`;
+        },
+        request: (context: WorkflowNodeContext) => {
+          const input = context.input as ReviewWorkflowInput;
+          const plan = context.outputs.initialReview as FrozenReviewPlan;
+          return {
+            repository: input.repository,
+            reviewRevision: input.reviewRevision,
+            fixerGroups: plan.fixerGroups.map((group) => group.groupId),
+          };
+        },
+        // Fix waves create worktrees, commit fixer output, and integrate onto the
+        // reviewed branch. Replaying an uncertain exit could duplicate or
+        // half-apply that integration, so recovery stays manual.
+        recovery: "manual",
+      },
       run: async (context) => await runFixWaves(
         context as Parameters<typeof runFixWaves>[0],
         context.outputs.initialReview as FrozenReviewPlan,

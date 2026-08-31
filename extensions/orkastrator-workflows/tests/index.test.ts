@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -115,8 +115,12 @@ test("empty implementation requests stop before workflow launch", async () => {
   assert.equal(messages.every((item) => !/action=start/.test(item.message)), true);
 });
 
-test("the published package includes every command-addressed workflow", () => {
+test("the published package includes every command-addressed workflow and runtime loader", () => {
   const packageRoot = fileURLToPath(new URL("../../../", import.meta.url));
+  const manifest = JSON.parse(readFileSync(`${packageRoot}/package.json`, "utf8")) as {
+    dependencies?: Record<string, string>;
+  };
+  assert.match(manifest.dependencies?.tsx ?? "", /^\^?4\./u);
   const pack = JSON.parse(
     execFileSync("npm", ["pack", "--dry-run", "--json"], {
       cwd: packageRoot,
@@ -170,7 +174,8 @@ test("a stale async session_start cannot install after shutdown", async () => {
   lifecycle.get("session_shutdown")?.({});
   await starting;
 
-  await assert.rejects(delegateSubagent({
+  let hostedFallback = false;
+  const response = await delegateSubagent({
     ownerRunId: "run",
     nodeId: "node",
     agent: "worker",
@@ -178,7 +183,20 @@ test("a stale async session_start cannot install after shutdown", async () => {
     context: "fresh",
     cwd: "/tmp",
     result: { kind: "text" },
-  }, new AbortController().signal), /bridge is not installed/u);
+  }, new AbortController().signal, async (spec) => {
+    hostedFallback = true;
+    return {
+      requestId: "hosted",
+      ownerRunId: spec.ownerRunId,
+      nodeId: spec.nodeId,
+      status: "completed",
+      agent: spec.agent,
+      exitCode: 0,
+      result: { kind: "text", text: "done" },
+    };
+  });
+  assert.equal(hostedFallback, true);
+  assert.equal(response.status, "completed");
   assert.equal(events.listenerCount("prompt-template:subagent:response"), 0);
 });
 

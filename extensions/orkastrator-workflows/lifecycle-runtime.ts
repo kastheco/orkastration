@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
@@ -15,10 +16,22 @@ export type OrkastratorLifecycleInput = {
   worktreeRetentionDays: number;
 };
 
+export type ImplementationWorktree = {
+  repository: string;
+  branch: string;
+  baseRevision: string;
+};
+
 export type ReviewTarget = {
   repository: string;
   reviewRevision: string;
 };
+
+export type WorktrunkRunner = (
+  repository: string,
+  args: string[],
+  signal: AbortSignal,
+) => Promise<string>;
 
 export type OwnerResolvedStatus = "owner_accepted_partial" | "stopped";
 
@@ -115,6 +128,87 @@ async function git(repository: string, args: string[], signal: AbortSignal): Pro
     signal,
   });
   return result.stdout.trim();
+}
+
+const runWorktrunk: WorktrunkRunner = async (repository, args, signal) => {
+  const result = await execFileAsync("wt", ["-C", repository, ...args], {
+    encoding: "utf8",
+    signal,
+  });
+  return result.stdout.trim();
+};
+
+function parseWorktrunkPath(stdout: string, branch: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch {
+    throw new Error("Worktrunk create output must be JSON");
+  }
+  const output = requireRecord(value, "Worktrunk create output");
+  if (output.branch !== branch) {
+    throw new Error("Worktrunk create output returned an unexpected branch");
+  }
+  if (typeof output.path !== "string" || !isAbsolute(output.path)) {
+    throw new Error("Worktrunk create output must include an absolute path");
+  }
+  return output.path;
+}
+
+export async function createImplementationWorktree(
+  repository: string,
+  runId: string,
+  signal: AbortSignal,
+  runner: WorktrunkRunner = runWorktrunk,
+): Promise<ImplementationWorktree> {
+  const source = await realpath(repository);
+  const topLevel = await realpath(await git(source, ["rev-parse", "--show-toplevel"], signal));
+  if (topLevel !== source) {
+    throw new Error("Worktrunk source repository must name the worktree root");
+  }
+  if ((await git(source, ["status", "--porcelain"], signal)).length !== 0) {
+    throw new Error("Worktrunk source repository must be clean");
+  }
+  const baseRevision = await git(source, ["rev-parse", "HEAD"], signal);
+  if (!SHA.test(baseRevision)) {
+    throw new Error("Worktrunk source HEAD is not a full Git revision");
+  }
+
+  const runDigest = createHash("sha256").update(runId).digest("hex").slice(0, 16);
+  const branch = `orkastrator/${runDigest}/worker`;
+  let stdout: string;
+  try {
+    stdout = await runner(
+      source,
+      ["switch", "--create", branch, "--base", "@", "--no-hooks", "--no-cd", "--format=json"],
+      signal,
+    );
+  } catch (error) {
+    const exists = await git(source, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], signal)
+      .then(() => true, () => false);
+    if (!exists) throw error;
+    stdout = await runner(
+      source,
+      ["switch", branch, "--no-hooks", "--no-cd", "--format=json"],
+      signal,
+    );
+  }
+
+  const worktree = await realpath(parseWorktrunkPath(stdout, branch));
+  const worktreeRoot = await realpath(await git(worktree, ["rev-parse", "--show-toplevel"], signal));
+  if (worktreeRoot !== worktree) {
+    throw new Error("Worktrunk result must name the worktree root");
+  }
+  if ((await git(worktree, ["branch", "--show-current"], signal)) !== branch) {
+    throw new Error("Worktrunk result is on an unexpected branch");
+  }
+  if ((await git(worktree, ["rev-parse", "HEAD"], signal)) !== baseRevision) {
+    throw new Error("Worktrunk result does not start at the invoking HEAD");
+  }
+  if ((await git(worktree, ["status", "--porcelain"], signal)).length !== 0) {
+    throw new Error("Worktrunk result must be clean");
+  }
+  return { repository: worktree, branch, baseRevision };
 }
 
 export async function resolveReviewTarget(

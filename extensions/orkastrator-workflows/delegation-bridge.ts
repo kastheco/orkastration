@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
+  ModelRuntime,
+  resolveCliModel,
+  SessionManager,
+  SettingsManager,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type {
   SubagentDelegationRequest,
   SubagentDelegationResponse,
@@ -297,13 +306,141 @@ async function delegateWithHerdr(
   return response;
 }
 
-/** Run one configured delegation leaf through the detected backend. */
-export async function delegateSubagent(
+function assistantText(messages: unknown[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message === null || typeof message !== "object" || Array.isArray(message)) continue;
+    const record = message as Record<string, unknown>;
+    if (record.role !== "assistant" || !Array.isArray(record.content)) continue;
+    const text = record.content.flatMap((part) => {
+      if (part === null || typeof part !== "object" || Array.isArray(part)) return [];
+      const value = part as Record<string, unknown>;
+      return value.type === "text" && typeof value.text === "string" ? [value.text] : [];
+    }).join("").trim();
+    if (text.length > 0) return text;
+  }
+  return undefined;
+}
+
+class StructuredOutputError extends Error {}
+
+function parseStructuredText(text: string): unknown {
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(trimmed)?.[1] ?? trimmed;
+  try {
+    return JSON.parse(fenced);
+  } catch {
+    throw new StructuredOutputError("Pi child returned invalid structured JSON");
+  }
+}
+
+async function delegateWithPiSdk(
   spec: DelegationSpec,
   signal: AbortSignal,
 ): Promise<SubagentDelegationTerminalResponse> {
+  const startedAt = Date.now();
+  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(spec.cwd, agentDir);
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: spec.cwd,
+    agentDir,
+    settingsManager,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  });
+  await resourceLoader.reload();
+  const modelRuntime = await ModelRuntime.create({ signal });
+  const resolvedModel = spec.model === undefined
+    ? undefined
+    : resolveCliModel({ cliModel: spec.model, modelRuntime });
+  if (resolvedModel?.error) throw new Error(resolvedModel.error);
+  const model = resolvedModel?.model;
+  const { session } = await createAgentSession({
+    cwd: spec.cwd,
+    agentDir,
+    resourceLoader,
+    settingsManager,
+    sessionManager: SessionManager.inMemory(spec.cwd),
+    modelRuntime,
+    ...(model === undefined ? {} : { model }),
+    ...(spec.thinking === undefined ? {} : { thinkingLevel: spec.thinking }),
+    tools: spec.agent === "reviewer"
+      ? ["read", "grep", "find", "ls"]
+      : ["read", "bash", "edit", "write", "grep", "find", "ls"],
+  });
+  const abort = () => void session.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal.aborted) throw aborted();
+    await session.prompt(spec.task);
+    if (signal.aborted) throw aborted();
+    const error = session.agent.state.errorMessage;
+    if (typeof error === "string" && error.length > 0) throw new Error(error);
+    const text = assistantText(session.messages);
+    if (text === undefined) throw new Error("Pi child returned no final assistant text");
+    const response: SubagentDelegationTerminalResponse = {
+      requestId: randomUUID(),
+      ownerRunId: spec.ownerRunId,
+      nodeId: spec.nodeId,
+      status: "completed",
+      agent: spec.agent,
+      exitCode: 0,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+        toolCalls: 0,
+        durationMs: Date.now() - startedAt,
+      },
+      result: spec.result.kind === "structured"
+        ? { kind: "structured", value: parseStructuredText(text) }
+        : { kind: "text", text },
+    };
+    return response;
+  } catch (error) {
+    if (signal.aborted) throw aborted();
+    return {
+      requestId: randomUUID(),
+      ownerRunId: spec.ownerRunId,
+      nodeId: spec.nodeId,
+      status: error instanceof StructuredOutputError ? "structured_output_failed" : "failed",
+      agent: spec.agent,
+      exitCode: 1,
+      error: error instanceof Error ? error.message : String(error),
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        turns: 0,
+        toolCalls: 0,
+        durationMs: Date.now() - startedAt,
+      },
+    };
+  } finally {
+    signal.removeEventListener("abort", abort);
+    await session.dispose();
+  }
+}
+
+/** Run one configured delegation leaf through the interactive bridge or a hosted-worker-safe Pi SDK child. */
+export async function delegateSubagent(
+  spec: DelegationSpec,
+  signal: AbortSignal,
+  hostedRunner: (
+    spec: DelegationSpec,
+    signal: AbortSignal,
+  ) => Promise<SubagentDelegationTerminalResponse> = delegateWithPiSdk,
+): Promise<SubagentDelegationTerminalResponse> {
   const bridge = (globalThis as BridgeGlobal)[BRIDGE];
-  if (bridge === undefined) throw new Error("Orkastrator workflow bridge is not installed");
+  if (bridge === undefined) return await hostedRunner(spec, signal);
   return bridge.backend === "pi-herdr-subagents"
     ? delegateWithHerdr(bridge, spec, signal)
     : delegateWithEvents(bridge, spec, signal);

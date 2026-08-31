@@ -2,14 +2,14 @@
 
 ## Decision
 
-Orkastrator is a policy layer on top of `@osolmaz/pi-workflows` and
-`pi-subagents`. The migration is complete; this is no longer an exploratory
-architecture.
+Orkastrator is a policy layer on top of `@osolmaz/pi-workflows` and exactly
+one supported delegation backend: `pi-subagents` or `pi-herdr-subagents`. The
+migration is complete; this is no longer an exploratory architecture.
 
 Pi Workflows owns durable graph execution, checkpoints, recovery, human
-choices, source identity, and result delivery. `pi-subagents` owns bounded
-reviewer and fixer sessions. Orkastrator owns only the review-and-repair rules
-that are specific to this project.
+choices, source identity, and result delivery. The selected subagent backend
+owns bounded reviewer and fixer sessions. Orkastrator owns only the
+review-and-repair rules that are specific to this project.
 
 ## Command surface
 
@@ -67,10 +67,10 @@ identity after sorting, deferred evidence across a rejected round, and rename
 scope enforcement. The cleanup commit `11d33cd` removed the last unused reducer
 seam.
 
-The current 28-test suite additionally covers strict schemas, path escape
+The current 41-test suite additionally covers strict schemas, path escape
 rejection, parallel caps, transitive clumping, exact commit identity, idempotent
 effect adoption, owner escalation, cancellation, novel deferred-finding
-reconciliation, and paths removed by renames.
+reconciliation, paths removed by renames, and dual-backend capability routing.
 
 ## Retained policy
 
@@ -99,6 +99,15 @@ worktrees become eligible for cleanup after 30 days by default, but a later
 review removes one only when its marker identity, repository ownership, exact
 HEAD, merged ancestry, clean status, unlocked state, and inactive process check
 all still pass. Legacy and unmarked worktrees are never swept automatically.
+
+## Delegation backends
+
+Install exactly one backend. `pi-subagents` uses correlated request, response,
+and cancellation events. The Herdr path uses the forked
+`pi-herdr-subagents` delegation API v1 and is pinned to commit
+`242437a7d2c6fbf76c8d9c23dce7b21f840d9d5d` until that API has an upstream
+release. Orkastrator detects backend capabilities without launching a child and
+fails closed when both or neither backend is available.
 
 ## Remaining limitations
 

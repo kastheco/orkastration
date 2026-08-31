@@ -33,7 +33,38 @@ to use herdr instead, replace the `pi-subagents` line with the forked runner whi
 pi install git:github.com/brkastner/pi-herdr-subagents@242437a7d2c6fbf76c8d9c23dce7b21f840d9d5d
 ```
 
-orkastrator detects the backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation.
+orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation. hosted workflow workers can't share that process-local bridge, so they launch isolated in-memory Pi SDK children instead. reviewer children receive only read-only tools; fixer children receive repository editing tools inside their assigned worktree. hosted children load no extensions, skills, prompt templates, themes, context files, or persistent session history.
+
+## configuration
+
+orkastrator has built-in routing defaults. they apply when no user config exists and remain in place for every field a partial config doesn't override:
+
+| stage | model | thinking |
+|---|---|---|
+| initial review | `anthropic/claude-opus-5` | `medium` |
+| fixer | `openai-codex/gpt-5.6-terra` | `medium` |
+| re-review | `anthropic/claude-sonnet-5` | `medium` |
+
+user configuration lives at `$XDG_CONFIG_HOME/orkastrator/config.json`, or `~/.config/orkastrator/config.json` when `XDG_CONFIG_HOME` isn't set. `ORKASTRATOR_CONFIG` can point to a different file. every field is optional:
+
+```json
+{
+  "review": {
+    "initial": {
+      "model": "anthropic/claude-opus-5",
+      "thinking": "high"
+    },
+    "fixer": {
+      "model": "openai-codex/gpt-5.6-terra"
+    },
+    "reReview": {
+      "model": "anthropic/claude-sonnet-5"
+    }
+  }
+}
+```
+
+supported thinking levels are `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. invalid JSON, unknown fields, empty model names, and unsupported thinking levels stop the workflow rather than silently falling back to the active parent model.
 
 run pi from a trusted git repository, then choose how much ceremony you want:
 
@@ -43,12 +74,14 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 /kas:check <review objective>
 ```
 
-- `/kas` starts `orkastrator-implement.workflow.ts`. one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result.
-- `/kas:cook` starts `orkastrator-cook.workflow.ts`. it combines pi workflows planning, canonical documentation, required operator approval, implementation, verification, delivery, and the full orkastrator review policy in one run.
+- `/kas` starts `orkastrator-implement.workflow.ts`. it immediately creates an isolated Worktrunk branch and worktree, then one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result there.
+- `/kas:cook` starts `orkastrator-cook.workflow.ts`. planning, canonical documentation, and required operator approval stay on the invoking checkout. once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree for implementation, verification, delivery, and the full orkastrator review policy.
 - `/kas:check` starts `orkastrator-review.workflow.ts` against the repository's committed `HEAD`. it won't guess when the worktree is dirty.
 - `/kas-runs` reports the active or most recent workflow visible to the current pi session. it doesn't perform a name-filtered orkastrator run lookup.
 
 each command addresses its packaged workflow by exact installed file path. the command turn only resolves the repository and launches the workflow. planning, implementation, grilling, and review stay inside the graph.
+
+implementation worktrees use deterministic per-run branches based on the invoking `HEAD`. Worktrunk runs non-interactively with hooks disabled, and the workflow verifies the returned root, branch, base revision, and clean state before passing it to autoimplementation. creation or identity failures block the run instead of falling back to the invoking checkout.
 
 the direct equivalent of `/kas:check` is:
 
@@ -92,7 +125,7 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-a later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. the current suite passes 39 tests plus typescript checking.
+a later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. the current suite passes 41 tests plus typescript checking.
 
 the composed `/kas` and `/kas:cook` workflows have static definition coverage, package-inclusion tests, and passing typescript checks. they don't yet have a live end-to-end dogfood run.
 
@@ -114,7 +147,7 @@ extensions/orkastrator-workflows/review-wave.ts
 extensions/orkastrator-workflows/worktree-retention.ts
 ```
 
-the extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, and the bridge between pi workflows and the selected `pi-subagents` or `pi-herdr-subagents` backend. the three workflow definitions own their complete command lifecycles.
+the extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, and the in-process bridge to the selected `pi-subagents` or `pi-herdr-subagents` backend. hosted workflow workers use the isolated Pi SDK child path. the three workflow definitions own their complete command lifecycles.
 
 ## development
 

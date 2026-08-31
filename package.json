@@ -48,6 +48,21 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@osolmaz/pi-workflows": "^0.14.0"
-  }
+    "@osolmaz/pi-workflows": "^0.15.0",
+    "tsx": "^4.23.13"
+  },
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kastheco/orkastrator.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kastheco/orkastrator/issues"
+  },
+  "homepage": "https://github.com/kastheco/orkastrator#readme"
 }
