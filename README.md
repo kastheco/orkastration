@@ -1,4 +1,15 @@
-# orkastrator
+<table>
+  <tr>
+    <td width="260" align="center">
+      <img src="docs/assets/orkastrator.png" alt="ukiyo-e puppet master controlling puppets on strings" width="220">
+    </td>
+    <td>
+      <h1>orkastrator</h1>
+      <p><strong>plan, implement, review, and repair with bounded agents.</strong></p>
+      <p><a href="https://github.com/kastheco/orkastrator/actions/workflows/pr-checks.yml"><img src="https://github.com/kastheco/orkastrator/actions/workflows/pr-checks.yml/badge.svg" alt="ci"></a></p>
+    </td>
+  </tr>
+</table>
 
 orkastrator is an opinionated software delivery policy and workflow suite for pi. it covers planning, implementation, review, and bounded repair. it doesn't own the workflow engine, process manager, ledger, or recovery system underneath those flows.
 
