@@ -33,7 +33,38 @@ to use herdr instead, replace the `pi-subagents` line with the forked runner whi
 pi install git:github.com/brkastner/pi-herdr-subagents@242437a7d2c6fbf76c8d9c23dce7b21f840d9d5d
 ```
 
-orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation. hosted workflow workers can't share that process-local bridge, so they launch isolated in-memory Pi SDK children instead. reviewer children receive only read-only tools; fixer children receive repository editing tools inside their assigned worktree. hosted children load no extensions, skills, prompt templates, themes, context files, or persistent session history. they use the configured Pi model instead of hard-coded provider dispatches.
+orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation. hosted workflow workers can't share that process-local bridge, so they launch isolated in-memory Pi SDK children instead. reviewer children receive only read-only tools; fixer children receive repository editing tools inside their assigned worktree. hosted children load no extensions, skills, prompt templates, themes, context files, or persistent session history.
+
+## configuration
+
+orkastrator has built-in routing defaults. they apply when no user config exists and remain in place for every field a partial config doesn't override:
+
+| stage | model | thinking |
+|---|---|---|
+| initial review | `anthropic/claude-opus-5` | `medium` |
+| fixer | `openai-codex/gpt-5.6-terra` | `medium` |
+| re-review | `anthropic/claude-sonnet-5` | `medium` |
+
+user configuration lives at `$XDG_CONFIG_HOME/orkastrator/config.json`, or `~/.config/orkastrator/config.json` when `XDG_CONFIG_HOME` isn't set. `ORKASTRATOR_CONFIG` can point to a different file. every field is optional:
+
+```json
+{
+  "review": {
+    "initial": {
+      "model": "anthropic/claude-opus-5",
+      "thinking": "high"
+    },
+    "fixer": {
+      "model": "openai-codex/gpt-5.6-terra"
+    },
+    "reReview": {
+      "model": "anthropic/claude-sonnet-5"
+    }
+  }
+}
+```
+
+supported thinking levels are `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. invalid JSON, unknown fields, empty model names, and unsupported thinking levels stop the workflow rather than silently falling back to the active parent model.
 
 run pi from a trusted git repository, then choose how much ceremony you want:
 
