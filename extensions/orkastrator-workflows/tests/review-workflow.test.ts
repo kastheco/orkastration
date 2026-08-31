@@ -17,7 +17,14 @@ import type {
   SubagentDelegationValue,
 } from "pi-subagents/delegation";
 
+import cookWorkflow from "../../../.pi/workflows/orkastrator-cook.workflow.ts";
+import implementWorkflow from "../../../.pi/workflows/orkastrator-implement.workflow.ts";
 import reviewWorkflow from "../../../.pi/workflows/orkastrator-review.workflow.ts";
+import {
+  parseLifecycleInput,
+  parseOwnerResolvedStatus,
+  resolveReviewTarget,
+} from "../lifecycle-runtime.ts";
 import { planReviewWaves } from "../review-wave.ts";
 import {
   delegateSubagent,
@@ -53,8 +60,23 @@ class FakeEvents implements DelegationEvents {
   }
 }
 
-test("workflow definition is valid and rejects ambiguous input", () => {
+test("workflow definitions are valid and reject ambiguous input", () => {
   assert.doesNotThrow(() => validateWorkflowDefinition(reviewWorkflow));
+  assert.doesNotThrow(() => validateWorkflowDefinition(implementWorkflow));
+  assert.doesNotThrow(() => validateWorkflowDefinition(cookWorkflow));
+  assert.deepEqual(parseLifecycleInput({
+    task: "implement the committed change",
+    repository: "/tmp/repository",
+  }), {
+    task: "implement the committed change",
+    repository: "/tmp/repository",
+    maxParallelFixers: 3,
+    worktreeRetentionDays: 30,
+  });
+  assert.throws(
+    () => parseLifecycleInput({ task: "implement", repository: "relative" }),
+    /absolute path/u,
+  );
   assert.deepEqual(parseReviewWorkflowInput({
     objective: "fix the committed change",
     repository: "/tmp/repository",
@@ -91,6 +113,57 @@ test("workflow definition is valid and rejects ambiguous input", () => {
       worktreeRetentionDays: 0,
     }),
     /integer from 1 to 365/u,
+  );
+});
+
+test("owner-resolved lifecycle status preserves partial acceptance and stop", () => {
+  assert.equal(
+    parseOwnerResolvedStatus({ status: "owner_accepted_partial" }),
+    "owner_accepted_partial",
+  );
+  assert.equal(parseOwnerResolvedStatus({ status: "stopped" }), "stopped");
+  assert.throws(
+    () => parseOwnerResolvedStatus({ status: "completed" }),
+    /must be owner_accepted_partial or stopped/u,
+  );
+});
+
+test("review target requires one reported clean implementation repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-review-target-"));
+  const repository = join(root, "repo");
+  await git(root, ["init", "--initial-branch=main", repository]);
+  await git(repository, ["config", "user.name", "Orkastrator Test"]);
+  await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+  await writeFile(join(repository, "change.txt"), "committed\n", "utf8");
+  await git(repository, ["add", "change.txt"]);
+  await git(repository, ["commit", "-m", "implementation"]);
+
+  const completed = {
+    status: "completed" as const,
+    task: "implement",
+    plan: {},
+    implementation: { repositories: [repository] },
+    verification: {},
+    reviewRounds: [],
+    ci: {},
+    delivery: { repositories: [] },
+  };
+  const target = await resolveReviewTarget(completed, new AbortController().signal);
+  assert.equal(target.repository, repository);
+  assert.equal(target.reviewRevision, await git(repository, ["rev-parse", "HEAD"]));
+
+  await assert.rejects(
+    resolveReviewTarget(
+      { ...completed, implementation: {}, delivery: {} },
+      new AbortController().signal,
+    ),
+    /requires one reported implementation repository, observed 0/u,
+  );
+
+  await writeFile(join(repository, "dirty.txt"), "dirty\n", "utf8");
+  await assert.rejects(
+    resolveReviewTarget(completed, new AbortController().signal),
+    /must be clean/u,
   );
 });
 

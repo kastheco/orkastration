@@ -2,7 +2,7 @@
   "name": "orkastrator-pi",
   "version": "0.1.0",
   "private": true,
-  "description": "Orkastrator review policy for Pi Workflows and pi-subagents",
+  "description": "Orkastrator review policy for Pi Workflows and alternative subagent backends",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -19,7 +19,16 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
+    "pi-herdr-subagents": "0.2.1-orkastrator.0",
     "pi-subagents": ">=0.59.0 <0.60.0"
+  },
+  "peerDependenciesMeta": {
+    "pi-herdr-subagents": {
+      "optional": true
+    },
+    "pi-subagents": {
+      "optional": true
+    }
   },
   "pi": {
     "extensions": [
@@ -34,6 +43,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
     "@types/node": "^22.20.1",
+    "pi-herdr-subagents": "git+https://github.com/brkastner/pi-herdr-subagents.git#242437a",
     "pi-subagents": "^0.59.0",
     "typescript": "^7.0.2"
   },

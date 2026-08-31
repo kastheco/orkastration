@@ -25,6 +25,7 @@ const ownerChoices = defineHumanChoices({
 });
 
 export default defineWorkflow<ReviewWorkflowInput>({
+  source: import.meta.url,
   name: "orkastrator-review",
   input: parseReviewWorkflowInput,
   presentationPrompt: ({ finalOutput }) => [
@@ -34,7 +35,17 @@ export default defineWorkflow<ReviewWorkflowInput>({
     JSON.stringify(finalOutput),
   ].join("\n"),
   startAt: "initialReview",
-  maxSteps: 12,
+  maxSteps: 14,
+  exits: {
+    completed: {
+      from: "reviewCompleted",
+      validate: (value: unknown) => value,
+    },
+    owner_resolved: {
+      from: "ownerResolved",
+      validate: (value: unknown) => value,
+    },
+  },
   nodes: {
     initialReview: action({
       statusDetail: "running immutable initial review",
@@ -118,6 +129,12 @@ export default defineWorkflow<ReviewWorkflowInput>({
         fixes: outputs.fixWaves,
       }),
     }),
+    reviewCompleted: compute({
+      run: ({ outputs }) => outputs.completed ?? outputs.clean,
+    }),
+    ownerResolved: compute({
+      run: ({ outputs }) => outputs.acceptedPartial ?? outputs.stopped,
+    }),
   },
   edges: [
     { from: "initialReview", to: "classifyReview" },
@@ -138,5 +155,9 @@ export default defineWorkflow<ReviewWorkflowInput>({
       choices: ownerChoices,
       cases: { accept_partial: "acceptedPartial", stop: "stopped" },
     }),
+    { from: "clean", to: "reviewCompleted" },
+    { from: "completed", to: "reviewCompleted" },
+    { from: "acceptedPartial", to: "ownerResolved" },
+    { from: "stopped", to: "ownerResolved" },
   ],
 });

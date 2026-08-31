@@ -13,20 +13,21 @@ that are specific to this project.
 
 ## Command surface
 
-- `/kas <request>` expands the installed `implement` skill, allows only the
-  planning needed by the request, and automatically applies the `/kas:check`
-  contract after the implementation is reviewed, tested, and committed.
-- `/kas:cook <request>` expands `grill-with-docs`, keeps its interview and domain
-  documentation phase active across user turns, then follows the exact installed
-  `implement` skill and the `/kas:check` contract.
-- `/kas:check <objective>` runs only the durable `orkastrator-review` workflow
-  against a clean, exact committed revision. The command passes the workflow's
-  exact file path inside the installed Orkastrator package because Pi Workflows
-  discovers names only from project `.pi/workflows`, global
-  `~/.pi/agent/workflows`, and built-ins.
+- `/kas <request>` starts `orkastrator-implement.workflow.ts`. The workflow owns
+  its implementation-ready plan, implementation, verification, delivery,
+  committed review target, Orkastrator review, repair waves, and final result.
+- `/kas:cook <request>` starts `orkastrator-cook.workflow.ts`. It composes
+  planning, canonical documentation, required operator approval,
+  autoimplementation, and the complete Orkastrator review policy in one durable
+  run.
+- `/kas:check <objective>` starts `orkastrator-review.workflow.ts` against a
+  clean, exact committed revision.
 
-Required skills are discovered through Pi's command registry. Missing
-`implement` or `grill-with-docs` resources fail closed before the pipeline starts.
+Each command passes the workflow's exact file path inside the installed
+Orkastrator package because Pi Workflows discovers names only from project
+`.pi/workflows`, global `~/.pi/agent/workflows`, and built-ins. The launch turn
+only resolves the repository and starts the graph. It does not run lifecycle
+stages through skills or free-form prompt chaining.
 
 ## Why the custom runtime was removed
 
@@ -66,7 +67,7 @@ identity after sorting, deferred evidence across a rejected round, and rename
 scope enforcement. The cleanup commit `11d33cd` removed the last unused reducer
 seam.
 
-The current 21-test suite additionally covers strict schemas, path escape
+The current 28-test suite additionally covers strict schemas, path escape
 rejection, parallel caps, transitive clumping, exact commit identity, idempotent
 effect adoption, owner escalation, cancellation, novel deferred-finding
 reconciliation, and paths removed by renames.
@@ -85,11 +86,12 @@ Orkastrator keeps:
 - serial integration;
 - final reconciliation and owner escalation.
 
-A re-review observation is classified as a known sibling finding, a regression
-introduced by the current fix, a genuinely novel relevant finding, or an
-unrelated repository issue. Only the first may be ignored at the current fixer
-boundary without further action. A novel deferred finding prevents workflow
-completion until reconciliation.
+A re-review observation is either a known sibling finding, a regression
+introduced by the current fix, or a non-fix-introduced deferred finding. Known
+siblings remain with their frozen fixer group. Introduced regressions reject the
+current fix. Every reported deferred finding prevents workflow completion until
+final reconciliation. The current runtime has no separate nonblocking
+`unrelated` structured route.
 
 Runtime-owned fixer worktrees now carry retention manifests outside the Git
 worktree. Worktrees stay locked while active or unresolved. Fully integrated
@@ -108,6 +110,11 @@ all still pass. Legacy and unmarked worktrees are never swept automatically.
   adopted idempotently.
 - Integration conflicts stop for owner intervention rather than invoking an
   automatic conflict resolver.
+- Autoimplementation delivery happens before Orkastrator review. Fixes integrated
+  during the later review stage are not automatically republished or sent through
+  a second CI and delivery pass.
+- The composed `/kas` and `/kas:cook` graphs have static definition and package
+  coverage, but no live end-to-end dogfood run yet.
 
 These are bounded adapter limitations, not reasons to restore the removed
 workflow engine.
