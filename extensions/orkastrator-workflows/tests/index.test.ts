@@ -174,7 +174,8 @@ test("a stale async session_start cannot install after shutdown", async () => {
   lifecycle.get("session_shutdown")?.({});
   await starting;
 
-  await assert.rejects(delegateSubagent({
+  let hostedFallback = false;
+  const response = await delegateSubagent({
     ownerRunId: "run",
     nodeId: "node",
     agent: "worker",
@@ -182,7 +183,20 @@ test("a stale async session_start cannot install after shutdown", async () => {
     context: "fresh",
     cwd: "/tmp",
     result: { kind: "text" },
-  }, new AbortController().signal), /bridge is not installed/u);
+  }, new AbortController().signal, async (spec) => {
+    hostedFallback = true;
+    return {
+      requestId: "hosted",
+      ownerRunId: spec.ownerRunId,
+      nodeId: spec.nodeId,
+      status: "completed",
+      agent: spec.agent,
+      exitCode: 0,
+      result: { kind: "text", text: "done" },
+    };
+  });
+  assert.equal(hostedFallback, true);
+  assert.equal(response.status, "completed");
   assert.equal(events.listenerCount("prompt-template:subagent:response"), 0);
 });
 

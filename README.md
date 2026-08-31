@@ -33,7 +33,7 @@ to use herdr instead, replace the `pi-subagents` line with the forked runner whi
 pi install git:github.com/brkastner/pi-herdr-subagents@242437a7d2c6fbf76c8d9c23dce7b21f840d9d5d
 ```
 
-orkastrator detects the backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation.
+orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation. hosted workflow workers can't share that process-local bridge, so they launch isolated in-memory Pi SDK children instead. reviewer children receive only read-only tools; fixer children receive repository editing tools inside their assigned worktree. hosted children load no extensions, skills, prompt templates, themes, context files, or persistent session history. they use the configured Pi model instead of hard-coded provider dispatches.
 
 run pi from a trusted git repository, then choose how much ceremony you want:
 
@@ -116,7 +116,7 @@ extensions/orkastrator-workflows/review-wave.ts
 extensions/orkastrator-workflows/worktree-retention.ts
 ```
 
-the extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, and the bridge between pi workflows and the selected `pi-subagents` or `pi-herdr-subagents` backend. the three workflow definitions own their complete command lifecycles.
+the extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, and the in-process bridge to the selected `pi-subagents` or `pi-herdr-subagents` backend. hosted workflow workers use the isolated Pi SDK child path. the three workflow definitions own their complete command lifecycles.
 
 ## development
 
