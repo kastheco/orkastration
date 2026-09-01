@@ -58,8 +58,45 @@ function renderWorkflowWidgetLinesUnsafe(
     `${paintStatusGlyph(status, theme)} ${theme.fg("accent", theme.bold(title))}`
       + theme.fg("dim", `${unknownStatus}  ${elapsed} · ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}`),
   ];
-  const outline = renderWorkflowOutline(bundle.snapshot, state, now, theme);
+  const outline = renderCompactOutline(bundle.snapshot, state, now, theme);
   return [...header, ...outline].map((line) => truncateToWidth(line, width, "…"));
+}
+
+export function renderWorkflowDetailLines(
+  bundle: LoadedWorkflowRun,
+  width: number,
+  theme: WidgetTheme,
+  now = new Date(),
+): string[] {
+  const title = sanitizeText(bundle.state.runTitle ?? bundle.state.workflowName);
+  const outline = renderWorkflowOutline(bundle.snapshot, bundle.state, now, theme);
+  return [
+    theme.fg("accent", theme.bold(title)),
+    ...outline,
+  ].map((line) => truncateToWidth(line, width, "…"));
+}
+
+function renderCompactOutline(
+  snapshot: WorkflowDefinitionSnapshot,
+  state: WorkflowRunState,
+  now: Date,
+  theme: WidgetTheme,
+): string[] {
+  const plain = renderWorkflowOutline(snapshot, state, now);
+  const styled = renderWorkflowOutline(snapshot, state, now, theme);
+  const anchorNode = state.currentNode ?? state.waitingOn ?? state.steps.at(-1)?.nodeId;
+  const anchor = anchorNode === undefined
+    ? 0
+    : Math.max(0, plain.findIndex((line) => line.includes(`${sanitizeText(anchorNode)}  `)));
+  const start = Math.max(0, anchor - 2);
+  const end = Math.min(styled.length, anchor + 3);
+  const earlier = start;
+  const later = styled.length - end;
+  return [
+    ...(earlier === 0 ? [] : [theme.fg("dim", `↑ ${earlier} earlier node${earlier === 1 ? "" : "s"}`)]),
+    ...styled.slice(start, end),
+    ...(later === 0 ? [] : [theme.fg("dim", `↓ ${later} later node${later === 1 ? "" : "s"} · /kas:workflow`)]),
+  ];
 }
 
 export function renderWorkflowOutline(

@@ -35,7 +35,7 @@ pi install git:github.com/brkastner/pi-herdr-subagents@1817e6d670110100fbdc67ef0
 
 orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation.
 
-for an orkastrator workflow started from herdr, the extension renders a live, theme-aware workflow widget above pi's editor. unary steps stay in one lane, real branches indent, node types carry distinct colors, and implied queued labels are omitted. the extension adds a non-secret launch id to the accepted workflow input and keeps the socket capability in a user-private runtime descriptor. hosted reviewer and fixer actions use that binding to call a session-owned unix socket broker. active workers open in a right-hand column beside the originating pi session, and concurrent workers stack downward there. completed worker panes close automatically. a terminal workflow collapses to a concise in-editor receipt without dumping its raw json output. a bound request fails closed if the originating session or broker disappears instead of silently creating an invisible child.
+for an orkastrator workflow started from herdr, the extension renders a compact, theme-aware workflow widget above pi's editor. it shows a bounded window around the active step and summarizes omitted nodes above and below. `/kas:workflow` opens the complete graph in a scrollable overlay. unary steps stay in one lane, real branches indent, node types carry distinct colors, and implied queued labels are omitted. the extension adds a non-secret launch id to the accepted workflow input and keeps the socket capability in a user-private runtime descriptor. hosted reviewer and fixer actions use that binding to call a session-owned unix socket broker. active workers open in a right-hand column beside the originating pi session, and concurrent workers stack downward there. completed worker panes close automatically. a terminal workflow collapses to a concise in-editor receipt without dumping its raw json output. a bound request fails closed if the originating session or broker disappears instead of silently creating an invisible child.
 
 reviewer children receive only read-only tools. fixer children receive repository editing tools inside their assigned worktree. both run with discovered extensions, skills, prompt templates, themes, and context files disabled while retaining the explicit completion extension. they use the configured pi model instead of hard-coded provider dispatches. unbound and non-herdr hosted runs retain the isolated in-memory pi sdk fallback.
 
@@ -76,11 +76,13 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 /kas <implementation request>
 /kas:cook <implementation request>
 /kas:check <review objective>
+/kas:workflow
 ```
 
 - `/kas` starts `orkastrator-implement.workflow.ts`. it immediately creates an isolated Worktrunk branch and worktree, then one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result there.
 - `/kas:cook` starts `orkastrator-cook.workflow.ts`. planning, canonical documentation, and required operator approval stay on the invoking checkout. once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree for implementation, verification, delivery, and the full orkastrator review policy.
 - `/kas:check` starts `orkastrator-review.workflow.ts` against the repository's committed `HEAD`. it won't guess when the worktree is dirty.
+- `/kas:workflow` expands the attached workflow into a scrollable overlay. use `↑`/`↓` or `j`/`k`, jump with home/end, and close with `q` or escape.
 - `/kas-runs` reports the active or most recent workflow visible to the current pi session. it doesn't perform a name-filtered orkastrator run lookup.
 
 each command addresses its packaged workflow by exact installed file path. the command turn only resolves the repository and launches the workflow. planning, implementation, grilling, and review stay inside the graph.
@@ -129,7 +131,7 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 62 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
+A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 63 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
 
 The session broker has a real separate-process Unix socket test for result delivery and cancellation. Herdr worker placement remains rooted in the originating session while workflow status stays inside Pi's own widget area. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
 

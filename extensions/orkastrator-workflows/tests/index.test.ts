@@ -9,6 +9,7 @@ import { delegateSubagent } from "../delegation-bridge.ts";
 import { __indexTest__, installOrkastratorWorkflows } from "../index.ts";
 import { currentHerdrPaneId } from "../herdr-session-pane.ts";
 import {
+  renderWorkflowDetailLines,
   renderWorkflowOutline,
   renderWorkflowWidgetLines,
   workflowReceiptLines,
@@ -150,6 +151,53 @@ test("workflow widget survives unknown persisted run statuses", () => {
 
   const fallback = renderWorkflowWidgetLines({ state: {} } as never, 120, theme as never);
   assert.match(fallback[0]!, /workflow display unavailable/u);
+});
+
+test("workflow widget bounds large composed graphs around the active node", () => {
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const nodeIds = Array.from({ length: 20 }, (_, index) => `node-${index}`);
+  const lines = renderWorkflowWidgetLines({
+    state: {
+      workflowName: "orkastrator-cook",
+      startedAt: "2026-09-01T01:54:00.000Z",
+      updatedAt: "2026-09-01T01:54:05.000Z",
+      status: "running",
+      currentNode: "node-10",
+      currentNodeStartedAt: "2026-09-01T01:54:04.000Z",
+      steps: nodeIds.slice(0, 10).map((nodeId) => ({
+        nodeId,
+        outcome: "ok",
+        startedAt: "2026-09-01T01:54:00.000Z",
+        finishedAt: "2026-09-01T01:54:01.000Z",
+      })),
+    },
+    snapshot: {
+      startAt: nodeIds[0],
+      nodes: Object.fromEntries(nodeIds.map((nodeId) => [nodeId, { nodeType: "compute" }])),
+      edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
+    },
+  } as never, 160, theme as never, new Date("2026-09-01T01:54:05.000Z"));
+
+  assert.equal(lines.length, 8);
+  assert.equal(lines.some((line) => line.includes("node-10")), true);
+  assert.equal(lines.some((line) => /↑ 8 earlier nodes/u.test(line)), true);
+  assert.equal(lines.some((line) => /↓ 7 later nodes · \/kas:workflow/u.test(line)), true);
+  assert.equal(renderWorkflowDetailLines({
+    state: {
+      workflowName: "orkastrator-cook",
+      updatedAt: "2026-09-01T01:54:05.000Z",
+      status: "running",
+      steps: [],
+    },
+    snapshot: {
+      startAt: nodeIds[0],
+      nodes: Object.fromEntries(nodeIds.map((nodeId) => [nodeId, { nodeType: "compute" }])),
+      edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
+    },
+  } as never, 160, theme as never).length, 21);
 });
 
 test("workflow branches render as a vertical outline with join references", () => {

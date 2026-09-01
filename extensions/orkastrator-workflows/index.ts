@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey } from "@earendil-works/pi-tui";
 import {
   readWorkflowRun,
   type WorkflowRunState,
@@ -10,7 +11,10 @@ import { detectDelegationBackend, installDelegationBridge } from "./delegation-b
 import { SessionDelegationBroker } from "./herdr-delegation-broker.ts";
 import type { HerdrLaunchBinding } from "./herdr-launch.ts";
 import { currentHerdrPaneId } from "./herdr-session-pane.ts";
-import { renderWorkflowWidgetLines } from "./workflow-widget.ts";
+import {
+  renderWorkflowDetailLines,
+  renderWorkflowWidgetLines,
+} from "./workflow-widget.ts";
 
 const IMPLEMENT_WORKFLOW_PATH = fileURLToPath(
   new URL("../../.pi/workflows/orkastrator-implement.workflow.ts", import.meta.url),
@@ -280,6 +284,51 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     }
   });
 
+  const showWorkflowDetails = async (ctx: ExtensionContext, runId: string): Promise<void> => {
+    await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+      const viewportRows = 18;
+      let offset = 0;
+      let lineCount = 0;
+      const move = (next: number): void => {
+        offset = Math.max(0, Math.min(next, Math.max(0, lineCount - viewportRows)));
+        tui.requestRender();
+      };
+      return {
+        render(width: number): string[] {
+          const bundle = readWorkflowRun(runId);
+          if (bundle === null) {
+            return [theme.fg("error", `workflow ${runId} is unavailable`)];
+          }
+          const lines = renderWorkflowDetailLines(bundle, width, theme);
+          lineCount = lines.length;
+          offset = Math.min(offset, Math.max(0, lineCount - viewportRows));
+          const end = Math.min(lineCount, offset + viewportRows);
+          return [
+            theme.fg("dim", `${offset + 1}-${end} of ${lineCount}`),
+            ...lines.slice(offset, end),
+            theme.fg("dim", "↑/↓ or j/k scroll · home/end jump · q/esc close"),
+          ];
+        },
+        handleInput(data: string): void {
+          if (matchesKey(data, Key.up) || data === "k") move(offset - 1);
+          else if (matchesKey(data, Key.down) || data === "j") move(offset + 1);
+          else if (matchesKey(data, Key.home)) move(0);
+          else if (matchesKey(data, Key.end)) move(lineCount);
+          else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data === "q") done();
+        },
+        invalidate() {},
+      };
+    }, {
+      overlay: true,
+      overlayOptions: {
+        width: "85%",
+        maxHeight: "85%",
+        anchor: "center",
+        margin: 1,
+      },
+    });
+  };
+
   pi.registerCommand("kas", {
     description: "Run the complete Orkastrator implementation lifecycle",
     handler: async (args, ctx) => {
@@ -301,6 +350,18 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       if (!requireTrust(ctx)) return;
       pi.sendUserMessage(checkPrompt(args.trim()));
+    },
+  });
+
+  pi.registerCommand("kas:workflow", {
+    description: "Expand and scroll the current Orkastrator workflow",
+    handler: async (_args, ctx) => {
+      if (!requireTrust(ctx)) return;
+      if (widgetRunId === undefined) {
+        ctx.ui.notify("No workflow is attached to this Pi session", "error");
+        return;
+      }
+      await showWorkflowDetails(ctx, widgetRunId);
     },
   });
 
