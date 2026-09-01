@@ -8,9 +8,10 @@ import {
 } from "@osolmaz/pi-workflows";
 import {
   autoimplementWorkflow,
-  planChangeWorkflow,
   type AutoimplementInput,
 } from "@osolmaz/pi-workflows/builtins";
+
+import planChangeWorkflow from "./orkastrator-plan-change.workflow.ts";
 
 import {
   createImplementationWorktree,
@@ -44,7 +45,9 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
         };
       },
     }),
-    implementation: includeWorkflow(autoimplementWorkflow, {
+    implementation: includeWorkflow({
+      workflow: "builtin:autoimplement",
+      contract: autoimplementWorkflow,
       input: ({ input, outputs }): AutoimplementInput => {
         const request = input as OrkastratorLifecycleInput;
         const planning = includedResult(planChangeWorkflow, outputs.planning);

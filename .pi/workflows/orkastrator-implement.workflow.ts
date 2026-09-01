@@ -61,7 +61,9 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
   startAt: "createWorktree",
   maxSteps: 400,
   includes: {
-    implementation: includeWorkflow(autoimplementWorkflow, {
+    implementation: includeWorkflow({
+      workflow: "builtin:autoimplement",
+      contract: autoimplementWorkflow,
       input: ({ input, outputs }): AutoimplementInput => {
         const request = input as OrkastratorLifecycleInput;
         const planning = outputs.plan as ImplementationPlan;

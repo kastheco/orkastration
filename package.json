@@ -50,7 +50,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@osolmaz/pi-workflows": "^0.15.0",
+    "@osolmaz/pi-workflows": "0.15.2",
     "tsx": "^4.23.13"
   },
   "main": "index.js",
