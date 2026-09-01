@@ -16,7 +16,8 @@ import {
   type FrozenReviewPlan,
   type InitialReviewFinding,
 } from "./review-wave.ts";
-import { delegateSubagent, type DelegationSpec } from "./delegation-bridge.ts";
+import { loadOrkastratorConfig, type OrkastratorStageConfig } from "./config.ts";
+import { delegateSubagent } from "./delegation-bridge.ts";
 import {
   ensureOwnedFixerWorktree,
   recordFixerWorktreeOutcome,
@@ -156,6 +157,7 @@ export async function runInitialReview(
   const input = parseReviewWorkflowInput(context.input);
   const repository = await verifyReviewRepository(input, context.signal, true);
   await sweepExpiredFixerWorktrees(input, context.signal);
+  const config = await loadOrkastratorConfig();
   const committedDiff = await reviewDiff(
     repository,
     ["show", "--format=fuller", "--no-ext-diff", "--no-renames", input.reviewRevision, "--"],
@@ -168,7 +170,8 @@ export async function runInitialReview(
     task: initialReviewPrompt(input, committedDiff),
     context: "fresh",
     cwd: repository,
-    thinking: "medium",
+    model: config.review.initial.model,
+    thinking: config.review.initial.thinking,
     timeoutMs: 30 * 60_000,
     toolBudget: { soft: 60, hard: 100 },
     artifacts: true,
@@ -185,6 +188,7 @@ export async function runFixWaves(
 ): Promise<FixWaveResult> {
   const input = parseReviewWorkflowInput(context.input);
   const repository = await verifyReviewRepository(input, context.signal, false);
+  const config = await loadOrkastratorConfig();
   const accepted: AcceptedFix[] = [];
   const unresolved: UnresolvedFix[] = [];
   const groups = new Map(plan.fixerGroups.map((group) => [group.groupId, group]));
@@ -207,6 +211,8 @@ export async function runFixWaves(
         repository,
         group,
         knownSiblingFindings,
+        config.review.fixer,
+        config.review.reReview,
       );
     }));
     for (const result of results) {
@@ -297,6 +303,8 @@ async function runFixerGroup(
     category: InitialReviewFinding["category"];
     writablePaths: string[];
   }>,
+  fixerConfig: OrkastratorStageConfig,
+  reReviewConfig: OrkastratorStageConfig,
 ): Promise<AcceptedFix | UnresolvedFix> {
   const worktree = await ensureOwnedFixerWorktree(input, context.state.runId, group.groupId, context.signal);
   let rejectionEvidence: string[] = [];
@@ -311,7 +319,8 @@ async function runFixerGroup(
         task: fixerPrompt(input, group, round, rejectionEvidence),
         context: "fresh",
         cwd: worktree,
-        thinking: "medium",
+        model: fixerConfig.model,
+        thinking: fixerConfig.thinking,
         timeoutMs: 60 * 60_000,
         toolBudget: { soft: 100, hard: 160 },
         artifacts: true,
@@ -357,7 +366,8 @@ async function runFixerGroup(
       task: reReviewPrompt(input, packet, knownSiblingFindings, exactDiff),
       context: "fresh",
       cwd: worktree,
-      thinking: "medium",
+      model: reReviewConfig.model,
+      thinking: reReviewConfig.thinking,
       timeoutMs: 30 * 60_000,
       toolBudget: { soft: 50, hard: 90 },
       artifacts: true,

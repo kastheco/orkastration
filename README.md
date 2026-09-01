@@ -33,11 +33,42 @@ to use herdr instead, replace the `pi-subagents` line with the forked runner whi
 pi install git:github.com/brkastner/pi-herdr-subagents@1817e6d670110100fbdc67ef08a31316a3a05bf4
 ```
 
-Orkastrator detects the interactive backend through its non-launching delegation capabilities. It refuses to delegate when both backends are installed. The `pi-subagents` backend uses its correlated event protocol. The Herdr backend uses the fork's versioned global delegation API and public awaitable runner, and it requires a working Herdr installation.
+orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation.
 
-For an Orkastrator workflow started from Herdr, the extension renders a live, theme-aware workflow widget above Pi's editor. Unary steps stay in one lane, real branches indent, node types carry distinct colors, and implied queued labels are omitted. The extension adds a non-secret launch ID to the accepted workflow input and keeps the socket capability in a user-private runtime descriptor. Hosted reviewer and fixer actions use that binding to call a session-owned Unix socket broker. Active workers open in a right-hand column beside the originating Pi session, and concurrent workers stack downward there. Completed worker panes close automatically. A terminal workflow collapses to a concise in-editor receipt without dumping its raw JSON output. A bound request fails closed if the originating session or broker disappears instead of silently creating an invisible child.
+for an orkastrator workflow started from herdr, the extension renders a live, theme-aware workflow widget above pi's editor. unary steps stay in one lane, real branches indent, node types carry distinct colors, and implied queued labels are omitted. the extension adds a non-secret launch id to the accepted workflow input and keeps the socket capability in a user-private runtime descriptor. hosted reviewer and fixer actions use that binding to call a session-owned unix socket broker. active workers open in a right-hand column beside the originating pi session, and concurrent workers stack downward there. completed worker panes close automatically. a terminal workflow collapses to a concise in-editor receipt without dumping its raw json output. a bound request fails closed if the originating session or broker disappears instead of silently creating an invisible child.
 
-Reviewer children receive only read-only tools. Fixer children receive repository editing tools inside their assigned worktree. Both run with discovered extensions, skills, prompt templates, themes, and context files disabled while retaining the explicit completion extension. They use the configured Pi model instead of hard-coded provider dispatches. Unbound and non-Herdr hosted runs retain the isolated in-memory Pi SDK fallback.
+reviewer children receive only read-only tools. fixer children receive repository editing tools inside their assigned worktree. both run with discovered extensions, skills, prompt templates, themes, and context files disabled while retaining the explicit completion extension. they use the configured pi model instead of hard-coded provider dispatches. unbound and non-herdr hosted runs retain the isolated in-memory pi sdk fallback.
+
+## configuration
+
+orkastrator has built-in routing defaults. they apply when no user config exists and remain in place for every field a partial config doesn't override:
+
+| stage | model | thinking |
+|---|---|---|
+| initial review | `anthropic/claude-opus-5` | `medium` |
+| fixer | `openai-codex/gpt-5.6-terra` | `medium` |
+| re-review | `anthropic/claude-sonnet-5` | `medium` |
+
+user configuration lives at `$XDG_CONFIG_HOME/orkastrator/config.json`, or `~/.config/orkastrator/config.json` when `XDG_CONFIG_HOME` isn't set. `ORKASTRATOR_CONFIG` can point to a different file. every field is optional:
+
+```json
+{
+  "review": {
+    "initial": {
+      "model": "anthropic/claude-opus-5",
+      "thinking": "high"
+    },
+    "fixer": {
+      "model": "openai-codex/gpt-5.6-terra"
+    },
+    "reReview": {
+      "model": "anthropic/claude-sonnet-5"
+    }
+  }
+}
+```
+
+supported thinking levels are `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. invalid JSON, unknown fields, empty model names, and unsupported thinking levels stop the workflow rather than silently falling back to the active parent model.
 
 run pi from a trusted git repository, then choose how much ceremony you want:
 
@@ -98,7 +129,7 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 55 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
+A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 61 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
 
 The session broker has a real separate-process Unix socket test for result delivery and cancellation. Herdr worker placement remains rooted in the originating session while workflow status stays inside Pi's own widget area. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
 
