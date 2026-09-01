@@ -68,6 +68,27 @@ function checkPrompt(objective: string): string {
   ].join("\n");
 }
 
+type WorkflowManagementAction = "status" | "pause" | "resume" | "cancel";
+
+const WORKFLOW_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+
+function workflowManagementPrompt(action: WorkflowManagementAction, args: string): string {
+  const runId = args.trim();
+  if ((action === "pause" || action === "resume") && runId.length > 0) {
+    throw new Error(`/kas:${action} operates on the active workflow and does not accept a run ID`);
+  }
+  if (runId.length > 0 && !WORKFLOW_RUN_ID.test(runId)) {
+    throw new Error("Workflow run IDs may contain only letters, numbers, dots, underscores, colons, and hyphens");
+  }
+
+  const input = runId.length > 0 ? { action, runId } : { action };
+  return [
+    `Call the workflow tool immediately with this exact input: ${JSON.stringify(input)}.`,
+    action === "resume" ? "Do not call workflow status first." : "Do not start a new workflow.",
+    action === "status" ? "Report the result concisely." : "Report the control request result.",
+  ].join("\n");
+}
+
 function requireTrust(ctx: { isProjectTrusted(): boolean; ui: { notify(message: string, level: "error"): void } }): boolean {
   if (ctx.isProjectTrusted()) return true;
   ctx.ui.notify("Orkastrator requires project trust", "error");
@@ -365,15 +386,29 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand("kas-runs", {
-    description: "Report the active or most recent Orkastrator workflow run",
-    handler: async (_args, ctx) => {
-      if (!requireTrust(ctx)) return;
-      pi.sendUserMessage(
-        "Call the workflow tool with action=status and report the active or most recent Orkastrator workflow run concisely.",
-      );
-    },
-  });
+  const registerWorkflowControl = (
+    name: "kas:status" | "kas:pause" | "kas:resume" | "kas:cancel" | "kas-runs",
+    action: WorkflowManagementAction,
+    description: string,
+  ): void => {
+    pi.registerCommand(name, {
+      description,
+      handler: async (args, ctx) => {
+        if (!requireTrust(ctx)) return;
+        try {
+          pi.sendUserMessage(workflowManagementPrompt(action, args));
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+      },
+    });
+  };
+
+  registerWorkflowControl("kas:status", "status", "Report the active workflow or a specified run ID");
+  registerWorkflowControl("kas:pause", "pause", "Pause the active workflow");
+  registerWorkflowControl("kas:resume", "resume", "Resume the active workflow");
+  registerWorkflowControl("kas:cancel", "cancel", "Cancel the active workflow or a specified run ID");
+  registerWorkflowControl("kas-runs", "status", "Report the active or most recent Orkastrator workflow run");
 
   pi.on("session_shutdown", async () => {
     lifecycleGeneration += 1;
@@ -390,6 +425,7 @@ export const __indexTest__ = {
   workflowStartInput,
   workflowResultRunId,
   acceptedCancellationRunId,
+  workflowManagementPrompt,
   workflowPaths: ORKASTRATOR_WORKFLOWS,
 };
 

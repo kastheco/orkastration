@@ -401,23 +401,69 @@ test("a stale async session_start cannot install after shutdown", async () => {
   assert.equal(events.listenerCount("prompt-template:subagent:response"), 0);
 });
 
-test("all kas execution commands require project trust", async () => {
+test("workflow management commands route exact control requests", async () => {
+  const { commands, messages, notifications } = createHarness();
+  const ctx = trustedContext(notifications);
+  const cases = [
+    ["kas:status", "", { action: "status" }],
+    ["kas:status", "run-1", { action: "status", runId: "run-1" }],
+    ["kas:pause", "", { action: "pause" }],
+    ["kas:resume", "", { action: "resume" }],
+    ["kas:cancel", "run-1", { action: "cancel", runId: "run-1" }],
+    ["kas-runs", "", { action: "status" }],
+  ] as const;
+
+  for (const [name, args, input] of cases) {
+    const command = commands.get(name);
+    assert.ok(command);
+    await command.handler(args, ctx);
+    assert.match(messages.at(-1)!.message, new RegExp(JSON.stringify(input).replace(/[{}]/gu, "\\$&"), "u"));
+  }
+
+  assert.match(messages[3]!.message, /Do not call workflow status first/u);
+  assert.deepEqual(notifications, []);
+});
+
+test("workflow management commands reject unsupported or malformed run IDs", async () => {
+  const { commands, messages, notifications } = createHarness();
+  const ctx = trustedContext(notifications);
+
+  await commands.get("kas:resume")!.handler("run-1", ctx);
+  await commands.get("kas:cancel")!.handler("run 1; restart", ctx);
+
+  assert.equal(messages.length, 0);
+  assert.deepEqual(notifications, [
+    ["/kas:resume operates on the active workflow and does not accept a run ID", "error"],
+    ["Workflow run IDs may contain only letters, numbers, dots, underscores, colons, and hyphens", "error"],
+  ]);
+});
+
+test("all kas execution and management commands require project trust", async () => {
   const { commands, messages, notifications } = createHarness();
   const untrusted = {
     isProjectTrusted: () => false,
     ui: { notify: (message: string, level: string) => notifications.push([message, level]) },
   };
+  const names = [
+    "kas",
+    "kas:cook",
+    "kas:check",
+    "kas:status",
+    "kas:pause",
+    "kas:resume",
+    "kas:cancel",
+    "kas-runs",
+  ];
 
-  for (const name of ["kas", "kas:cook", "kas:check"]) {
+  for (const name of names) {
     const command = commands.get(name);
     assert.ok(command);
     await command.handler("ignored", untrusted);
   }
 
   assert.equal(messages.length, 0);
-  assert.deepEqual(notifications, [
-    ["Orkastrator requires project trust", "error"],
-    ["Orkastrator requires project trust", "error"],
-    ["Orkastrator requires project trust", "error"],
-  ]);
+  assert.deepEqual(
+    notifications,
+    names.map(() => ["Orkastrator requires project trust", "error"]),
+  );
 });

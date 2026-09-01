@@ -77,13 +77,20 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 /kas:cook <implementation request>
 /kas:check <review objective>
 /kas:workflow
+/kas:status [run-id]
+/kas:pause
+/kas:resume
+/kas:cancel [run-id]
 ```
 
 - `/kas` starts `orkastrator-implement.workflow.ts`. it immediately creates an isolated Worktrunk branch and worktree, then one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result there.
 - `/kas:cook` starts `orkastrator-cook.workflow.ts`. planning, canonical documentation, and required operator approval stay on the invoking checkout. once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree for implementation, verification, delivery, and the full orkastrator review policy.
 - `/kas:check` starts `orkastrator-review.workflow.ts` against the repository's committed `HEAD`. it won't guess when the worktree is dirty.
 - `/kas:workflow` expands the attached workflow into a scrollable overlay. use `↑`/`↓` or `j`/`k`, jump with home/end, and close with `q` or escape.
-- `/kas-runs` reports the active or most recent workflow visible to the current pi session. it doesn't perform a name-filtered orkastrator run lookup.
+- `/kas:status [run-id]` reports the active workflow or the specified durable run.
+- `/kas:pause` and `/kas:resume` control the workflow attached to the current pi session. resume acts immediately without a preliminary status call.
+- `/kas:cancel [run-id]` cancels the active workflow or the specified run. cancellation keeps the durable terminal record.
+- `/kas-runs` remains a compatibility alias for `/kas:status`.
 
 each command addresses its packaged workflow by exact installed file path. the command turn only resolves the repository and launches the workflow. planning, implementation, grilling, and review stay inside the graph.
 
@@ -131,7 +138,7 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 63 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
+A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 65 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
 
 The session broker has a real separate-process Unix socket test for result delivery and cancellation. Herdr worker placement remains rooted in the originating session while workflow status stays inside Pi's own widget area. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
 
@@ -158,7 +165,7 @@ extensions/orkastrator-workflows/review-wave.ts
 extensions/orkastrator-workflows/worktree-retention.ts
 ```
 
-The extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas-runs`, the in-process backend bridge, and the session-owned Herdr broker. Herdr-bound workflow leaves return to the originating session for visible worker-pane execution while status remains in the embedded widget. Other hosted workflow leaves use the isolated Pi SDK child path. The three workflow definitions own their complete command lifecycles.
+The extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas:workflow`, `/kas:status`, `/kas:pause`, `/kas:resume`, `/kas:cancel`, the `/kas-runs` compatibility alias, the in-process backend bridge, and the session-owned Herdr broker. Herdr-bound workflow leaves return to the originating session for visible worker-pane execution while status remains in the embedded widget. Other hosted workflow leaves use the isolated Pi SDK child path. The three workflow definitions own their complete command lifecycles.
 
 ## development
 
