@@ -86,6 +86,7 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
           reviewRevision: target.reviewRevision,
           maxParallelFixers: request.maxParallelFixers,
           worktreeRetentionDays: request.worktreeRetentionDays,
+          ...(request.herdrLaunch === undefined ? {} : { herdrLaunch: request.herdrLaunch }),
         };
       },
     }),

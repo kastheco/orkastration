@@ -6,7 +6,13 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { delegateSubagent } from "../delegation-bridge.ts";
-import { installOrkastratorWorkflows } from "../index.ts";
+import { __indexTest__, installOrkastratorWorkflows } from "../index.ts";
+import { currentHerdrPaneId } from "../herdr-session-pane.ts";
+import {
+  renderWorkflowOutline,
+  renderWorkflowWidgetLines,
+  workflowReceiptLines,
+} from "../workflow-widget.ts";
 
 type Command = {
   description?: string;
@@ -53,6 +59,127 @@ function workflowPath(message: string, name: string): string {
   assert.equal(existsSync(path), true);
   return path;
 }
+
+test("workflow event matching is exact and worker placement targets the originating session", () => {
+  const workflow = [...__indexTest__.workflowPaths][0]!;
+  const workflowInput = { task: "work", repository: "/tmp/repository" };
+  assert.deepEqual(__indexTest__.workflowStartInput({
+    toolName: "workflow",
+    input: { action: "start", workflow, input: workflowInput },
+  }), { workflowInput });
+  assert.equal(__indexTest__.workflowStartInput({
+    toolName: "workflow",
+    input: { action: "start", workflow: "/tmp/unrelated.workflow.ts", input: workflowInput },
+  }), undefined);
+  assert.equal(__indexTest__.workflowResultRunId({ action: "start", runId: "run-1" }, "start"), "run-1");
+  assert.equal(__indexTest__.workflowResultRunId({ action: "cancel", runId: "run-1" }, "cancel"), "run-1");
+  assert.equal(__indexTest__.workflowResultRunId({ action: "status", runId: "run-1" }, "start"), undefined);
+  assert.equal(currentHerdrPaneId({ HERDR_PANE_ID: "origin-pane" }), "origin-pane");
+  assert.throws(() => currentHerdrPaneId({}), /cannot place workers/u);
+});
+
+test("completed workflow receipts replace raw output with a concise terminal state", () => {
+  assert.deepEqual(workflowReceiptLines({
+    workflowName: "orkastrator-review",
+    startedAt: "2026-08-31T22:54:03.000Z",
+    finishedAt: "2026-08-31T22:55:16.000Z",
+    updatedAt: "2026-08-31T22:55:16.000Z",
+    status: "completed",
+    steps: [{}, {}, {}, {}],
+    finalOutput: { reason: "no blocking findings", review: { findings: [] } },
+  } as never), [
+    "✓ orkastrator-review · complete",
+    "1m 13s · 4 steps",
+    "no blocking findings",
+  ]);
+
+});
+
+test("the embedded workflow widget uses theme semantics and omits implied queued labels", () => {
+  const theme = {
+    bold: (text: string) => `<bold>${text}</bold>`,
+    fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+  };
+  const lines = renderWorkflowWidgetLines({
+    state: {
+      workflowName: "orkastrator-review",
+      startedAt: "2026-08-31T22:54:03.000Z",
+      updatedAt: "2026-08-31T22:54:04.000Z",
+      status: "running",
+      currentNode: "review",
+      currentNodeStartedAt: "2026-08-31T22:54:03.000Z",
+      steps: [],
+    },
+    snapshot: {
+      startAt: "review",
+      nodes: {
+        review: { nodeType: "action" },
+        classify: { nodeType: "compute" },
+      },
+      edges: [{ from: "review", to: "classify" }],
+    },
+  } as never, 240, theme as never, new Date("2026-08-31T22:54:04.000Z"));
+
+  assert.equal(lines.some((line) => line.includes("<warning>action</warning>")), true);
+  assert.equal(lines.some((line) => line.includes("<syntaxFunction>compute</syntaxFunction>")), true);
+  assert.equal(lines.some((line) => line.includes("queued")), false);
+  assert.equal(lines.some((line) => line.includes("↓")), true);
+});
+
+test("workflow branches render as a vertical outline with join references", () => {
+  const snapshot = {
+    startAt: "initial",
+    nodes: {
+      initial: { nodeType: "action" },
+      start: { nodeType: "compute" },
+      accepted: { nodeType: "compute" },
+      stopped: { nodeType: "compute" },
+      resolved: { nodeType: "compute" },
+    },
+    edges: [
+      { from: "initial", to: "start" },
+      {
+        from: "start",
+        switch: { on: "$.route", cases: { accept: "accepted", stop: "stopped" } },
+      },
+      { from: "accepted", to: "resolved" },
+      { from: "stopped", to: "resolved" },
+    ],
+  } as never;
+  const state = {
+    currentNode: "start",
+    updatedAt: "2026-08-31T22:54:03.000Z",
+    statusDetail: "waiting for route",
+    steps: [],
+  } as never;
+
+  assert.deepEqual(renderWorkflowOutline(snapshot, state, new Date("2026-08-31T22:54:04.000Z")), [
+    "· initial  action",
+    "↓ ◐ start  compute · running · 1s · waiting for route",
+    "├─ accept → · accepted  compute",
+    "│  ↓ · resolved  compute",
+    "└─ stop → · stopped  compute",
+    "   ↓ ↳ resolved",
+  ]);
+});
+
+test("workflow cancellation applies only after an accepted result and uses the resolved run ID", () => {
+  const failed = new Set(["failed-call"]);
+  assert.equal(__indexTest__.acceptedCancellationRunId(failed, {
+    toolCallId: "failed-call",
+    isError: true,
+    details: { action: "cancel", runId: "run-1" },
+  }), undefined);
+  assert.equal(failed.size, 0);
+
+  const accepted = new Set(["accepted-call"]);
+  assert.equal(__indexTest__.acceptedCancellationRunId(accepted, {
+    toolCallId: "accepted-call",
+    isError: false,
+    details: { action: "cancel", runId: "resolved-active-run" },
+  }), "resolved-active-run");
+  assert.equal(accepted.size, 0);
+});
 
 test("/kas launches one workflow that owns planning, implementation, and review", async () => {
   const { commands, messages, notifications, lifecycle } = createHarness();

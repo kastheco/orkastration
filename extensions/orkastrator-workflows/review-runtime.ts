@@ -6,6 +6,10 @@ import { promisify } from "node:util";
 import type { WorkflowActionContext } from "@osolmaz/pi-workflows";
 
 import {
+  parseOptionalHerdrLaunchBinding,
+  type HerdrLaunchBinding,
+} from "./herdr-launch.ts";
+import {
   buildReReviewPacket,
   parseInitialReviewOutput,
   type FixerGroup,
@@ -24,6 +28,7 @@ export { sweepExpiredFixerWorktrees } from "./worktree-retention.ts";
 const execFileAsync = promisify(execFile);
 const SHA = /^[0-9a-f]{40}$/u;
 const MAX_GIT_OUTPUT = 1_048_576;
+const MAX_REVIEW_DIFF = 600_000;
 const DEFAULT_WORKTREE_RETENTION_DAYS = 30;
 const MAX_WORKTREE_RETENTION_DAYS = 365;
 const INITIAL_REVIEW_SCHEMA = reviewEnvelopeSchema();
@@ -56,6 +61,7 @@ export interface ReviewWorkflowInput {
   maxParallelFixers: number;
   worktreeRetentionDays: number;
   stateRoot?: string;
+  herdrLaunch?: HerdrLaunchBinding;
 }
 
 export interface AcceptedFix {
@@ -101,6 +107,7 @@ export function parseReviewWorkflowInput(value: unknown): ReviewWorkflowInput {
     "reviewRevision",
     "stateRoot",
     "worktreeRetentionDays",
+    "herdrLaunch",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown !== undefined) throw new Error(`review workflow input has unknown field ${unknown}`);
@@ -128,6 +135,10 @@ export function parseReviewWorkflowInput(value: unknown): ReviewWorkflowInput {
   if (input.stateRoot !== undefined && (typeof input.stateRoot !== "string" || !isAbsolute(input.stateRoot))) {
     throw new Error("review workflow stateRoot must be an absolute path");
   }
+  const herdrLaunch = parseOptionalHerdrLaunchBinding(
+    input.herdrLaunch,
+    "review workflow Herdr launch binding",
+  );
   return {
     objective: input.objective,
     repository: input.repository,
@@ -135,6 +146,7 @@ export function parseReviewWorkflowInput(value: unknown): ReviewWorkflowInput {
     maxParallelFixers: maxParallelFixers as number,
     worktreeRetentionDays: worktreeRetentionDays as number,
     ...(input.stateRoot === undefined ? {} : { stateRoot: input.stateRoot as string }),
+    ...(herdrLaunch === undefined ? {} : { herdrLaunch }),
   };
 }
 
@@ -144,11 +156,16 @@ export async function runInitialReview(
   const input = parseReviewWorkflowInput(context.input);
   const repository = await verifyReviewRepository(input, context.signal, true);
   await sweepExpiredFixerWorktrees(input, context.signal);
+  const committedDiff = await reviewDiff(
+    repository,
+    ["show", "--format=fuller", "--no-ext-diff", "--no-renames", input.reviewRevision, "--"],
+    context.signal,
+  );
   const response = await delegateSubagent({
     ownerRunId: context.state.runId,
     nodeId: "initial-review",
     agent: "reviewer",
-    task: initialReviewPrompt(input),
+    task: initialReviewPrompt(input, committedDiff),
     context: "fresh",
     cwd: repository,
     thinking: "medium",
@@ -156,6 +173,7 @@ export async function runInitialReview(
     toolBudget: { soft: 60, hard: 100 },
     artifacts: true,
     result: { kind: "structured", schema: INITIAL_REVIEW_SCHEMA },
+    ...(input.herdrLaunch === undefined ? {} : { herdrLaunch: input.herdrLaunch }),
   }, context.signal);
   const value = requireStructuredResult(response, "initial reviewer");
   return parseInitialReviewResult(value, input.maxParallelFixers);
@@ -298,9 +316,18 @@ async function runFixerGroup(
         toolBudget: { soft: 100, hard: 160 },
         artifacts: true,
         result: { kind: "text" },
+        ...(input.herdrLaunch === undefined ? {} : { herdrLaunch: input.herdrLaunch }),
       }, context.signal);
       requireCompleted(response, `fixer ${group.groupId}`);
       head = await git(worktree, ["rev-parse", "HEAD"], context.signal);
+      if (head === input.reviewRevision) {
+        head = await commitVerifiedFixerChanges(
+          worktree,
+          group.groupId,
+          group.writablePaths,
+          context.signal,
+        );
+      }
     }
 
     const changedPaths = await inspectExactFixCommit(
@@ -318,11 +345,16 @@ async function runFixerGroup(
       changedPaths,
       validationEvidence: ["exactly one commit", "clean worktree", "changed paths within declared scope"],
     });
+    const exactDiff = await reviewDiff(
+      worktree,
+      ["diff", "--no-ext-diff", "--no-renames", input.reviewRevision, head, "--", ...changedPaths],
+      context.signal,
+    );
     const response = await delegateSubagent({
       ownerRunId: context.state.runId,
       nodeId: `${group.groupId}:re-review:${round}`,
       agent: "reviewer",
-      task: reReviewPrompt(input, packet, knownSiblingFindings),
+      task: reReviewPrompt(input, packet, knownSiblingFindings, exactDiff),
       context: "fresh",
       cwd: worktree,
       thinking: "medium",
@@ -330,6 +362,7 @@ async function runFixerGroup(
       toolBudget: { soft: 50, hard: 90 },
       artifacts: true,
       result: { kind: "structured", schema: RE_REVIEW_SCHEMA },
+      ...(input.herdrLaunch === undefined ? {} : { herdrLaunch: input.herdrLaunch }),
     }, context.signal);
     const verdict = parseReReviewVerdict(requireStructuredResult(response, `re-review ${group.groupId}`));
     const introducedBlocking = verdict.introducedFindings.filter(
@@ -365,6 +398,54 @@ async function runFixerGroup(
     evidence: rejectionEvidence,
     worktree,
   };
+}
+
+async function commitVerifiedFixerChanges(
+  worktree: string,
+  groupId: string,
+  writablePaths: string[],
+  signal: AbortSignal,
+): Promise<string> {
+  const stagedBefore = (await git(
+    worktree,
+    ["diff", "--cached", "--name-only", "--no-renames"],
+    signal,
+  )).split("\n").filter(Boolean);
+  if (stagedBefore.length > 0) {
+    throw new Error(`fixer staged changes despite supervisor-owned commits: ${stagedBefore[0]}`);
+  }
+  const tracked = (await git(
+    worktree,
+    ["diff", "--name-only", "--no-renames"],
+    signal,
+  )).split("\n").filter(Boolean);
+  const untracked = (await git(
+    worktree,
+    ["ls-files", "--others", "--exclude-standard"],
+    signal,
+  )).split("\n").filter(Boolean);
+  const changedPaths = [...new Set([...tracked, ...untracked])]
+    .sort((left, right) => left.localeCompare(right));
+  if (changedPaths.length === 0) throw new Error("fixer returned without any worktree changes");
+  const allowed = new Set(writablePaths);
+  const escaped = changedPaths.find((path) => !allowed.has(path));
+  if (escaped !== undefined) throw new Error(`fixer changed path outside declared scope: ${escaped}`);
+
+  await git(worktree, ["add", "--all", "--", ...writablePaths], signal);
+  const staged = (await git(
+    worktree,
+    ["diff", "--cached", "--name-only", "--no-renames"],
+    signal,
+  )).split("\n").filter(Boolean);
+  const stagedEscape = staged.find((path) => !allowed.has(path));
+  if (stagedEscape !== undefined) throw new Error(`fixer staged path outside declared scope: ${stagedEscape}`);
+  if (staged.length === 0) throw new Error("fixer changes produced no commit content");
+  await git(
+    worktree,
+    ["-c", "core.hooksPath=/dev/null", "commit", "-m", `fix: resolve review group ${groupId}`],
+    signal,
+  );
+  return await git(worktree, ["rev-parse", "HEAD"], signal);
 }
 
 async function verifyReviewRepository(
@@ -431,6 +512,23 @@ async function isAncestor(
   }
 }
 
+async function reviewDiff(cwd: string, args: string[], signal: AbortSignal): Promise<string> {
+  try {
+    const result = await execFileAsync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      maxBuffer: MAX_REVIEW_DIFF,
+      signal,
+    });
+    return result.stdout.trim();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/maxBuffer|stdout maxBuffer|ENOBUFS/iu.test(message)) {
+      throw new Error(`review diff exceeds the ${MAX_REVIEW_DIFF}-byte transport limit`);
+    }
+    throw error;
+  }
+}
+
 async function git(cwd: string, args: string[], signal: AbortSignal): Promise<string> {
   const result = await execFileAsync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
@@ -440,7 +538,7 @@ async function git(cwd: string, args: string[], signal: AbortSignal): Promise<st
   return result.stdout.trim();
 }
 
-function initialReviewPrompt(input: ReviewWorkflowInput): string {
+function initialReviewPrompt(input: ReviewWorkflowInput, committedDiff: string): string {
   return [
     `Review commit ${input.reviewRevision} for this objective:`,
     input.objective,
@@ -450,6 +548,8 @@ function initialReviewPrompt(input: ReviewWorkflowInput): string {
     "For each finding, implicatedPaths names evidence locations and writablePaths names only files a fixer may change. Both use repository-relative paths such as src/count.js.",
     "Never widen writablePaths to tests or aggregate consequence paths unless those files themselves must change. Do not report an umbrella failing-suite finding when scoped root-cause findings already explain the failure.",
     "Never return an absolute path or a path containing . or .. segments.",
+    "Exact committed diff:",
+    committedDiff,
   ].join("\n\n");
 }
 
@@ -469,7 +569,7 @@ function fixerPrompt(
       evidence: finding.evidence,
     })))}`,
     rejectionEvidence.length === 0 ? "" : `Previous rejection evidence: ${JSON.stringify(rejectionEvidence)}`,
-    "Change only the declared writable paths. Validate the fix, leave the worktree clean, and create exactly one commit.",
+    "Change only the declared writable paths. Validate the fix and leave the worktree changes uncommitted. The supervisor verifies scope and creates the commit.",
     "Do not ask the supervisor to widen scope. If scoped validation passes while the full suite fails only in another declared fixer group's paths, commit the scoped fix and record that out-of-scope failure.",
   ].filter(Boolean).join("\n\n");
 }
@@ -482,6 +582,7 @@ function reReviewPrompt(
     category: InitialReviewFinding["category"];
     writablePaths: string[];
   }>,
+  exactDiff: string,
 ): string {
   return [
     `Re-review one fix for objective: ${input.objective}`,
@@ -491,6 +592,8 @@ function reReviewPrompt(
     "Do not modify files. Reject any unmet contract or blocking regression introduced by this fix.",
     "Do not return a known sibling finding as new. If validation fails only because of a known sibling, mention it in the reason and keep introducedFindings empty.",
     "Return a non-fix-introduced finding only when it is genuinely novel. Novel deferred findings block final workflow completion pending reconciliation.",
+    "Exact fixer diff:",
+    exactDiff,
   ].join("\n\n");
 }
 

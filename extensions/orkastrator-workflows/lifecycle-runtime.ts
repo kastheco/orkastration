@@ -6,6 +6,11 @@ import { promisify } from "node:util";
 
 import type { AutoimplementCompleted } from "@osolmaz/pi-workflows/builtins";
 
+import {
+  parseOptionalHerdrLaunchBinding,
+  type HerdrLaunchBinding,
+} from "./herdr-launch.ts";
+
 const execFileAsync = promisify(execFile);
 const SHA = /^[0-9a-f]{40}$/u;
 
@@ -14,6 +19,7 @@ export type OrkastratorLifecycleInput = {
   repository: string;
   maxParallelFixers: number;
   worktreeRetentionDays: number;
+  herdrLaunch?: HerdrLaunchBinding;
 };
 
 export type ImplementationWorktree = {
@@ -63,6 +69,7 @@ export function parseLifecycleInput(value: unknown): OrkastratorLifecycleInput {
     "repository",
     "maxParallelFixers",
     "worktreeRetentionDays",
+    "herdrLaunch",
   ]);
   const unexpected = Object.keys(input).find((key) => !allowed.has(key));
   if (unexpected !== undefined) {
@@ -74,6 +81,10 @@ export function parseLifecycleInput(value: unknown): OrkastratorLifecycleInput {
   if (typeof input.repository !== "string" || !isAbsolute(input.repository)) {
     throw new Error("Orkastrator lifecycle repository must be an absolute path");
   }
+  const herdrLaunch = parseOptionalHerdrLaunchBinding(
+    input.herdrLaunch,
+    "Orkastrator lifecycle Herdr launch binding",
+  );
   return {
     task: input.task.trim(),
     repository: input.repository,
@@ -91,6 +102,7 @@ export function parseLifecycleInput(value: unknown): OrkastratorLifecycleInput {
       365,
       "Orkastrator lifecycle worktreeRetentionDays",
     ),
+    ...(herdrLaunch === undefined ? {} : { herdrLaunch }),
   };
 }
 

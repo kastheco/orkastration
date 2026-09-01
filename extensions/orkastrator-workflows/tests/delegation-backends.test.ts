@@ -15,6 +15,11 @@ import {
 
 const HERDR_API = Symbol.for("pi-herdr-subagents/delegation.v1");
 const herdrGlobal = globalThis as typeof globalThis & { [HERDR_API]?: unknown };
+const HERDR_CAPABILITIES = {
+  panePlacement: true,
+  resourceIsolation: true,
+  writableRootSandbox: true,
+} as const;
 
 const spec: DelegationSpec = {
   ownerRunId: "run",
@@ -77,6 +82,7 @@ function installHerdr(result: Record<string, unknown>, controller?: AbortControl
   const calls: Array<{ params: Record<string, unknown>; options: Record<string, unknown> }> = [];
   herdrGlobal[HERDR_API] = {
     version: 1,
+    capabilities: HERDR_CAPABILITIES,
     runSubagent: async (
       params: Record<string, unknown>,
       _ctx: unknown,
@@ -104,7 +110,7 @@ test("capability detection routes either backend and rejects both or neither", a
   delete herdrGlobal[HERDR_API];
   assert.equal(await detectDelegationBackend([], new CapabilityEvents(true), 5), "pi-subagents");
 
-  herdrGlobal[HERDR_API] = { version: 1, runSubagent() {} };
+  herdrGlobal[HERDR_API] = { version: 1, capabilities: HERDR_CAPABILITIES, runSubagent() {} };
   assert.equal(await detectDelegationBackend([], new CapabilityEvents(false), 5), "pi-herdr-subagents");
   await assert.rejects(
     detectDelegationBackend([], new CapabilityEvents(true), 5),
@@ -122,7 +128,13 @@ test("Herdr metadata only refines incompatible-version errors", async () => {
   delete herdrGlobal[HERDR_API];
   await assert.rejects(
     detectDelegationBackend([tool("pi-herdr-subagents")], new CapabilityEvents(false), 5),
-    /tool metadata without the required delegation API.*0\.2\.1-orkastrator\.0/u,
+    /tool metadata without the required delegation API.*0\.2\.1-orkastrator\.1/u,
+  );
+
+  herdrGlobal[HERDR_API] = { version: 1, runSubagent() {} };
+  await assert.rejects(
+    detectDelegationBackend([], new CapabilityEvents(false), 5),
+    /pane placement, resource isolation, and writable-root sandbox capabilities/u,
   );
 
   herdrGlobal[HERDR_API] = { version: 0, runSubagent() {} };
@@ -143,13 +155,22 @@ test("pi-subagents capability probes always clean up their correlated listener",
 
 test("Herdr routing resolves the real global API and normalizes successful text", async () => {
   const { calls, uninstall } = installHerdr({ summary: "done", exitCode: 0, elapsed: 2 });
-  const response = await delegateSubagent(spec, new AbortController().signal);
+  const placement = {
+    parentPaneId: "workflow-root",
+    stackId: "workflow-stack",
+    firstDirection: "down" as const,
+  };
+  const response = await delegateSubagent({ ...spec, panePlacement: placement }, new AbortController().signal);
   assert.equal(response.status, "completed");
   assert.deepEqual(response.result, { kind: "text", text: "done" });
   assert.equal(response.usage?.durationMs, 2000);
   assert.equal(calls[0]?.params.agent, "worker");
   assert.equal(calls[0]?.params.fork, false);
+  assert.equal(calls[0]?.params.tools, "read,bash,edit,write,grep,find,ls");
   assert.equal(calls[0]?.options.structuredOutput, undefined);
+  assert.deepEqual(calls[0]?.options.placement, placement);
+  assert.equal(calls[0]?.options.isolateResources, true);
+  assert.equal(calls[0]?.options.sandboxRoot, "/tmp");
   uninstall();
 });
 
@@ -164,7 +185,7 @@ test("Herdr rejects missing and incompatible global delegation APIs", async () =
   herdrGlobal[HERDR_API] = { version: 2, runSubagent() {} };
   await assert.rejects(delegateSubagent(spec, new AbortController().signal), /API version 1/u);
 
-  herdrGlobal[HERDR_API] = { version: 1 };
+  herdrGlobal[HERDR_API] = { version: 1, capabilities: HERDR_CAPABILITIES };
   await assert.rejects(delegateSubagent(spec, new AbortController().signal), /runSubagent capability/u);
   delete herdrGlobal[HERDR_API];
   uninstall();
@@ -181,6 +202,15 @@ test("Herdr failure and cancellation retain terminal and abort semantics", async
   installed = installHerdr({ summary: "Subagent cancelled.", exitCode: 1, elapsed: 0, error: "cancelled" }, controller);
   await assert.rejects(delegateSubagent(spec, controller.signal), (error: unknown) =>
     error instanceof DOMException && error.name === "AbortError");
+  installed.uninstall();
+});
+
+test("Herdr reviewers receive only read-only tools", async () => {
+  const installed = installHerdr({ summary: "clean", exitCode: 0, elapsed: 1 });
+  const response = await delegateSubagent({ ...spec, agent: "reviewer" }, new AbortController().signal);
+  assert.equal(response.status, "completed");
+  assert.equal(installed.calls[0]?.params.tools, "read,grep,find,ls");
+  assert.equal(installed.calls[0]?.options.sandboxRoot, undefined);
   installed.uninstall();
 });
 

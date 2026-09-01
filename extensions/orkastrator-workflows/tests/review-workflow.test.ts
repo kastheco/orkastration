@@ -118,6 +118,51 @@ test("workflow definitions are valid and reject ambiguous input", () => {
   );
 });
 
+test("Herdr launch bindings parse strictly and propagate into included review workflows", () => {
+  const herdrLaunch = {
+    version: 1 as const,
+    transport: "unix" as const,
+    launchId: "123e4567-e89b-42d3-a456-426614174000",
+  };
+  const lifecycle = parseLifecycleInput({
+    task: "implement the committed change",
+    repository: "/tmp/repository",
+    herdrLaunch,
+  });
+  assert.deepEqual(lifecycle.herdrLaunch, herdrLaunch);
+  const review = parseReviewWorkflowInput({
+    objective: "review the committed change",
+    repository: "/tmp/repository",
+    reviewRevision: "a".repeat(40),
+    herdrLaunch,
+  });
+  assert.deepEqual(review.herdrLaunch, herdrLaunch);
+  assert.throws(
+    () => parseLifecycleInput({
+      task: "implement",
+      repository: "/tmp/repository",
+      herdrLaunch: { ...herdrLaunch, capability: "model-supplied" },
+    }),
+    /unknown or missing fields/u,
+  );
+
+  for (const workflow of [implementWorkflow, cookWorkflow]) {
+    const includeReview = (workflow as unknown as {
+      includes: { review: { input(context: unknown): unknown } };
+    }).includes.review;
+    const included = includeReview.input({
+      input: lifecycle,
+      outputs: {
+        prepareReview: {
+          repository: "/tmp/repository",
+          reviewRevision: "b".repeat(40),
+        },
+      },
+    } as never) as ReviewWorkflowInput;
+    assert.deepEqual(included.herdrLaunch, herdrLaunch);
+  }
+});
+
 test("implementation workflows create Worktrunk isolation at the required stage", () => {
   assert.equal(implementWorkflow.startAt, "createWorktree");
   assert.deepEqual(implementWorkflow.edges.slice(0, 2), [
@@ -407,10 +452,8 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
         const [path] = JSON.parse(writable) as string[];
         await new Promise((resolve) => setTimeout(resolve, 20));
         await writeFile(join(request.cwd, path!), `fixed ${path![0]}\n`, "utf8");
-        await git(request.cwd, ["add", path!]);
-        await git(request.cwd, ["commit", "-m", `fix ${request.nodeId}`]);
         activeFixers -= 1;
-        respond(events, request, { kind: "text", text: "committed" });
+        respond(events, request, { kind: "text", text: "left verified changes for the supervisor" });
         return;
       }
       if (request.nodeId.includes(":re-review:")) {
@@ -467,6 +510,7 @@ test("bounded fixer groups run concurrently, re-review, and integrate serially",
   assert.equal(fixerRequests, 2);
   assert.equal(reReviewTasks.length, 2);
   assert.equal(reReviewTasks.every((task) => task.includes("Known sibling findings")), true);
+  assert.equal(reReviewTasks.every((task) => task.includes("Exact fixer diff:")), true);
   assert.equal(await readFile(join(repository, "a.txt"), "utf8"), "fixed a\n");
   assert.equal(await readFile(join(repository, "b.txt"), "utf8"), "fixed b\n");
 

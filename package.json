@@ -19,7 +19,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
-    "pi-herdr-subagents": "0.2.1-orkastrator.0",
+    "@earendil-works/pi-tui": "0.84.3",
+    "pi-herdr-subagents": "0.2.1-orkastrator.1",
     "pi-subagents": ">=0.59.0 <0.60.0"
   },
   "peerDependenciesMeta": {
@@ -42,8 +43,9 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-tui": "^0.84.3",
     "@types/node": "^22.20.1",
-    "pi-herdr-subagents": "git+https://github.com/brkastner/pi-herdr-subagents.git#242437a",
+    "pi-herdr-subagents": "git+https://github.com/brkastner/pi-herdr-subagents.git#1817e6d670110100fbdc67ef08a31316a3a05bf4",
     "pi-subagents": "^0.59.0",
     "typescript": "^7.0.2"
   },

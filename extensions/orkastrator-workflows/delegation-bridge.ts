@@ -16,6 +16,9 @@ import type {
   SubagentDelegationTerminalResponse,
 } from "pi-subagents/delegation";
 
+import { delegateWithHerdrBroker } from "./herdr-delegation-client.ts";
+import type { HerdrLaunchBinding } from "./herdr-launch.ts";
+
 type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type HerdrParams = Record<string, unknown>;
 type HerdrContext = Pick<ExtensionContext, "cwd" | "sessionManager" | "model" | "modelRegistry">;
@@ -31,8 +34,19 @@ type HerdrResult = {
   validationErrors?: string[];
 };
 
+export interface HerdrPanePlacement {
+  parentPaneId: string;
+  stackId: string;
+  firstDirection: "right" | "down";
+}
+
 interface HerdrDelegationApiV1 {
   readonly version: 1;
+  readonly capabilities: {
+    readonly panePlacement: true;
+    readonly resourceIsolation: true;
+    readonly writableRootSandbox: true;
+  };
   runSubagent(
     params: HerdrParams,
     ctx: HerdrContext,
@@ -40,6 +54,9 @@ interface HerdrDelegationApiV1 {
       signal: AbortSignal;
       parentThinking: ThinkingLevel;
       structuredOutput?: { schema: Record<string, unknown> };
+      placement?: HerdrPanePlacement;
+      isolateResources?: boolean;
+      sandboxRoot?: string;
     },
   ): Promise<HerdrResult>;
 }
@@ -57,6 +74,8 @@ export interface DelegationEvents {
 
 export interface DelegationSpec extends Omit<SubagentDelegationRequest, "requestId" | "result"> {
   result: { kind: "text" } | { kind: "structured"; schema: Record<string, unknown> };
+  herdrLaunch?: HerdrLaunchBinding;
+  panePlacement?: HerdrPanePlacement;
 }
 
 export type DelegationBackend = "pi-subagents" | "pi-herdr-subagents";
@@ -95,6 +114,19 @@ function inspectHerdrApi(): { available: boolean; error?: Error } {
   }
   if (typeof (api as { runSubagent?: unknown }).runSubagent !== "function") {
     return { available: false, error: new Error("Orkastrator requires the pi-herdr-subagents awaitable runSubagent capability") };
+  }
+  const capabilities = (api as { capabilities?: Record<string, unknown> }).capabilities;
+  if (
+    capabilities?.panePlacement !== true
+    || capabilities.resourceIsolation !== true
+    || capabilities.writableRootSandbox !== true
+  ) {
+    return {
+      available: false,
+      error: new Error(
+        "Orkastrator requires pi-herdr-subagents pane placement, resource isolation, and writable-root sandbox capabilities",
+      ),
+    };
   }
   return { available: true };
 }
@@ -154,7 +186,7 @@ export async function detectDelegationBackend(
   if (hasPiSubagents) return "pi-subagents";
   if (herdrMetadataPresent(tools)) {
     throw new Error(
-      "Orkastrator found pi-herdr-subagents tool metadata without the required delegation API; install version 0.2.1-orkastrator.0",
+      "Orkastrator found pi-herdr-subagents tool metadata without the required delegation API; install version 0.2.1-orkastrator.1",
     );
   }
   throw new Error("Orkastrator requires either pi-subagents or pi-herdr-subagents");
@@ -191,7 +223,8 @@ async function delegateWithEvents(
   spec: DelegationSpec,
   signal: AbortSignal,
 ): Promise<SubagentDelegationTerminalResponse> {
-  const request: SubagentDelegationRequest = { ...spec, requestId: randomUUID() };
+  const { herdrLaunch: _binding, panePlacement: _placement, ...eventSpec } = spec;
+  const request: SubagentDelegationRequest = { ...eventSpec, requestId: randomUUID() };
   return await new Promise<SubagentDelegationTerminalResponse>((resolve, reject) => {
     let settled = false;
     const finish = (outcome: { response: SubagentDelegationTerminalResponse } | { error: Error }): void => {
@@ -256,6 +289,9 @@ async function delegateWithHerdr(
     fork: spec.context === "fork",
     ...(spec.model ? { model: spec.model } : {}),
     ...(spec.thinking ? { thinking: spec.thinking === "off" ? "minimal" : spec.thinking } : {}),
+    tools: spec.agent === "reviewer"
+      ? "read,grep,find,ls"
+      : "read,bash,edit,write,grep,find,ls",
     interactive: false,
   };
   const result = await api.runSubagent(
@@ -267,6 +303,9 @@ async function delegateWithHerdr(
       ...(spec.result.kind === "structured"
         ? { structuredOutput: { schema: spec.result.schema } }
         : {}),
+      ...(spec.panePlacement === undefined ? {} : { placement: spec.panePlacement }),
+      isolateResources: true,
+      ...(spec.agent === "worker" ? { sandboxRoot: spec.cwd } : {}),
     },
   );
 
@@ -430,7 +469,7 @@ async function delegateWithPiSdk(
   }
 }
 
-/** Run one configured delegation leaf through the interactive bridge or a hosted-worker-safe Pi SDK child. */
+/** Run one configured delegation leaf through its bound interactive session or a hosted Pi SDK child. */
 export async function delegateSubagent(
   spec: DelegationSpec,
   signal: AbortSignal,
@@ -440,7 +479,12 @@ export async function delegateSubagent(
   ) => Promise<SubagentDelegationTerminalResponse> = delegateWithPiSdk,
 ): Promise<SubagentDelegationTerminalResponse> {
   const bridge = (globalThis as BridgeGlobal)[BRIDGE];
-  if (bridge === undefined) return await hostedRunner(spec, signal);
+  if (bridge === undefined) {
+    if (spec.herdrLaunch !== undefined) {
+      return await delegateWithHerdrBroker(spec, spec.herdrLaunch, signal);
+    }
+    return await hostedRunner(spec, signal);
+  }
   return bridge.backend === "pi-herdr-subagents"
     ? delegateWithHerdr(bridge, spec, signal)
     : delegateWithEvents(bridge, spec, signal);

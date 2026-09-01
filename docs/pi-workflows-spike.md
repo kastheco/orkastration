@@ -104,16 +104,29 @@ all still pass. Legacy and unmarked worktrees are never swept automatically.
 
 Install exactly one backend. `pi-subagents` uses correlated request, response,
 and cancellation events. The Herdr path uses the forked
-`pi-herdr-subagents` delegation API v1 and is pinned to commit
-`242437a7d2c6fbf76c8d9c23dce7b21f840d9d5d` until that API has an upstream
-release. Orkastrator detects backend capabilities without launching a child and
-fails closed when both or neither backend is available.
+`pi-herdr-subagents` delegation API v1 with additive pane placement and resource
+isolation options. Orkastrator detects backend capabilities without launching a
+child and fails closed when both or neither backend is available.
+
+An Orkastrator workflow started from Herdr receives a non-secret launch binding
+before the workflow tool executes. The interactive extension owns a user-private
+Unix socket broker and renders live workflow state through Pi's persistent widget
+area above the editor. The widget uses a theme-aware vertical outline: unary paths
+stay flat, branches indent, node types carry semantic colors, and queued state is
+implied rather than repeated. Hosted reviewers and fixers open in a right-hand
+worker column beside the originating Pi session, with concurrent workers stacked
+downward. The broker validates run ownership, applies tool and resource policy,
+propagates cancellation, and rejects stale or cross-run capabilities. Terminal
+runs collapse to a concise in-editor receipt. Headless and unbound runs retain the
+isolated Pi SDK fallback.
 
 ## Remaining limitations
 
-- The extension-to-extension delegation bridge is currently an interactive Pi
-  integration. Standalone `pi-workflows host` support requires a supported host
-  extension seam or generic public agent action.
+- The session broker pane-backs Orkastrator's explicit reviewer and fixer
+  leaves. Generic Pi Workflows `agent(...)` nodes remain hosted and headless.
+- Closing the originating Pi session cancels its active pane-backed children.
+  Durable workflow state remains available, but broker reattachment after a
+  session restart is not implemented.
 - Rejected-round reviewer evidence is not its own workflow node, so an
   interruption may repeat a reviewer call. Git effects are still observed and
   adopted idempotently.
