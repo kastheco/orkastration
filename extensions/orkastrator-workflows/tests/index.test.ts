@@ -126,6 +126,32 @@ test("the embedded workflow widget uses theme semantics and omits implied queued
   assert.equal(lines.some((line) => line.includes("↓")), true);
 });
 
+test("workflow widget survives unknown persisted run statuses", () => {
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const lines = renderWorkflowWidgetLines({
+    state: {
+      workflowName: "orkastrator-cook",
+      startedAt: "2026-09-01T01:54:00.000Z",
+      updatedAt: "2026-09-01T01:54:01.000Z",
+      status: "starting",
+      steps: [],
+    },
+    snapshot: {
+      startAt: "start",
+      nodes: { start: { nodeType: "compute" } },
+      edges: [],
+    },
+  } as never, 120, theme as never, new Date("2026-09-01T01:54:01.000Z"));
+
+  assert.match(lines[0]!, /starting/u);
+
+  const fallback = renderWorkflowWidgetLines({ state: {} } as never, 120, theme as never);
+  assert.match(fallback[0]!, /workflow display unavailable/u);
+});
+
 test("workflow branches render as a vertical outline with join references", () => {
   const snapshot = {
     startAt: "initial",

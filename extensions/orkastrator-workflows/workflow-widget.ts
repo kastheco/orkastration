@@ -25,6 +25,24 @@ export function renderWorkflowWidgetLines(
   theme: WidgetTheme,
   now = new Date(),
 ): string[] {
+  try {
+    return renderWorkflowWidgetLinesUnsafe(bundle, width, theme, now);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown rendering error";
+    return [truncateToWidth(
+      theme.fg("error", `✗ workflow display unavailable · ${sanitizeText(message)}`),
+      width,
+      "…",
+    )];
+  }
+}
+
+function renderWorkflowWidgetLinesUnsafe(
+  bundle: LoadedWorkflowRun,
+  width: number,
+  theme: WidgetTheme,
+  now: Date,
+): string[] {
   const state = bundle.state;
   const title = sanitizeText(state.runTitle ?? state.workflowName);
   if (isTerminalStatus(state.status)) {
@@ -33,9 +51,12 @@ export function renderWorkflowWidgetLines(
 
   const elapsed = formatDuration(Math.max(0, now.getTime() - Date.parse(state.startedAt)));
   const status = runStatus(state.status);
+  const unknownStatus = status.kind === "queued" && status.label !== undefined
+    ? ` · ${status.label}`
+    : "";
   const header = [
     `${paintStatusGlyph(status, theme)} ${theme.fg("accent", theme.bold(title))}`
-      + theme.fg("dim", `  ${elapsed} · ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}`),
+      + theme.fg("dim", `${unknownStatus}  ${elapsed} · ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}`),
   ];
   const outline = renderWorkflowOutline(bundle.snapshot, state, now, theme);
   return [...header, ...outline].map((line) => truncateToWidth(line, width, "…"));
@@ -185,7 +206,7 @@ function nodeStatus(
   return OUTCOMES[latest.outcome] ?? { glyph: "✗", kind: "failed", label: "failed" };
 }
 
-function runStatus(status: WorkflowRunState["status"]): OutlineStatus {
+function runStatus(status: unknown): OutlineStatus {
   const statuses: Record<WorkflowRunState["status"], OutlineStatus> = {
     completed: { glyph: "✓", kind: "complete", label: "complete" },
     failed: { glyph: "✗", kind: "failed", label: "failed" },
@@ -194,7 +215,16 @@ function runStatus(status: WorkflowRunState["status"]): OutlineStatus {
     running: { glyph: "◐", kind: "running", label: "running" },
     waiting: { glyph: "⏸", kind: "waiting", label: "waiting" },
   };
-  return statuses[status];
+  if (typeof status === "string" && status in statuses) {
+    return statuses[status as WorkflowRunState["status"]];
+  }
+  return {
+    glyph: "·",
+    kind: "queued",
+    label: typeof status === "string" && status.trim().length > 0
+      ? sanitizeText(status)
+      : "unknown",
+  };
 }
 
 function nodeElapsed(
