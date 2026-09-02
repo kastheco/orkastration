@@ -45,7 +45,7 @@ export type PlanChangeReady = {
   documents: string[];
   revision: number;
   approval: PlanApprovalResolution;
-  documentation: DocumentedPlan["documentation"];
+  documentation: { files: string[] };
 };
 
 export type PlanChangeBlocked = {
@@ -347,7 +347,7 @@ export const planChangeWorkflow = defineWorkflow({
           documents: documented.documentation.files,
           revision,
           approval: approval.resolution,
-          documentation: documented.documentation,
+          documentation: { files: documented.documentation.files },
         } satisfies PlanChangeReady;
       },
     }),

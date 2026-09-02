@@ -24,7 +24,9 @@ import {
   createImplementationWorktree,
   parseLifecycleInput,
   parseOwnerResolvedStatus,
+  parseRepositoryResolution,
   resolveReviewTarget,
+  verifyImplementationRepository,
   type WorktrunkRunner,
 } from "../lifecycle-runtime.ts";
 import { planReviewWaves } from "../review-wave.ts";
@@ -118,6 +120,56 @@ test("workflow definitions are valid and reject ambiguous input", () => {
   );
 });
 
+test("/kas:cook resolves UTM coordination roots from ticket and repository evidence", async () => {
+  const launchRepository = "/home/kas/dev/utmco";
+  const implementationRepository = "/home/kas/dev/utmco/pass";
+  const lifecycle = parseLifecycleInput({
+    task: "UTM-72 add the priority queue",
+    repository: launchRepository,
+  });
+  const resolution = parseRepositoryResolution({
+    status: "resolved",
+    repository: implementationRepository,
+    reason: "UTM-72 is labelled pass and the coordination map assigns the worker priority queue to pass only",
+    evidence: [
+      "Linear UTM-72 label: pass",
+      "AGENTS.md divergence catalog: android notification worker priority queue is pass only",
+    ],
+  }, launchRepository);
+
+  const resolveNode = (cookWorkflow as unknown as {
+    nodes: {
+      resolveRepository: {
+        prompt(context: unknown): string | Promise<string>;
+        validate(value: unknown, context: unknown): unknown | Promise<unknown>;
+      };
+    };
+  }).nodes.resolveRepository;
+  const prompt = await resolveNode.prompt({ input: lifecycle });
+  assert.match(prompt, /ticket labels, title prefixes, and explicit repository routing as primary evidence/u);
+  assert.match(prompt, /Do not select a sibling merely because related code exists there/u);
+  assert.deepEqual(await resolveNode.validate(resolution, { input: lifecycle }), resolution);
+
+  const planning = (cookWorkflow as unknown as {
+    includes: { planning: { input(context: unknown): unknown } };
+  }).includes.planning.input({
+    input: lifecycle,
+    outputs: { resolveRepository: resolution },
+  } as never) as { repository: string };
+  assert.equal(planning.repository, implementationRepository);
+
+  const createWorktree = (cookWorkflow as unknown as {
+    nodes: { createWorktree: { effect: { request(context: unknown): unknown } } };
+  }).nodes.createWorktree;
+  assert.deepEqual(createWorktree.effect.request({
+    state: { runId: "continuation-run" },
+    outputs: { resolveRepository: resolution },
+  } as never), {
+    repository: implementationRepository,
+    runId: "continuation-run",
+  });
+});
+
 test("Herdr launch bindings parse strictly and propagate into included review workflows", () => {
   const herdrLaunch = {
     version: 1 as const,
@@ -165,6 +217,7 @@ test("Herdr launch bindings parse strictly and propagate into included review wo
 
 test("implementation workflows create Worktrunk isolation at the required stage", () => {
   assert.equal(implementWorkflow.startAt, "createWorktree");
+  assert.equal(cookWorkflow.startAt, "resolveRepository");
   assert.deepEqual(implementWorkflow.edges.slice(0, 2), [
     { from: "createWorktree", to: "plan" },
     { from: "plan", to: "classifyPlan" },
@@ -181,6 +234,55 @@ test("implementation workflows create Worktrunk isolation at the required stage"
     cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "planning.ready" && edge.to === "implementation"),
     false,
   );
+});
+
+test("dirty coordination-root state does not block a worktree in the resolved child repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-coordination-"));
+  const coordination = join(root, "coordination");
+  const child = join(coordination, "pass");
+  const worktree = join(root, "implementation");
+  try {
+    await git(root, ["init", "--initial-branch=main", coordination]);
+    await git(coordination, ["config", "user.name", "Orkastrator Test"]);
+    await git(coordination, ["config", "user.email", "orkastrator@example.test"]);
+    await writeFile(join(coordination, ".gitignore"), "pass/\n", "utf8");
+    await git(coordination, ["add", ".gitignore"]);
+    await git(coordination, ["commit", "-m", "coordination"]);
+    await writeFile(join(coordination, "notes.md"), "dirty coordination notes\n", "utf8");
+
+    await git(coordination, ["init", "--initial-branch=main", child]);
+    await git(child, ["config", "user.name", "Orkastrator Test"]);
+    await git(child, ["config", "user.email", "orkastrator@example.test"]);
+    await writeFile(join(child, "queue.js"), "module.exports = [];\n", "utf8");
+    await git(child, ["add", "queue.js"]);
+    await git(child, ["commit", "-m", "child"]);
+
+    assert.deepEqual(
+      await verifyImplementationRepository(
+        child,
+        coordination,
+        new AbortController().signal,
+      ),
+      { repository: child },
+    );
+
+    const runner: WorktrunkRunner = async (source, args) => {
+      assert.equal(source, child);
+      const branch = args[args.indexOf("--create") + 1]!;
+      await git(source, ["worktree", "add", "-b", branch, worktree, "HEAD"]);
+      return JSON.stringify({ action: "created", branch, path: worktree });
+    };
+    const result = await createImplementationWorktree(
+      child,
+      "coordination-child-run",
+      new AbortController().signal,
+      runner,
+    );
+    assert.equal(result.repository, worktree);
+    assert.match(await git(coordination, ["status", "--short"]), /notes\.md/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("owner-resolved lifecycle status preserves partial acceptance and stop", () => {

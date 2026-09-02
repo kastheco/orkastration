@@ -84,7 +84,7 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 ```
 
 - `/kas` starts `orkastrator-implement.workflow.ts`. it immediately creates an isolated Worktrunk branch and worktree, then one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result there.
-- `/kas:cook` starts `orkastrator-cook.workflow.ts`. planning, canonical documentation, and required operator approval stay on the invoking checkout. once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree for implementation, verification, delivery, and the full orkastrator review policy.
+- `/kas:cook` starts `orkastrator-cook.workflow.ts`. It first resolves one implementation repository from ticket labels, repository routing documents, and code ownership evidence. Planning, canonical documentation, and required operator approval use that resolved repository. Once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree there for implementation, verification, delivery, and the full Orkastrator review policy. Ambiguous ownership stops before planning.
 - `/kas:check` starts `orkastrator-review.workflow.ts` against the repository's committed `HEAD`. it won't guess when the worktree is dirty.
 - `/kas:workflow` expands the attached workflow into a scrollable overlay. use `↑`/`↓` or `j`/`k`, jump with home/end, and close with `q` or escape.
 - `/kas:status [run-id]` reports the active workflow or the specified durable run.
@@ -140,7 +140,9 @@ historical run records show that a live fixture produced two disjoint fixer grou
 
 A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 65 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
 
-The session broker has a real separate-process Unix socket test for result delivery and cancellation. Herdr worker placement remains rooted in the originating session while workflow status stays inside Pi's own widget area. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
+The session broker has a real separate-process Unix socket test for result delivery, cancellation, and accepted continuation runs. Herdr worker placement remains rooted in the originating session while the widget follows the newest continuation through its terminal state. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
+
+After installing these changes, reload Pi before retrying `/kas:cook`. Start a new run instead of resuming a failed run created from an older workflow snapshot. Durable history remains available through `/kas:status <run-id>`.
 
 autoimplementation delivery currently happens before the orkastrator review stage. repair commits integrated during review aren't automatically republished or sent through a second ci and delivery pass.
 

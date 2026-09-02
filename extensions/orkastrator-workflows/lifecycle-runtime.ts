@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import type { AutoimplementCompleted } from "@osolmaz/pi-workflows/builtins";
@@ -20,6 +20,13 @@ export type OrkastratorLifecycleInput = {
   maxParallelFixers: number;
   worktreeRetentionDays: number;
   herdrLaunch?: HerdrLaunchBinding;
+};
+
+export type RepositoryResolution = {
+  status: "resolved" | "blocked";
+  repository?: string;
+  reason: string;
+  evidence: string[];
 };
 
 export type ImplementationWorktree = {
@@ -104,6 +111,76 @@ export function parseLifecycleInput(value: unknown): OrkastratorLifecycleInput {
     ),
     ...(herdrLaunch === undefined ? {} : { herdrLaunch }),
   };
+}
+
+export function parseRepositoryResolution(
+  value: unknown,
+  coordinationRepository: string,
+): RepositoryResolution {
+  const result = requireRecord(value, "repository resolution");
+  const unexpected = Object.keys(result).find(
+    (key) => !["status", "repository", "reason", "evidence"].includes(key),
+  );
+  if (unexpected !== undefined) {
+    throw new Error(`repository resolution has unknown field ${unexpected}`);
+  }
+  if (result.status !== "resolved" && result.status !== "blocked") {
+    throw new Error("repository resolution status must be resolved or blocked");
+  }
+  if (typeof result.reason !== "string" || result.reason.trim().length === 0) {
+    throw new Error("repository resolution reason must be non-empty text");
+  }
+  if (
+    !Array.isArray(result.evidence)
+    || result.evidence.length === 0
+    || result.evidence.length > 8
+    || result.evidence.some((item) => typeof item !== "string" || item.trim().length === 0 || item.length > 1_000)
+  ) {
+    throw new Error("repository resolution evidence must contain 1 to 8 bounded text items");
+  }
+  if (result.status === "blocked") {
+    if (result.repository !== undefined) {
+      throw new Error("blocked repository resolution must not select a repository");
+    }
+    return {
+      status: "blocked",
+      reason: result.reason.trim(),
+      evidence: result.evidence.map((item) => item.trim()),
+    };
+  }
+  if (typeof result.repository !== "string" || !isAbsolute(result.repository)) {
+    throw new Error("resolved repository must be an absolute path");
+  }
+  const root = resolve(coordinationRepository);
+  const repository = resolve(result.repository);
+  const child = relative(root, repository);
+  if (child.startsWith("..") || isAbsolute(child)) {
+    throw new Error("resolved repository must be the launch repository or one of its descendants");
+  }
+  return {
+    status: "resolved",
+    repository,
+    reason: result.reason.trim(),
+    evidence: result.evidence.map((item) => item.trim()),
+  };
+}
+
+export async function verifyImplementationRepository(
+  repository: string,
+  coordinationRepository: string,
+  signal: AbortSignal,
+): Promise<{ repository: string }> {
+  const coordinationRoot = await realpath(coordinationRepository);
+  const candidate = await realpath(repository);
+  const child = relative(coordinationRoot, candidate);
+  if (child.startsWith("..") || isAbsolute(child)) {
+    throw new Error("resolved repository escapes the launch repository");
+  }
+  const topLevel = await realpath(await git(candidate, ["rev-parse", "--show-toplevel"], signal));
+  if (topLevel !== candidate) {
+    throw new Error("resolved repository must name a Git worktree root");
+  }
+  return { repository: candidate };
 }
 
 export function parseOwnerResolvedStatus(value: unknown): OwnerResolvedStatus {

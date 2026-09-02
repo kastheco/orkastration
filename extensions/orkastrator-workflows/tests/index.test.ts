@@ -127,6 +127,164 @@ test("the embedded workflow widget uses theme semantics and omits implied queued
   assert.equal(lines.some((line) => line.includes("↓")), true);
 });
 
+test("active Orkastrator widget suppresses competing workflow and subagent UI", () => {
+  const widgets: Array<{ id: string; value: unknown }> = [];
+  const statuses: Array<{ id: string; value: unknown }> = [];
+  const ctx = {
+    ui: {
+      setWidget(id: string, value: unknown) {
+        widgets.push({ id, value });
+      },
+      setStatus(id: string, value: unknown) {
+        statuses.push({ id, value });
+      },
+    },
+  };
+  const bundle = {
+    state: {
+      workflowName: "orkastrator-review",
+      status: "running",
+      currentNode: "review",
+      steps: [],
+    },
+    snapshot: {
+      startAt: "review",
+      nodes: { review: { nodeType: "action" } },
+      edges: [],
+    },
+  };
+
+  __indexTest__.setAttachedWorkflowWidget(ctx as never, bundle as never);
+
+  assert.deepEqual(widgets.slice(0, -1), [
+    { id: "pi-workflows", value: undefined },
+    { id: "subagent-status", value: undefined },
+    { id: "subagent-async", value: undefined },
+    { id: "subagent-fleet-status", value: undefined },
+  ]);
+  assert.equal(widgets.at(-1)?.id, "orkastrator-workflow");
+  assert.deepEqual(statuses, [{ id: "pi-workflows", value: undefined }]);
+});
+
+test("the UI guard rejects competing widgets until suppression ends", () => {
+  const calls: string[] = [];
+  const ui = {
+    setWidget(id: string, value: unknown) {
+      calls.push(`widget:${id}:${value === undefined ? "clear" : "show"}`);
+    },
+    setStatus(id: string, value: unknown) {
+      calls.push(`status:${id}:${value === undefined ? "clear" : "show"}`);
+    },
+  };
+  const uninstall = __indexTest__.installCompetingUiGuard({ ui } as never);
+  __indexTest__.suppressCompetingWorkflowUi(true);
+  ui.setWidget("subagent-status", ["worker"]);
+  ui.setWidget("pi-workflows", ["workflow"]);
+  ui.setStatus("pi-workflows", "running");
+  ui.setWidget("unrelated", ["keep"]);
+  ui.setWidget("subagent-status", undefined);
+  __indexTest__.suppressCompetingWorkflowUi(false);
+  ui.setWidget("subagent-status", ["restored"]);
+  uninstall();
+
+  assert.deepEqual(calls, [
+    "widget:unrelated:show",
+    "widget:subagent-status:clear",
+    "widget:subagent-status:show",
+  ]);
+});
+
+test("accepted plan approval follows a successful continuation", () => {
+  const continuations = new Map([
+    ["parent-run", "continuation-run"],
+  ]);
+  const chain = __indexTest__.workflowContinuationChain(
+    "parent-run",
+    (runId) => continuations.get(runId),
+  );
+  assert.deepEqual(chain, ["continuation-run"]);
+
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const lines = renderWorkflowWidgetLines({
+    state: {
+      runId: chain.at(-1),
+      workflowName: "orkastrator-cook",
+      startedAt: "2026-09-01T03:31:21.153Z",
+      updatedAt: "2026-09-01T03:31:22.600Z",
+      finishedAt: "2026-09-01T03:31:22.587Z",
+      status: "completed",
+      output: { status: "completed" },
+      steps: [],
+    },
+    snapshot: {
+      startAt: "completed",
+      nodes: { completed: { nodeType: "compute" } },
+      edges: [],
+    },
+  } as never, 120, theme as never);
+  assert.match(lines[0]!, /complete/u);
+});
+
+test("an older launch continuation cannot replace the selected workflow widget", () => {
+  assert.equal(
+    __indexTest__.workflowWidgetRunAfterContinuation(
+      "newer-launch",
+      "older-launch",
+      "newer-run",
+      "older-continuation",
+    ),
+    "newer-run",
+  );
+  assert.equal(
+    __indexTest__.workflowWidgetRunAfterContinuation(
+      "newer-launch",
+      "newer-launch",
+      "newer-run",
+      "newer-continuation",
+    ),
+    "newer-continuation",
+  );
+});
+
+test("failed continuation replaces the parent waiting state in the widget", () => {
+  const continuations = new Map([
+    ["parent-run", "continuation-run"],
+  ]);
+  const followed = __indexTest__.workflowContinuationChain(
+    "parent-run",
+    (runId) => continuations.get(runId),
+  ).at(-1);
+  assert.equal(followed, "continuation-run");
+
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const lines = renderWorkflowWidgetLines({
+    state: {
+      runId: followed,
+      workflowName: "orkastrator-cook",
+      startedAt: "2026-09-01T03:31:21.153Z",
+      updatedAt: "2026-09-01T03:31:22.600Z",
+      finishedAt: "2026-09-01T03:31:22.587Z",
+      status: "failed",
+      error: "Worktrunk source repository must be clean",
+      steps: [],
+    },
+    snapshot: {
+      startAt: "createWorktree",
+      nodes: { createWorktree: { nodeType: "action" } },
+      edges: [],
+    },
+  } as never, 120, theme as never);
+
+  assert.match(lines[0]!, /failed/u);
+  assert.equal(lines.some((line) => line.includes("Worktrunk source repository must be clean")), true);
+});
+
 test("workflow widget survives unknown persisted run statuses", () => {
   const theme = {
     bold: (text: string) => text,
@@ -198,6 +356,40 @@ test("workflow widget bounds large composed graphs around the active node", () =
       edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
     },
   } as never, 160, theme as never).length, 21);
+});
+
+test("workflow widget keeps its viewport until the active node leaves it", () => {
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const nodeIds = Array.from({ length: 12 }, (_, index) => `node-${index}`);
+  const snapshot = {
+    startAt: nodeIds[0],
+    nodes: Object.fromEntries(nodeIds.map((nodeId) => [nodeId, { nodeType: "compute" }])),
+    edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
+  };
+  const viewport: { start?: number } = {};
+  const renderAt = (currentNode: string) => renderWorkflowWidgetLines({
+    state: {
+      workflowName: "orkastrator-review",
+      startedAt: "2026-09-01T01:54:00.000Z",
+      updatedAt: "2026-09-01T01:54:05.000Z",
+      status: "running",
+      currentNode,
+      currentNodeStartedAt: "2026-09-01T01:54:04.000Z",
+      steps: [],
+    },
+    snapshot,
+  } as never, 160, theme as never, new Date("2026-09-01T01:54:05.000Z"), viewport);
+
+  renderAt("node-4");
+  assert.equal(viewport.start, 2);
+  const sameWindow = renderAt("node-5");
+  assert.equal(viewport.start, 2);
+  assert.equal(sameWindow.some((line) => line.includes("node-2")), true);
+  renderAt("node-7");
+  assert.equal(viewport.start, 3);
 });
 
 test("workflow branches render as a vertical outline with join references", () => {

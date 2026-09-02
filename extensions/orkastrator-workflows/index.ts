@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import {
+  readWorkflowContinuationRunId,
   readWorkflowRun,
   type WorkflowRunState,
 } from "@osolmaz/pi-workflows";
@@ -14,6 +15,7 @@ import { currentHerdrPaneId } from "./herdr-session-pane.ts";
 import {
   renderWorkflowDetailLines,
   renderWorkflowWidgetLines,
+  type WorkflowWidgetViewport,
 } from "./workflow-widget.ts";
 
 const IMPLEMENT_WORKFLOW_PATH = fileURLToPath(
@@ -36,6 +38,45 @@ type PendingLaunch = {
 };
 
 const WORKFLOW_WIDGET_ID = "orkastrator-workflow";
+const WORKFLOW_UI_SUPPRESSION = Symbol.for("orkastrator/workflow-ui-suppression");
+
+function suppressCompetingWorkflowUi(active: boolean): void {
+  (globalThis as Record<PropertyKey, unknown>)[WORKFLOW_UI_SUPPRESSION] = active;
+}
+
+function installCompetingUiGuard(ctx: Pick<ExtensionContext, "ui">): () => void {
+  type MutableUi = {
+    setWidget: (...args: unknown[]) => void;
+    setStatus: (...args: unknown[]) => void;
+  };
+  const ui = ctx.ui as unknown as MutableUi;
+  const originalSetWidget = ui.setWidget.bind(ctx.ui);
+  const originalSetStatus = ui.setStatus.bind(ctx.ui);
+  const guardedSetWidget = (...args: unknown[]): void => {
+    const [id, content] = args;
+    if (
+      (globalThis as Record<PropertyKey, unknown>)[WORKFLOW_UI_SUPPRESSION] === true
+      && COMPETING_WIDGET_IDS.includes(id as typeof COMPETING_WIDGET_IDS[number])
+      && content !== undefined
+    ) return;
+    originalSetWidget(...args);
+  };
+  const guardedSetStatus = (...args: unknown[]): void => {
+    const [id, text] = args;
+    if (
+      (globalThis as Record<PropertyKey, unknown>)[WORKFLOW_UI_SUPPRESSION] === true
+      && id === "pi-workflows"
+      && text !== undefined
+    ) return;
+    originalSetStatus(...args);
+  };
+  ui.setWidget = guardedSetWidget;
+  ui.setStatus = guardedSetStatus;
+  return () => {
+    if (ui.setWidget === guardedSetWidget) ui.setWidget = originalSetWidget;
+    if (ui.setStatus === guardedSetStatus) ui.setStatus = originalSetStatus;
+  };
+}
 
 function lifecyclePrompt(
   command: "/kas" | "/kas:cook",
@@ -131,11 +172,64 @@ const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowRunState["status"]>([
   "cancelled",
 ]);
 
+const COMPETING_WIDGET_IDS = [
+  "pi-workflows",
+  "subagent-status",
+  "subagent-async",
+  "subagent-fleet-status",
+] as const;
+
+type AttachedWorkflowBundle = NonNullable<ReturnType<typeof readWorkflowRun>>;
+
+function clearCompetingWorkflowUi(ctx: Pick<ExtensionContext, "ui">): void {
+  for (const widgetId of COMPETING_WIDGET_IDS) ctx.ui.setWidget(widgetId, undefined);
+  ctx.ui.setStatus("pi-workflows", undefined);
+}
+
+function setAttachedWorkflowWidget(
+  ctx: Pick<ExtensionContext, "ui">,
+  bundle: AttachedWorkflowBundle,
+  viewport?: WorkflowWidgetViewport,
+): void {
+  if (!TERMINAL_WORKFLOW_STATUSES.has(bundle.state.status)) clearCompetingWorkflowUi(ctx);
+  ctx.ui.setWidget(WORKFLOW_WIDGET_ID, (_tui, theme) => ({
+    render: (width) => renderWorkflowWidgetLines(bundle, width, theme, new Date(), viewport),
+    invalidate() {},
+  }));
+}
+
+function workflowWidgetRunAfterContinuation(
+  selectedLaunchId: string | undefined,
+  continuingLaunchId: string,
+  currentRunId: string | undefined,
+  continuationRunId: string,
+): string | undefined {
+  return selectedLaunchId === continuingLaunchId ? continuationRunId : currentRunId;
+}
+
+function workflowContinuationChain(
+  runId: string,
+  continuationFor: (parentRunId: string) => string | undefined = readWorkflowContinuationRunId,
+): string[] {
+  const chain: string[] = [];
+  const seen = new Set([runId]);
+  let parentRunId = runId;
+  for (let depth = 0; depth < 100; depth += 1) {
+    const continuationRunId = continuationFor(parentRunId);
+    if (continuationRunId === undefined || seen.has(continuationRunId)) break;
+    chain.push(continuationRunId);
+    seen.add(continuationRunId);
+    parentRunId = continuationRunId;
+  }
+  return chain;
+}
+
 export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
   const owner = {};
   let currentContext: ExtensionContext | undefined;
   let currentBackend: Awaited<ReturnType<typeof detectDelegationBackend>> | undefined;
   let uninstall: (() => void) | undefined;
+  let uninstallUiGuard: (() => void) | undefined;
   let broker: SessionDelegationBroker | undefined;
   let lifecycleGeneration = 0;
   const pendingByToolCall = new Map<string, PendingLaunch>();
@@ -143,6 +237,8 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
   const activeLaunches = new Set<string>();
   const runWatchers = new Map<string, NodeJS.Timeout>();
   let widgetRunId: string | undefined;
+  let widgetLaunchId: string | undefined;
+  let widgetViewport: WorkflowWidgetViewport = {};
 
   const stopWatchingRun = (launchId: string): void => {
     const timer = runWatchers.get(launchId);
@@ -159,24 +255,39 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     }
     if (bundle === null) return undefined;
     if (widgetRunId !== runId || currentContext === undefined) return bundle.state;
-    currentContext.ui.setWidget(WORKFLOW_WIDGET_ID, (_tui, theme) => ({
-      render: (width) => renderWorkflowWidgetLines(bundle, width, theme),
-      invalidate() {},
-    }));
+    setAttachedWorkflowWidget(currentContext, bundle, widgetViewport);
     return bundle.state;
   };
 
   const releaseLaunch = async (launchId: string): Promise<void> => {
     stopWatchingRun(launchId);
     activeLaunches.delete(launchId);
+    if (activeLaunches.size === 0) suppressCompetingWorkflowUi(false);
     await broker?.releaseLaunch(launchId);
   };
 
   const watchRun = (launchId: string, runId: string): void => {
     stopWatchingRun(launchId);
+    let displayedRunId = runId;
     const poll = (): void => {
       if (!activeLaunches.has(launchId)) return;
-      const state = updateWorkflowWidget(runId);
+      let continuationRunIds: string[] = [];
+      try {
+        continuationRunIds = workflowContinuationChain(displayedRunId);
+      } catch {
+        // The durable store may be briefly unavailable while the continuation commits.
+      }
+      for (const continuationRunId of continuationRunIds) {
+        broker?.bindContinuation(launchId, displayedRunId, continuationRunId);
+        displayedRunId = continuationRunId;
+        widgetRunId = workflowWidgetRunAfterContinuation(
+          widgetLaunchId,
+          launchId,
+          widgetRunId,
+          continuationRunId,
+        );
+      }
+      const state = updateWorkflowWidget(displayedRunId);
       if (state !== undefined && TERMINAL_WORKFLOW_STATUSES.has(state.status)) {
         runWatchers.delete(launchId);
         void releaseLaunch(launchId);
@@ -196,6 +307,9 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     pendingByToolCall.clear();
     pendingCancelToolCalls.clear();
     widgetRunId = undefined;
+    widgetLaunchId = undefined;
+    widgetViewport = {};
+    suppressCompetingWorkflowUi(false);
     currentContext?.ui.setWidget(WORKFLOW_WIDGET_ID, undefined);
     const activeBroker = broker;
     broker = undefined;
@@ -207,6 +321,8 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     currentContext?.ui.setWidget(WORKFLOW_WIDGET_ID, undefined);
     currentContext = undefined;
     currentBackend = undefined;
+    uninstallUiGuard?.();
+    uninstallUiGuard = undefined;
     uninstall?.();
     uninstall = undefined;
     await shutdownBroker();
@@ -220,6 +336,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     if (generation !== lifecycleGeneration) return;
     currentContext = ctx;
     currentBackend = detected;
+    uninstallUiGuard = installCompetingUiGuard(ctx);
     uninstall = installDelegationBridge(pi.events, owner, {
       backend: detected,
       getContext: () => currentContext,
@@ -227,6 +344,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     if (detected === "pi-herdr-subagents") {
       const nextBroker = new SessionDelegationBroker({
         sessionId: ctx.sessionManager.getSessionId(),
+        continuationRunIds: workflowContinuationChain,
       });
       await nextBroker.start();
       if (generation !== lifecycleGeneration) {
@@ -263,6 +381,8 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
       start.workflowInput.herdrLaunch = binding;
       pendingByToolCall.set(event.toolCallId, { binding });
       activeLaunches.add(binding.launchId);
+      suppressCompetingWorkflowUi(true);
+      clearCompetingWorkflowUi(ctx);
     } catch (error) {
       if (binding !== undefined) await broker.releaseLaunch(binding.launchId);
       return {
@@ -293,7 +413,9 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     }
     try {
       broker.bindRun(pending.binding.launchId, runId);
+      widgetLaunchId = pending.binding.launchId;
       widgetRunId = runId;
+      widgetViewport = {};
       updateWorkflowWidget(runId);
       watchRun(pending.binding.launchId, runId);
     } catch (error) {
@@ -415,6 +537,8 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     currentContext?.ui.setWidget(WORKFLOW_WIDGET_ID, undefined);
     currentContext = undefined;
     currentBackend = undefined;
+    uninstallUiGuard?.();
+    uninstallUiGuard = undefined;
     uninstall?.();
     uninstall = undefined;
     await shutdownBroker();
@@ -426,6 +550,12 @@ export const __indexTest__ = {
   workflowResultRunId,
   acceptedCancellationRunId,
   workflowManagementPrompt,
+  workflowContinuationChain,
+  workflowWidgetRunAfterContinuation,
+  setAttachedWorkflowWidget,
+  clearCompetingWorkflowUi,
+  suppressCompetingWorkflowUi,
+  installCompetingUiGuard,
   workflowPaths: ORKASTRATOR_WORKFLOWS,
 };
 
