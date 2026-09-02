@@ -96,7 +96,7 @@ test("completed workflow receipts replace raw output with a concise terminal sta
 
 });
 
-test("the embedded workflow widget uses theme semantics and omits implied queued labels", () => {
+test("the embedded workflow widget labels only agent nodes and omits implied queued labels", () => {
   const theme = {
     bold: (text: string) => `<bold>${text}</bold>`,
     fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
@@ -107,24 +107,32 @@ test("the embedded workflow widget uses theme semantics and omits implied queued
       startedAt: "2026-08-31T22:54:03.000Z",
       updatedAt: "2026-08-31T22:54:04.000Z",
       status: "running",
-      currentNode: "review",
+      currentNode: "reviewer",
       currentNodeStartedAt: "2026-08-31T22:54:03.000Z",
-      steps: [],
+      steps: [
+        { nodeId: "review", outcome: "ok" },
+        { nodeId: "classify", outcome: "ok" },
+      ],
     },
     snapshot: {
       startAt: "review",
       nodes: {
         review: { nodeType: "action" },
         classify: { nodeType: "compute" },
+        reviewer: { nodeType: "agent" },
       },
-      edges: [{ from: "review", to: "classify" }],
+      edges: [
+        { from: "review", to: "classify" },
+        { from: "classify", to: "reviewer" },
+      ],
     },
   } as never, 240, theme as never, new Date("2026-08-31T22:54:04.000Z"));
 
-  assert.equal(lines.some((line) => line.includes("<warning>action</warning>")), true);
-  assert.equal(lines.some((line) => line.includes("<syntaxFunction>compute</syntaxFunction>")), true);
+  assert.equal(lines.some((line) => line.includes("action")), false);
+  assert.equal(lines.some((line) => line.includes("compute")), false);
+  assert.equal(lines.some((line) => line.includes("<success>agent</success>")), true);
   assert.equal(lines.some((line) => line.includes("queued")), false);
-  assert.equal(lines.some((line) => line.includes("↓")), true);
+  assert.equal(lines.some((line) => line.includes("↓")), false);
 });
 
 test("active Orkastrator widget suppresses competing workflow and subagent UI", () => {
@@ -311,13 +319,13 @@ test("workflow widget survives unknown persisted run statuses", () => {
   assert.match(fallback[0]!, /workflow display unavailable/u);
 });
 
-test("workflow widget bounds large composed graphs around the active node", () => {
+test("workflow widget shows only start, latest completion, current node, and summary counts", () => {
   const theme = {
     bold: (text: string) => text,
     fg: (_color: string, text: string) => text,
   };
   const nodeIds = Array.from({ length: 20 }, (_, index) => `node-${index}`);
-  const lines = renderWorkflowWidgetLines({
+  const bundle = {
     state: {
       workflowName: "orkastrator-cook",
       startedAt: "2026-09-01T01:54:00.000Z",
@@ -337,59 +345,61 @@ test("workflow widget bounds large composed graphs around the active node", () =
       nodes: Object.fromEntries(nodeIds.map((nodeId) => [nodeId, { nodeType: "compute" }])),
       edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
     },
-  } as never, 160, theme as never, new Date("2026-09-01T01:54:05.000Z"));
+  } as never;
+  const lines = renderWorkflowWidgetLines(
+    bundle,
+    160,
+    theme as never,
+    new Date("2026-09-01T01:54:05.000Z"),
+  );
 
-  assert.equal(lines.length, 8);
+  assert.equal(lines.length, 6);
+  assert.equal(lines.some((line) => line.includes("node-0")), true);
+  assert.equal(lines.some((line) => line.includes("node-9")), true);
   assert.equal(lines.some((line) => line.includes("node-10")), true);
-  assert.equal(lines.some((line) => /↑ 8 earlier nodes/u.test(line)), true);
-  assert.equal(lines.some((line) => /↓ 7 later nodes · \/kas:workflow/u.test(line)), true);
-  assert.equal(renderWorkflowDetailLines({
+  assert.equal(lines.some((line) => line.includes("node-8")), false);
+  assert.equal(lines.some((line) => /↑ 8 completed nodes/u.test(line)), true);
+  assert.equal(lines.some((line) => /↓ 9 later nodes · \/kas:workflow/u.test(line)), true);
+  assert.equal(renderWorkflowDetailLines(bundle, 160, theme as never).length, 21);
+});
+
+test("workflow widget collapses completed intermediary nodes inside nested workflows", () => {
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const nodeIds = [
+    "resolveRepository",
+    "planning/start",
+    "planning/design",
+    "planning/documentation",
+    "planning/approval",
+    "createWorktree",
+    "implementation/start",
+  ];
+  const lines = renderWorkflowWidgetLines({
     state: {
       workflowName: "orkastrator-cook",
+      startedAt: "2026-09-01T01:54:00.000Z",
       updatedAt: "2026-09-01T01:54:05.000Z",
       status: "running",
-      steps: [],
+      currentNode: "createWorktree",
+      currentNodeStartedAt: "2026-09-01T01:54:04.000Z",
+      steps: nodeIds.slice(0, 5).map((nodeId) => ({ nodeId, outcome: "ok" })),
     },
     snapshot: {
       startAt: nodeIds[0],
       nodes: Object.fromEntries(nodeIds.map((nodeId) => [nodeId, { nodeType: "compute" }])),
       edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
     },
-  } as never, 160, theme as never).length, 21);
-});
+  } as never, 160, theme as never, new Date("2026-09-01T01:54:05.000Z"));
 
-test("workflow widget keeps its viewport until the active node leaves it", () => {
-  const theme = {
-    bold: (text: string) => text,
-    fg: (_color: string, text: string) => text,
-  };
-  const nodeIds = Array.from({ length: 12 }, (_, index) => `node-${index}`);
-  const snapshot = {
-    startAt: nodeIds[0],
-    nodes: Object.fromEntries(nodeIds.map((nodeId) => [nodeId, { nodeType: "compute" }])),
-    edges: nodeIds.slice(1).map((nodeId, index) => ({ from: nodeIds[index], to: nodeId })),
-  };
-  const viewport: { start?: number } = {};
-  const renderAt = (currentNode: string) => renderWorkflowWidgetLines({
-    state: {
-      workflowName: "orkastrator-review",
-      startedAt: "2026-09-01T01:54:00.000Z",
-      updatedAt: "2026-09-01T01:54:05.000Z",
-      status: "running",
-      currentNode,
-      currentNodeStartedAt: "2026-09-01T01:54:04.000Z",
-      steps: [],
-    },
-    snapshot,
-  } as never, 160, theme as never, new Date("2026-09-01T01:54:05.000Z"), viewport);
-
-  renderAt("node-4");
-  assert.equal(viewport.start, 2);
-  const sameWindow = renderAt("node-5");
-  assert.equal(viewport.start, 2);
-  assert.equal(sameWindow.some((line) => line.includes("node-2")), true);
-  renderAt("node-7");
-  assert.equal(viewport.start, 3);
+  assert.equal(lines.some((line) => line.includes("resolveRepository")), true);
+  assert.equal(lines.some((line) => line.includes("planning/approval")), true);
+  assert.equal(lines.some((line) => line.includes("createWorktree")), true);
+  assert.equal(lines.some((line) => line.includes("planning/design")), false);
+  assert.equal(lines.some((line) => /↑ 3 completed nodes/u.test(line)), true);
+  assert.equal(lines.some((line) => /↓ 1 later node · \/kas:workflow/u.test(line)), true);
 });
 
 test("workflow branches render as a vertical outline with join references", () => {
@@ -420,11 +430,11 @@ test("workflow branches render as a vertical outline with join references", () =
   } as never;
 
   assert.deepEqual(renderWorkflowOutline(snapshot, state, new Date("2026-08-31T22:54:04.000Z")), [
-    "· initial  action",
-    "↓ ◐ start  compute · running · 1s · waiting for route",
-    "├─ accept → · accepted  compute",
-    "│  ↓ · resolved  compute",
-    "└─ stop → · stopped  compute",
+    "· initial",
+    "↓ ◐ start · running · 1s · waiting for route",
+    "├─ accept → · accepted",
+    "│  ↓ · resolved",
+    "└─ stop → · stopped",
     "   ↓ ↳ resolved",
   ]);
 });

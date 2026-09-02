@@ -11,20 +11,25 @@
   </tr>
 </table>
 
-orkastrator is an opinionated software delivery policy and workflow suite for pi. it covers planning, implementation, review, and bounded repair. it doesn't own the workflow engine, process manager, ledger, or recovery system underneath those flows.
+orkastrator is an opinionated software delivery policy and workflow suite for pi. it covers planning, implementation, review, and bounded repair. it ships and loads a pinned [`@osolmaz/pi-workflows`](https://www.npmjs.com/package/@osolmaz/pi-workflows) engine so its workflow protocol and protected decision UI stay on one compatible copy.
 
-- [`@osolmaz/pi-workflows`](https://www.npmjs.com/package/@osolmaz/pi-workflows) owns durable runs, checkpoints, recovery, and workflow state.
+- `@osolmaz/pi-workflows` owns durable runs, checkpoints, recovery, and workflow state.
 - [`pi-subagents`](https://www.npmjs.com/package/pi-subagents) or [`pi-herdr-subagents`](https://github.com/brkastner/pi-herdr-subagents) runs reviewers and scoped fixers.
 - orkastrator supplies the delivery workflows and policy: planning and implementation composition, immutable findings, bounded write authority, parallel repair groups, scoped re-review, serial integration, and owner gates.
 
 ## install and run
 
-install pi workflows, orkastrator, and exactly one subagent backend:
+install orkastrator and exactly one subagent backend:
 
 ```bash
-pi install npm:@osolmaz/pi-workflows
 pi install npm:pi-subagents
 pi install git:github.com/kastheco/orkastrator
+```
+
+orkastrator loads its pinned workflow engine itself. don't install `@osolmaz/pi-workflows` as a separate pi package: duplicate workflow extensions would compete for the same commands and decision requests. remove an older standalone installation before starting pi again:
+
+```bash
+pi remove npm:@osolmaz/pi-workflows
 ```
 
 to use herdr instead, replace the `pi-subagents` line with the forked runner while it awaits an upstream release:

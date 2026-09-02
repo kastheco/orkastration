@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
@@ -23,8 +23,6 @@ function dependencyRoot(entry, packageName) {
   }
 }
 
-const workflowsRoot = dependencyRoot("@osolmaz/pi-workflows", "@osolmaz/pi-workflows");
-const installRoot = dirname(dirname(dirname(workflowsRoot)));
 const patchPackageRoot = dependencyRoot("patch-package", "patch-package");
 const patchPackageManifest = JSON.parse(
   readFileSync(join(patchPackageRoot, "package.json"), "utf8"),
@@ -34,11 +32,32 @@ const bin = typeof patchPackageManifest.bin === "string"
   : patchPackageManifest.bin["patch-package"];
 if (typeof bin !== "string") throw new Error("patch-package executable is unavailable");
 
-const patchDirectory = relative(installRoot, patches);
-const result = spawnSync(
-  process.execPath,
-  [join(patchPackageRoot, bin), "--patch-dir", patchDirectory, "--error-on-fail"],
-  { cwd: installRoot, stdio: "inherit" },
+function applyDependencyPatch(entry, packageName, patchName) {
+  const root = dependencyRoot(entry, packageName);
+  const installRoot = dirname(dirname(dirname(root)));
+  const temporaryPatches = mkdtempSync(join(installRoot, ".orkastrator-patches-"));
+  try {
+    copyFileSync(join(patches, patchName), join(temporaryPatches, patchName));
+    const patchDirectory = relative(installRoot, temporaryPatches);
+    const result = spawnSync(
+      process.execPath,
+      [join(patchPackageRoot, bin), "--patch-dir", patchDirectory, "--error-on-fail"],
+      { cwd: installRoot, stdio: "inherit" },
+    );
+    if (result.error !== undefined) throw result.error;
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  } finally {
+    rmSync(temporaryPatches, { recursive: true, force: true });
+  }
+}
+
+applyDependencyPatch(
+  "@osolmaz/pi-workflows",
+  "@osolmaz/pi-workflows",
+  "@osolmaz+pi-workflows+0.15.3.patch",
 );
-if (result.error !== undefined) throw result.error;
-if (result.status !== 0) process.exit(result.status ?? 1);
+applyDependencyPatch(
+  "@juicesharp/rpiv-ask-user-question",
+  "@juicesharp/rpiv-ask-user-question",
+  "@juicesharp+rpiv-ask-user-question+2.9.0.patch",
+);

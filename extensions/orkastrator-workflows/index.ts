@@ -2,12 +2,14 @@ import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
+import piWorkflows from "@osolmaz/pi-workflows/extension";
 import {
   readWorkflowContinuationRunId,
   readWorkflowRun,
   type WorkflowRunState,
 } from "@osolmaz/pi-workflows";
 
+import { WorkflowDecisionQuestionnaire } from "./decision-questionnaire.ts";
 import { detectDelegationBackend, installDelegationBridge } from "./delegation-bridge.ts";
 import { SessionDelegationBroker } from "./herdr-delegation-broker.ts";
 import type { HerdrLaunchBinding } from "./herdr-launch.ts";
@@ -15,7 +17,6 @@ import { currentHerdrPaneId } from "./herdr-session-pane.ts";
 import {
   renderWorkflowDetailLines,
   renderWorkflowWidgetLines,
-  type WorkflowWidgetViewport,
 } from "./workflow-widget.ts";
 
 const IMPLEMENT_WORKFLOW_PATH = fileURLToPath(
@@ -189,11 +190,10 @@ function clearCompetingWorkflowUi(ctx: Pick<ExtensionContext, "ui">): void {
 function setAttachedWorkflowWidget(
   ctx: Pick<ExtensionContext, "ui">,
   bundle: AttachedWorkflowBundle,
-  viewport?: WorkflowWidgetViewport,
 ): void {
   if (!TERMINAL_WORKFLOW_STATUSES.has(bundle.state.status)) clearCompetingWorkflowUi(ctx);
   ctx.ui.setWidget(WORKFLOW_WIDGET_ID, (_tui, theme) => ({
-    render: (width) => renderWorkflowWidgetLines(bundle, width, theme, new Date(), viewport),
+    render: (width) => renderWorkflowWidgetLines(bundle, width, theme),
     invalidate() {},
   }));
 }
@@ -226,6 +226,7 @@ function workflowContinuationChain(
 
 export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
   const owner = {};
+  const decisionQuestionnaire = new WorkflowDecisionQuestionnaire(pi);
   let currentContext: ExtensionContext | undefined;
   let currentBackend: Awaited<ReturnType<typeof detectDelegationBackend>> | undefined;
   let uninstall: (() => void) | undefined;
@@ -238,7 +239,6 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
   const runWatchers = new Map<string, NodeJS.Timeout>();
   let widgetRunId: string | undefined;
   let widgetLaunchId: string | undefined;
-  let widgetViewport: WorkflowWidgetViewport = {};
 
   const stopWatchingRun = (launchId: string): void => {
     const timer = runWatchers.get(launchId);
@@ -255,7 +255,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     }
     if (bundle === null) return undefined;
     if (widgetRunId !== runId || currentContext === undefined) return bundle.state;
-    setAttachedWorkflowWidget(currentContext, bundle, widgetViewport);
+    setAttachedWorkflowWidget(currentContext, bundle);
     return bundle.state;
   };
 
@@ -308,7 +308,6 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     pendingCancelToolCalls.clear();
     widgetRunId = undefined;
     widgetLaunchId = undefined;
-    widgetViewport = {};
     suppressCompetingWorkflowUi(false);
     currentContext?.ui.setWidget(WORKFLOW_WIDGET_ID, undefined);
     const activeBroker = broker;
@@ -336,6 +335,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     if (generation !== lifecycleGeneration) return;
     currentContext = ctx;
     currentBackend = detected;
+    decisionQuestionnaire.start(ctx);
     uninstallUiGuard = installCompetingUiGuard(ctx);
     uninstall = installDelegationBridge(pi.events, owner, {
       backend: detected,
@@ -415,7 +415,6 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
       broker.bindRun(pending.binding.launchId, runId);
       widgetLaunchId = pending.binding.launchId;
       widgetRunId = runId;
-      widgetViewport = {};
       updateWorkflowWidget(runId);
       watchRun(pending.binding.launchId, runId);
     } catch (error) {
@@ -534,6 +533,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     lifecycleGeneration += 1;
+    decisionQuestionnaire.stop();
     currentContext?.ui.setWidget(WORKFLOW_WIDGET_ID, undefined);
     currentContext = undefined;
     currentBackend = undefined;
@@ -559,4 +559,7 @@ export const __indexTest__ = {
   workflowPaths: ORKASTRATOR_WORKFLOWS,
 };
 
-export default installOrkastratorWorkflows;
+export default function orkastrator(pi: ExtensionAPI): void {
+  piWorkflows(pi);
+  installOrkastratorWorkflows(pi);
+}

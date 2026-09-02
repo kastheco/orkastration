@@ -1,3 +1,150 @@
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts b/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
+index 4fc12ac..f90c7cb 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
+@@ -1,6 +1,15 @@
+-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
++import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
++import type { HumanDecisionRequest, HumanDecisionResponse } from "../workflows/types.js";
+ export { parseControllerArgs, type ParsedControllerArgs } from "./controller-command.js";
+ export { PiDecisionChannel, TelegramDecisionChannel, audienceChannels, createTelegramChannels, decisionConfigDir, loadDecisionChannelConfig, verifyTelegramTokenFile, writeDecisionChannelProfile, type DecisionChannelConfig, type DecisionCredentialConfig, type HumanDecisionChannel, type HumanDecisionChannelAnswer, type HumanDecisionDeliveryResult, type LoadedDecisionChannelConfig, type PiDecisionUi, type SettledHumanDecision, type TelegramFetch, } from "./decision-channels.js";
++export type WorkflowHumanDecisionPresentation = {
++    requestId: string;
++    runId: string;
++    revision: number;
++    request: HumanDecisionRequest;
++};
++export type WorkflowHumanDecisionPresenter = (presentation: WorkflowHumanDecisionPresentation, context: ExtensionContext) => Promise<HumanDecisionResponse | undefined>;
++export declare function registerWorkflowHumanDecisionPresenter(presenter: WorkflowHumanDecisionPresenter): () => void;
+ export type ParsedWorkflowArgs = {
+     kind: "list";
+ } | {
+@@ -24,4 +33,11 @@ export type ParsedWorkflowArgs = {
+ };
+ /** Parse `/workflow` arguments. Exported for tests. */
+ export declare function parseWorkflowArgs(args: string): ParsedWorkflowArgs;
++export type PendingWorkflowDecision = {
++    requestId: string;
++    runId: string;
++    revision: number;
++    contract: unknown;
++};
++export declare function pendingDecisionForSession(sessionId: string): PendingWorkflowDecision | undefined;
+ export default function piWorkflows(pi: ExtensionAPI): void;
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/extension/index.js b/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
+index 9d745ae..36eff35 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
+@@ -21,6 +21,25 @@ const SUBMISSION_POLL_MS = 50;
+ const WORKFLOW_INTERACTION_MESSAGE_TYPE = "pi-workflows-interaction";
+ const WORKFLOW_NOTIFICATION_MESSAGE_TYPE = "pi-workflows-notification";
+ const WORKFLOW_PRESENTATION_MESSAGE_TYPE = "pi-workflows-presentation";
++const HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.human-decision-presenter.v1");
++function humanDecisionPresenterRegistry() {
++    const globals = globalThis;
++    const current = globals[HUMAN_DECISION_PRESENTER_KEY];
++    if (typeof current === "object" && current !== null) {
++        return current;
++    }
++    const registry = {};
++    globals[HUMAN_DECISION_PRESENTER_KEY] = registry;
++    return registry;
++}
++export function registerWorkflowHumanDecisionPresenter(presenter) {
++    const registry = humanDecisionPresenterRegistry();
++    registry.presenter = presenter;
++    return () => {
++        if (registry.presenter === presenter)
++            registry.presenter = undefined;
++    };
++}
+ /** Parse `/workflow` arguments. Exported for tests. */
+ export function parseWorkflowArgs(args) {
+     const trimmed = args.trim();
+@@ -105,6 +124,13 @@ export default function piWorkflows(pi) {
+         });
+         await prior;
+         try {
++            try {
++                if (await presentPendingDecisionWithRegisteredPresenter(client, ctx))
++                    return;
++            }
++            catch (error) {
++                ctx.ui.notify(`Workflow decision popup failed: ${errorMessage(error)}`, "error");
++            }
+             await sessionDelivery.synchronize(ctx, [
+                 () => claimPendingInteractionDelivery(pi, client, ctx),
+                 () => claimPendingNotificationDelivery(pi, client, ctx),
+@@ -804,6 +830,69 @@ function pendingDecision(sessionId, runId) {
+         return undefined;
+     }
+ }
++export function pendingDecisionForSession(sessionId) {
++    const request = pendingDecision(sessionId);
++    if (request === undefined)
++        return undefined;
++    return {
++        requestId: request.requestId,
++        runId: request.runId,
++        revision: request.revision,
++        contract: request.contract,
++    };
++}
++async function presentPendingDecisionWithRegisteredPresenter(client, context) {
++    const presenter = humanDecisionPresenterRegistry().presenter;
++    if (presenter === undefined)
++        return false;
++    const sessionId = context.sessionManager.getSessionId();
++    const pending = pendingDecision(sessionId);
++    if (pending === undefined || pending.presentationSessionEntryId !== null)
++        return false;
++    const contract = interactionContract(pending);
++    if (contract.schema !== "pi-workflows.human-decision-request.v1") {
++        throw new Error("Stored workflow decision contract is invalid");
++    }
++    const response = await presenter({
++        requestId: pending.requestId,
++        runId: pending.runId,
++        revision: pending.revision,
++        request: contract,
++    }, context);
++    if (response === undefined)
++        return false;
++    let current = pendingDecision(sessionId, pending.runId);
++    if (current?.requestId !== pending.requestId) {
++        throw new Error("Workflow decision changed while the answer was being entered");
++    }
++    for (let attempt = 0;; attempt += 1) {
++        const idempotencyKey = randomUUID();
++        try {
++            await requestAccepted(client, {
++                operation: "decision.answer",
++                requestId: `answer-${idempotencyKey}`,
++                idempotencyKey,
++                runId: current.runId,
++                expectedRevision: current.revision,
++                payload: {
++                    requestId: current.requestId,
++                    submissionId: idempotencyKey,
++                    response: decisionResponse(response),
++                },
++            });
++            return true;
++        }
++        catch (error) {
++            const refreshed = pendingDecision(sessionId, pending.runId);
++            if (attempt >= 2
++                || refreshed?.requestId !== pending.requestId
++                || refreshed.revision === current.revision) {
++                throw error;
++            }
++            current = refreshed;
++        }
++    }
++}
+ function hasClaimableNotification(sessionId) {
+     try {
+         const store = new SqliteControllerStore(workflowStatePath(), { readOnly: true, global: true });
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js b/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js
 index 67b6a7b..997f37c 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js
@@ -48,7 +195,7 @@ index 67b6a7b..997f37c 100644
      let value;
      try {
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts b/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
-index 6ce85ef..32f0539 100644
+index 844ddb8..f4295c7 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
 +++ b/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
 @@ -16,6 +16,14 @@ export type WorkflowHostOptions = {
@@ -75,7 +222,7 @@ index 6ce85ef..32f0539 100644
      private readonly controlClaims;
      private readonly activationTasks;
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/runner.js b/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
-index 2f91cab..7c41d0c 100644
+index 94e7088..9d66f75 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
 +++ b/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
 @@ -32,6 +32,17 @@ const CONTROLLER_CLAIM_LEASE_MS = 120_000;
@@ -104,7 +251,29 @@ index 2f91cab..7c41d0c 100644
      activeControllers = new Map();
      controlClaims = new Map();
      activationTasks = new Map();
-@@ -1677,10 +1689,12 @@ export class WorkflowHost {
+@@ -800,6 +812,12 @@ export class WorkflowHost {
+         if (this.queue.isWorkflowRunPaused(interaction.runId)) {
+             return { outcome: "conflict", error: "Workflow run is paused" };
+         }
++        const expectedRevision = requireNonNegativeInteger(command.expectedRevision, "expectedRevision");
++        if (interaction.runId !== requireRunId(command)
++            || interaction.revision !== expectedRevision
++            || (interaction.status !== "pending" && interaction.status !== "presenting")) {
++            return { outcome: "conflict", error: "Decision request changed before the answer was submitted" };
++        }
+         const request = interaction.contract;
+         const response = payload.response;
+         const accepted = this.decisions.acceptSync(request, {
+@@ -820,7 +838,7 @@ export class WorkflowHost {
+             requestId,
+             submissionId: requireString(payload.submissionId, "submissionId"),
+             idempotencyKey: command.idempotencyKey,
+-            expectedRevision: requireNonNegativeInteger(command.expectedRevision, "expectedRevision"),
++            expectedRevision,
+             payload: response,
+             accepted: true,
+             receipt: accepted.decision,
+@@ -1743,10 +1761,12 @@ export class WorkflowHost {
                  signal: result.signal,
                  ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
              });
@@ -118,7 +287,7 @@ index 2f91cab..7c41d0c 100644
              }
          }
          catch (error) {
-@@ -1700,7 +1714,7 @@ export class WorkflowHost {
+@@ -1766,7 +1786,7 @@ export class WorkflowHost {
                  // A completed worker record wins.
              }
              if (active.control === undefined) {
@@ -127,7 +296,7 @@ index 2f91cab..7c41d0c 100644
              }
          }
          finally {
-@@ -2237,7 +2251,7 @@ export class WorkflowHost {
+@@ -2303,7 +2323,7 @@ export class WorkflowHost {
              }
          });
      }
@@ -136,7 +305,7 @@ index 2f91cab..7c41d0c 100644
          if (!this.queue.verifyWorkflowRunClaim({
              runId: active.record.runId,
              claimToken: active.claimToken,
-@@ -2272,8 +2286,28 @@ export class WorkflowHost {
+@@ -2338,8 +2358,28 @@ export class WorkflowHost {
              }
              return;
          }
@@ -296,6 +465,163 @@ index 33708e2..759554f 100644
  export function readLastTraceEvent(runId, options = {}) {
      const store = new WorkflowRunStore(options.databasePath ?? workflowStatePath(), {
          readOnly: true,
+diff --git a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
+index 5e8f58f..b990683 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
+@@ -11,7 +11,11 @@ import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
+ import { errorMessage } from "../workflows/errors.js";
+ import { discoverWorkflows } from "../workflows/loader.js";
+ import { createRunId, WorkflowRunStore } from "../workflows/store.js";
+-import type { AgentStepContract, HumanDecisionResponse } from "../workflows/types.js";
++import type {
++  AgentStepContract,
++  HumanDecisionRequest,
++  HumanDecisionResponse,
++} from "../workflows/types.js";
+ import { parseControllerArgs, type ParsedControllerArgs } from "./controller-command.js";
+ import { SessionDeliveryCoordinator, type ClaimedSessionDelivery } from "./session-delivery.js";
+ import { SessionWorkflowView } from "./session-view.js";
+@@ -51,6 +55,44 @@ const SUBMISSION_POLL_MS = 50;
+ const WORKFLOW_INTERACTION_MESSAGE_TYPE = "pi-workflows-interaction";
+ const WORKFLOW_NOTIFICATION_MESSAGE_TYPE = "pi-workflows-notification";
+ const WORKFLOW_PRESENTATION_MESSAGE_TYPE = "pi-workflows-presentation";
++const HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.human-decision-presenter.v1");
++
++export type WorkflowHumanDecisionPresentation = {
++  requestId: string;
++  runId: string;
++  revision: number;
++  request: HumanDecisionRequest;
++};
++
++export type WorkflowHumanDecisionPresenter = (
++  presentation: WorkflowHumanDecisionPresentation,
++  context: ExtensionContext,
++) => Promise<HumanDecisionResponse | undefined>;
++
++type HumanDecisionPresenterRegistry = {
++  presenter?: WorkflowHumanDecisionPresenter;
++};
++
++function humanDecisionPresenterRegistry(): HumanDecisionPresenterRegistry {
++  const globals = globalThis as unknown as { [key: symbol]: unknown };
++  const current = globals[HUMAN_DECISION_PRESENTER_KEY];
++  if (typeof current === "object" && current !== null) {
++    return current as HumanDecisionPresenterRegistry;
++  }
++  const registry: HumanDecisionPresenterRegistry = {};
++  globals[HUMAN_DECISION_PRESENTER_KEY] = registry;
++  return registry;
++}
++
++export function registerWorkflowHumanDecisionPresenter(
++  presenter: WorkflowHumanDecisionPresenter,
++): () => void {
++  const registry = humanDecisionPresenterRegistry();
++  registry.presenter = presenter;
++  return () => {
++    if (registry.presenter === presenter) registry.presenter = undefined;
++  };
++}
+ 
+ export type ParsedWorkflowArgs =
+   | { kind: "list" }
+@@ -144,6 +186,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
+     });
+     await prior;
+     try {
++      try {
++        if (await presentPendingDecisionWithRegisteredPresenter(client, ctx)) return;
++      } catch (error) {
++        ctx.ui.notify(`Workflow decision popup failed: ${errorMessage(error)}`, "error");
++      }
+       await sessionDelivery.synchronize(ctx, [
+         () => claimPendingInteractionDelivery(pi, client, ctx),
+         () => claimPendingNotificationDelivery(pi, client, ctx),
+@@ -924,6 +971,82 @@ function pendingDecision(sessionId: string, runId?: string): InteractiveRequestR
+   }
+ }
+ 
++export type PendingWorkflowDecision = {
++  requestId: string;
++  runId: string;
++  revision: number;
++  contract: unknown;
++};
++
++export function pendingDecisionForSession(sessionId: string): PendingWorkflowDecision | undefined {
++  const request = pendingDecision(sessionId);
++  if (request === undefined) return undefined;
++  return {
++    requestId: request.requestId,
++    runId: request.runId,
++    revision: request.revision,
++    contract: request.contract,
++  };
++}
++
++async function presentPendingDecisionWithRegisteredPresenter(
++  client: WorkflowHostClient,
++  context: ExtensionContext,
++): Promise<boolean> {
++  const presenter = humanDecisionPresenterRegistry().presenter;
++  if (presenter === undefined) return false;
++  const sessionId = context.sessionManager.getSessionId();
++  const pending = pendingDecision(sessionId);
++  if (pending === undefined || pending.presentationSessionEntryId !== null) return false;
++  const contract = interactionContract(pending);
++  if (contract.schema !== "pi-workflows.human-decision-request.v1") {
++    throw new Error("Stored workflow decision contract is invalid");
++  }
++  const response = await presenter(
++    {
++      requestId: pending.requestId,
++      runId: pending.runId,
++      revision: pending.revision,
++      request: contract as unknown as HumanDecisionRequest,
++    },
++    context,
++  );
++  if (response === undefined) return false;
++
++  let current = pendingDecision(sessionId, pending.runId);
++  if (current?.requestId !== pending.requestId) {
++    throw new Error("Workflow decision changed while the answer was being entered");
++  }
++  for (let attempt = 0; ; attempt += 1) {
++    const idempotencyKey = randomUUID();
++    try {
++      await requestAccepted(client, {
++        operation: "decision.answer",
++        requestId: `answer-${idempotencyKey}`,
++        idempotencyKey,
++        runId: current.runId,
++        expectedRevision: current.revision,
++        payload: {
++          requestId: current.requestId,
++          submissionId: idempotencyKey,
++          response: decisionResponse(response),
++        },
++      });
++      return true;
++    } catch (error) {
++      const refreshed = pendingDecision(sessionId, pending.runId);
++      if (
++        attempt >= 2
++        || refreshed?.requestId !== pending.requestId
++        || refreshed.revision === current.revision
++      ) {
++        throw error;
++      }
++      current = refreshed;
++    }
++  }
++}
++
+ function hasClaimableNotification(sessionId: string): boolean {
+   try {
+     const store = new SqliteControllerStore(workflowStatePath(), { readOnly: true, global: true });
 diff --git a/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts b/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts
 index 9d7d4ef..291339f 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts
@@ -346,7 +672,7 @@ index 9d7d4ef..291339f 100644
    let value: unknown;
    try {
 diff --git a/node_modules/@osolmaz/pi-workflows/src/host/runner.ts b/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
-index 5d2bc23..55a1e05 100644
+index 921f22f..e635cea 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
 +++ b/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
 @@ -121,6 +121,26 @@ type ActiveRun = {
@@ -384,7 +710,31 @@ index 5d2bc23..55a1e05 100644
    private readonly activeControllers = new Map<string, ActiveController>();
    private readonly controlClaims = new Map<string, string>();
    private readonly activationTasks = new Map<string, Promise<void>>();
-@@ -1942,12 +1963,13 @@ export class WorkflowHost {
+@@ -981,6 +1002,14 @@ export class WorkflowHost {
+     if (this.queue.isWorkflowRunPaused(interaction.runId)) {
+       return { outcome: "conflict", error: "Workflow run is paused" };
+     }
++    const expectedRevision = requireNonNegativeInteger(command.expectedRevision, "expectedRevision");
++    if (
++      interaction.runId !== requireRunId(command)
++      || interaction.revision !== expectedRevision
++      || (interaction.status !== "pending" && interaction.status !== "presenting")
++    ) {
++      return { outcome: "conflict", error: "Decision request changed before the answer was submitted" };
++    }
+     const request = interaction.contract as unknown as HumanDecisionRequest;
+     const response = payload.response as HumanDecisionResponse;
+     const accepted = this.decisions.acceptSync(request, {
+@@ -1001,7 +1030,7 @@ export class WorkflowHost {
+       requestId,
+       submissionId: requireString(payload.submissionId, "submissionId"),
+       idempotencyKey: command.idempotencyKey,
+-      expectedRevision: requireNonNegativeInteger(command.expectedRevision, "expectedRevision"),
++      expectedRevision,
+       payload: response as JsonValue,
+       accepted: true,
+       receipt: accepted.decision as unknown as JsonValue,
+@@ -2016,12 +2045,13 @@ export class WorkflowHost {
          signal: result.signal,
          ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
        });
@@ -399,7 +749,7 @@ index 5d2bc23..55a1e05 100644
        }
      } catch (error) {
        this.log(`worker ${envelope.workerEpoch} failed: ${errorMessage(error)}`);
-@@ -1965,7 +1987,7 @@ export class WorkflowHost {
+@@ -2039,7 +2069,7 @@ export class WorkflowHost {
          // A completed worker record wins.
        }
        if (active.control === undefined) {
@@ -408,7 +758,7 @@ index 5d2bc23..55a1e05 100644
        }
      } finally {
        this.reapWorkerDescendants(envelope.workerEpoch);
-@@ -2677,7 +2699,11 @@ export class WorkflowHost {
+@@ -2751,7 +2781,11 @@ export class WorkflowHost {
      });
    }
  
@@ -421,7 +771,7 @@ index 5d2bc23..55a1e05 100644
      if (
        !this.queue.verifyWorkflowRunClaim({
          runId: active.record.runId,
-@@ -2722,8 +2748,32 @@ export class WorkflowHost {
+@@ -2796,8 +2830,32 @@ export class WorkflowHost {
        }
        return;
      }

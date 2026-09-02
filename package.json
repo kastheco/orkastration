@@ -40,7 +40,8 @@
   },
   "scripts": {
     "test:extension": "node --experimental-strip-types --test extensions/orkastrator-workflows/tests/*.test.ts",
-    "test:orkastrator": "npm run test:extension",
+    "test:decision-runtime": "node scripts/test-decision-questionnaire-runtime.mjs",
+    "test:orkastrator": "npm run test:extension && npm run test:decision-runtime",
     "typecheck": "tsc --noEmit",
     "postinstall": "node scripts/apply-patches.mjs"
   },
@@ -53,7 +54,8 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@osolmaz/pi-workflows": "0.15.2",
+    "@juicesharp/rpiv-ask-user-question": "2.9.0",
+    "@osolmaz/pi-workflows": "0.15.3",
     "patch-package": "^8.0.1",
     "tsx": "^4.23.13"
   },

@@ -11,7 +11,6 @@ type OutlineChild = { nodeId: string; label?: string };
 type StatusKind = "cancelled" | "complete" | "failed" | "queued" | "running" | "timed_out" | "waiting";
 type OutlineStatus = { glyph: string; kind: StatusKind; label?: string };
 type WidgetTheme = Pick<Theme, "bold" | "fg">;
-export type WorkflowWidgetViewport = { start?: number };
 
 const OUTCOMES: Record<string, OutlineStatus> = {
   ok: { glyph: "✓", kind: "complete" },
@@ -25,10 +24,9 @@ export function renderWorkflowWidgetLines(
   width: number,
   theme: WidgetTheme,
   now = new Date(),
-  viewport?: WorkflowWidgetViewport,
 ): string[] {
   try {
-    return renderWorkflowWidgetLinesUnsafe(bundle, width, theme, now, viewport);
+    return renderWorkflowWidgetLinesUnsafe(bundle, width, theme, now);
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown rendering error";
     return [truncateToWidth(
@@ -44,7 +42,6 @@ function renderWorkflowWidgetLinesUnsafe(
   width: number,
   theme: WidgetTheme,
   now: Date,
-  viewport?: WorkflowWidgetViewport,
 ): string[] {
   const state = bundle.state;
   const title = sanitizeText(state.runTitle ?? state.workflowName);
@@ -61,7 +58,7 @@ function renderWorkflowWidgetLinesUnsafe(
     `${paintStatusGlyph(status, theme)} ${theme.fg("accent", theme.bold(title))}`
       + theme.fg("dim", `${unknownStatus}  ${elapsed} · ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}`),
   ];
-  const outline = renderCompactOutline(bundle.snapshot, state, now, theme, viewport);
+  const outline = renderCompactOutline(bundle.snapshot, state, now, theme);
   return [...header, ...outline].map((line) => truncateToWidth(line, width, "…"));
 }
 
@@ -84,27 +81,38 @@ function renderCompactOutline(
   state: WorkflowRunState,
   now: Date,
   theme: WidgetTheme,
-  viewport?: WorkflowWidgetViewport,
 ): string[] {
-  const plain = renderWorkflowOutline(snapshot, state, now);
-  const styled = renderWorkflowOutline(snapshot, state, now, theme);
-  const anchorNode = state.currentNode ?? state.waitingOn ?? state.steps.at(-1)?.nodeId;
-  const anchor = anchorNode === undefined
-    ? 0
-    : Math.max(0, plain.findIndex((line) => line.includes(`${sanitizeText(anchorNode)}  `)));
-  const viewportRows = 5;
-  let start = viewport?.start ?? Math.max(0, anchor - 2);
-  start = Math.min(start, Math.max(0, styled.length - viewportRows));
-  if (anchor < start) start = anchor;
-  else if (anchor >= start + viewportRows) start = anchor - viewportRows + 1;
-  if (viewport !== undefined) viewport.start = start;
-  const end = Math.min(styled.length, start + viewportRows);
-  const earlier = start;
-  const later = styled.length - end;
+  const currentNode = state.currentNode ?? state.waitingOn;
+  const completedNodes = new Set(
+    state.steps
+      .filter((step) => step.outcome === "ok")
+      .map((step) => step.nodeId),
+  );
+  const latestCompletedNode = [...state.steps]
+    .reverse()
+    .find((step) => step.outcome === "ok" && step.nodeId !== currentNode)
+    ?.nodeId;
+  const visibleNodes = [snapshot.startAt, latestCompletedNode, currentNode]
+    .filter((nodeId): nodeId is string => nodeId !== undefined)
+    .filter((nodeId, index, nodes) => nodes.indexOf(nodeId) === index);
+  const hiddenCompleted = [...completedNodes]
+    .filter((nodeId) => !visibleNodes.includes(nodeId))
+    .length;
+  const later = Object.keys(snapshot.nodes)
+    .filter((nodeId) => !completedNodes.has(nodeId) && !visibleNodes.includes(nodeId))
+    .length;
+
   return [
-    ...(earlier === 0 ? [] : [theme.fg("dim", `↑ ${earlier} earlier node${earlier === 1 ? "" : "s"}`)]),
-    ...styled.slice(start, end),
-    ...(later === 0 ? [] : [theme.fg("dim", `↓ ${later} later node${later === 1 ? "" : "s"} · /kas:workflow`)]),
+    nodeLine(snapshot, state, snapshot.startAt, now, theme),
+    ...(hiddenCompleted === 0
+      ? []
+      : [theme.fg("dim", `↑ ${hiddenCompleted} completed node${hiddenCompleted === 1 ? "" : "s"}`)]),
+    ...visibleNodes
+      .filter((nodeId) => nodeId !== snapshot.startAt)
+      .map((nodeId) => nodeLine(snapshot, state, nodeId, now, theme)),
+    ...(later === 0
+      ? []
+      : [theme.fg("dim", `↓ ${later} later node${later === 1 ? "" : "s"} · /kas:workflow`)]),
   ];
 }
 
@@ -223,7 +231,8 @@ function nodeLine(
     ? ` · ${sanitizeText(state.statusDetail)}`
     : "";
   if (theme === undefined) {
-    return `${status.glyph} ${sanitizeText(nodeId)}  ${type}${statusText}${timing}${detail}`;
+    const typeText = type === "agent" ? "  agent" : "";
+    return `${status.glyph} ${sanitizeText(nodeId)}${typeText}${statusText}${timing}${detail}`;
   }
 
   const glyph = paintStatusGlyph(status, theme);
@@ -232,13 +241,13 @@ function nodeLine(
     : status.kind === "queued"
       ? theme.fg("muted", sanitizeText(nodeId))
       : sanitizeText(nodeId);
-  const typeText = theme.fg(nodeTypeColor(type), type);
+  const typeText = type === "agent" ? `  ${theme.fg(nodeTypeColor(type), type)}` : "";
   const statusLabel = status.label === undefined
     ? ""
     : theme.fg(statusColor(status.kind), ` · ${status.label}`);
   const timingText = timing.length === 0 ? "" : theme.fg("dim", timing);
   const detailText = detail.length === 0 ? "" : theme.fg("muted", detail);
-  return `${glyph} ${name}  ${typeText}${statusLabel}${timingText}${detailText}`;
+  return `${glyph} ${name}${typeText}${statusLabel}${timingText}${detailText}`;
 }
 
 function nodeStatus(
