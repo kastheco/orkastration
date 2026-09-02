@@ -1,0 +1,563 @@
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js b/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js
+index 67b6a7b..997f37c 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/protocol.js
+@@ -4,7 +4,7 @@ import { canonicalJson, parseJson } from "../state/json.js";
+ export const HOST_PROTOCOL_VERSION = 1;
+ export const HOST_REQUEST_SCHEMA = "pi-workflows.host-request.v1";
+ export const HOST_RESPONSE_SCHEMA = "pi-workflows.host-response.v1";
+-export const MAX_PROTOCOL_MESSAGE_BYTES = 1024 * 1024;
++export const MAX_PROTOCOL_MESSAGE_BYTES = 8 * 1024 * 1024;
+ export const HOST_OPERATIONS = [
+     "run.start",
+     "run.pause",
+@@ -37,7 +37,7 @@ export class HostProtocolError extends Error {
+ export function encodeProtocolLine(message) {
+     const encoded = Buffer.from(`${canonicalJson(message)}\n`, "utf8");
+     if (encoded.byteLength > MAX_PROTOCOL_MESSAGE_BYTES) {
+-        throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++        throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+     }
+     return encoded;
+ }
+@@ -107,7 +107,7 @@ export class NdjsonFrameDecoder {
+     push(chunk) {
+         this.buffered = Buffer.concat([this.buffered, chunk]);
+         if (this.buffered.byteLength > MAX_PROTOCOL_MESSAGE_BYTES && !this.buffered.includes(0x0a)) {
+-            throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++            throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+         }
+         const frames = [];
+         for (;;) {
+@@ -119,7 +119,7 @@ export class NdjsonFrameDecoder {
+             if (frame.byteLength === 0)
+                 continue;
+             if (frame.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+-                throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++                throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+             }
+             frames.push(frame);
+         }
+@@ -129,7 +129,7 @@ export class NdjsonFrameDecoder {
+ function parseProtocolValue(line) {
+     const buffer = Buffer.isBuffer(line) ? line : Buffer.from(line, "utf8");
+     if (buffer.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+-        throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++        throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+     }
+     let value;
+     try {
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts b/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
+index 6ce85ef..32f0539 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
+@@ -16,6 +16,14 @@ export type WorkflowHostOptions = {
+     controllerWorkerEntryPath?: string;
+     onLog?: (message: string) => void;
+ };
++export type WorkerFailureRecoveryDecision = {
++    action: "retry" | "fail";
++    delayMs: number;
++};
++export declare function workerFailureRecoveryDecision(failure: {
++    count: number;
++    diagnostic: string;
++}): WorkerFailureRecoveryDecision;
+ /** Global package-owned host. It writes state and supervises code-only workers. */
+ export declare class WorkflowHost {
+     private readonly options;
+@@ -32,6 +40,7 @@ export declare class WorkflowHost {
+     private readonly registry;
+     private readonly activeRuns;
+     private readonly workerDescendants;
++    private readonly workerFailures;
+     private readonly activeControllers;
+     private readonly controlClaims;
+     private readonly activationTasks;
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/runner.js b/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
+index 2f91cab..7c41d0c 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
+@@ -32,6 +32,17 @@ const CONTROLLER_CLAIM_LEASE_MS = 120_000;
+ const CONTROLLER_RENEW_MS = 30_000;
+ const MAX_CONTROLLER_WORKERS = 4;
+ const DEFAULT_CONTROLLER_TIMEOUT_MS = 60_000;
++export function workerFailureRecoveryDecision(failure) {
++    if (!Number.isInteger(failure.count) || failure.count < 1) {
++        throw new Error("Worker failure count must be a positive integer");
++    }
++    if (failure.diagnostic.trim().length === 0) {
++        throw new Error("Worker failure diagnostic must be non-empty");
++    }
++    return failure.count >= 3
++        ? { action: "fail", delayMs: 0 }
++        : { action: "retry", delayMs: 1_000 * 2 ** (failure.count - 1) };
++}
+ /** Global package-owned host. It writes state and supervises code-only workers. */
+ export class WorkflowHost {
+     options;
+@@ -48,6 +59,7 @@ export class WorkflowHost {
+     registry;
+     activeRuns = new Map();
+     workerDescendants = new Map();
++    workerFailures = new Map();
+     activeControllers = new Map();
+     controlClaims = new Map();
+     activationTasks = new Map();
+@@ -1677,10 +1689,12 @@ export class WorkflowHost {
+                 signal: result.signal,
+                 ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
+             });
++            if (result.outcome === "exited")
++                this.workerFailures.delete(active.record.runId);
+             if (active.control === undefined &&
+                 (result.outcome !== "exited" ||
+                     this.hostState.validatingInteraction(active.record.runId) !== undefined)) {
+-                await this.recoverWorkerExit(active, result.outcome);
++                await this.recoverWorkerExit(active, result.outcome, result.diagnostic);
+             }
+         }
+         catch (error) {
+@@ -1700,7 +1714,7 @@ export class WorkflowHost {
+                 // A completed worker record wins.
+             }
+             if (active.control === undefined) {
+-                await this.recoverWorkerExit(active, "crashed");
++                await this.recoverWorkerExit(active, "crashed", result.diagnostic ?? errorMessage(error));
+             }
+         }
+         finally {
+@@ -2237,7 +2251,7 @@ export class WorkflowHost {
+             }
+         });
+     }
+-    async recoverWorkerExit(active, outcome) {
++    async recoverWorkerExit(active, outcome, diagnostic) {
+         if (!this.queue.verifyWorkflowRunClaim({
+             runId: active.record.runId,
+             claimToken: active.claimToken,
+@@ -2272,8 +2286,28 @@ export class WorkflowHost {
+             }
+             return;
+         }
++        const failureDiagnostic = diagnostic?.trim() || `Workflow worker ${outcome}`;
++        const previous = this.workerFailures.get(active.record.runId);
++        const failure = {
++            count: previous?.diagnostic === failureDiagnostic ? previous.count + 1 : 1,
++            diagnostic: failureDiagnostic,
++        };
++        const decision = workerFailureRecoveryDecision(failure);
++        if (decision.action === "fail") {
++            this.workerFailures.delete(active.record.runId);
++            this.queue.failWorkflowRun({
++                runId: active.record.runId,
++                claimToken: active.claimToken,
++                errorCode: "workerFailureLimit",
++                errorMessage: `Workflow worker failed ${failure.count} consecutive times with the same diagnostic: ${failureDiagnostic}`,
++            });
++            this.log(`run ${active.record.runId} failed after ${failure.count} deterministic worker failures`);
++            return;
++        }
++        this.workerFailures.set(active.record.runId, failure);
++        await new Promise((resolve) => setTimeout(resolve, decision.delayMs));
+         this.queue.parkWorkflowRun({ runId: active.record.runId, claimToken: active.claimToken });
+-        this.log(`run ${active.record.runId} parked after worker ${outcome}`);
++        this.log(`run ${active.record.runId} parked after worker ${outcome}; retry ${failure.count} in ${decision.delayMs}ms`);
+     }
+     releaseLock() {
+         try {
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-entry.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-entry.js
+index a6b91e1..c8fc040 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-entry.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/worker-entry.js
+@@ -8,6 +8,7 @@ import { compositionMetadata } from "../workflows/composition.js";
+ import { WorkflowEngine } from "../workflows/engine.js";
+ import { ClaimLostError, RunParkedError, WorkflowSourceChangedError, errorMessage, } from "../workflows/errors.js";
+ import { hashWorkflowSource, resolveWorkflowSource } from "../workflows/loader.js";
++import { MAX_PROTOCOL_MESSAGE_BYTES } from "./protocol.js";
+ import { RpcStepExecutor } from "./rpc-executor.js";
+ import { encodeWorkerLine, parseWorkerResponse, } from "./worker-protocol.js";
+ import { HostBackedWorkflowStore } from "./worker-store.js";
+@@ -79,8 +80,8 @@ class StdioWorkerTransport {
+     }
+     onData(chunk) {
+         this.buffered = Buffer.concat([this.buffered, chunk]);
+-        if (this.buffered.byteLength > 1024 * 1024 && !this.buffered.includes(0x0a)) {
+-            this.failAll(new Error("Worker response exceeds 1 MiB"));
++        if (this.buffered.byteLength > MAX_PROTOCOL_MESSAGE_BYTES && !this.buffered.includes(0x0a)) {
++            this.failAll(new Error("Worker response exceeds 8 MiB"));
+             return;
+         }
+         for (;;) {
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js
+index a2e53a4..864c4f2 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js
+@@ -57,7 +57,7 @@ export function workerKindForOperation(operation, payload) {
+ export function encodeWorkerLine(message) {
+     const encoded = Buffer.from(`${canonicalJson(message)}\n`, "utf8");
+     if (encoded.byteLength > MAX_PROTOCOL_MESSAGE_BYTES) {
+-        throw new Error("Worker protocol message exceeds 1 MiB");
++        throw new Error("Worker protocol message exceeds 8 MiB");
+     }
+     return encoded;
+ }
+@@ -102,7 +102,7 @@ export function parseWorkerResponse(line) {
+ function parseWorkerValue(line) {
+     const buffer = Buffer.isBuffer(line) ? line : Buffer.from(line, "utf8");
+     if (buffer.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+-        throw new Error("Worker protocol message exceeds 1 MiB");
++        throw new Error("Worker protocol message exceeds 8 MiB");
+     }
+     const text = buffer.toString("utf8");
+     const value = parseJson(text);
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts b/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts
+index 907101f..af70a25 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts
+@@ -15,5 +15,5 @@ export { COMMAND_BATCH_RESULT_SCHEMA, MAX_COMMAND_BATCH_CONCURRENCY, MAX_COMMAND
+ export { estimateProgress, formatProgressLine, formatProgressReport, formatRemaining, prioritizeProgressEstimates, progressRecordsFromTrace, progressTracksFromRecords, type ProgressConfidence, type ProgressEstimate, type ProgressSample, type ProgressTrackState, } from "./progress.js";
+ export { MAX_CURRENT_UPDATES, MAX_UPDATE_DATA_BYTES, UPDATE_RATE_BURST, UPDATE_RATE_PER_SECOND, updateProjection, validateProgressData, validateWorkflowUpdate, } from "./updates.js";
+ export { sanitizeText, stripAnsi } from "./text.js";
+-export { DEFINITION_SNAPSHOT_SCHEMA, RUN_STATE_SCHEMA, SESSION_BINDING_SCHEMA, WorkflowRunStore, createDefinitionSnapshot, createRunId, listWorkflowRuns, readLastTraceEvent, readWorkflowRun, workflowStateDatabasePath, type LoadedWorkflowRun, type ReadWorkflowRunOptions, type RunWriteAuthority, } from "./store.js";
++export { DEFINITION_SNAPSHOT_SCHEMA, RUN_STATE_SCHEMA, SESSION_BINDING_SCHEMA, WorkflowRunStore, createDefinitionSnapshot, createRunId, listWorkflowRuns, readLastTraceEvent, readWorkflowContinuationRunId, readWorkflowRun, workflowStateDatabasePath, type LoadedWorkflowRun, type ReadWorkflowRunOptions, type RunWriteAuthority, } from "./store.js";
+ export type { AcceptedHumanDecision, DefaultedHumanDecision, ResolvedHumanDecision, AgentNodeDefinition, AgentExpectedOutput, AgentStepCompletion, AgentStepContract, AssistantAgentNodeDefinition, AssistantMessageOutput, AssistantMessageReceipt, AgentStepExecutor, AgentStepPresentation, AgentStepRequest, AgentStepSubmission, ActionNodeDefinition, CheckpointNodeDefinition, ConversationRange, ComputeNodeDefinition, FunctionActionNodeDefinition, DecisionPresentation, DecisionPresentationBlock, DecisionPresentationBullets, DecisionPresentationFields, DecisionPresentationParagraph, DecisionPresentationPreformatted, DecisionPresentationSection, HumanDecisionAnswerSource, HumanDecisionAudience, HumanDecisionCancellationRecord, HumanDecisionChannelRequest, HumanDecisionChoice, HumanDecisionChoiceMap, HumanDecisionContinuationRecord, HumanDecisionDeliveryRecord, HumanDecisionNodeContract, HumanDecisionPrompt, HumanDecisionReceipt, HumanDecisionRequest, HumanDecisionResponse, HumanDecisionSettlementRecord, HumanDecisionSubmission, HumanDecisionTextInput, HumanDecisionTimeout, HumanDecisionTimeoutPolicy, MaybePromise, NotifyNodeDefinition, ShellActionExecution, ShellActionNodeDefinition, SubmittedAgentNodeDefinition, ShellActionResult, WorkflowActionContext, WorkflowActionReceipt, WorkflowCompositionSnapshot, WorkflowDefinition, WorkflowDefinitionSnapshot, WorkflowEdge, WorkflowExitDefinition, WorkflowExitMap, WorkflowExitOutputs, WorkflowIncludeDefinition, WorkflowIncludedResult, WorkflowInputOf, WorkflowSettingsOf, WorkflowMountedSource, WorkflowMountSnapshot, WorkflowValueParser, WorkflowEngineOptions, WorkflowNodeCommon, WorkflowNodeContext, WorkflowNodeDefinition, WorkflowNodeOutcome, WorkflowNodeResult, WorkflowNodeSnapshot, WorkflowNotificationReceipt, WorkflowNotificationRequest, WorkflowNotificationSink, WorkflowPresentationContext, WorkflowProgressData, WorkflowProgressStatus, WorkflowRunResult, WorkflowRunState, WorkflowRunStatus, WorkflowSource, WorkflowSessionBinding, WorkflowSessionEntryRecord, WorkflowSettingsSnapshot, WorkflowStepRecord, WorkflowTraceEvent, WorkflowTraceEventDraft, WorkflowUpdateInput, WorkflowUpdateReceipt, WorkflowUpdateRecord, ShellActionUpdates, ShellUpdateLine, } from "./types.js";
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/index.js b/node_modules/@osolmaz/pi-workflows/dist/workflows/index.js
+index 04055d9..d061e4e 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/workflows/index.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/workflows/index.js
+@@ -15,5 +15,5 @@ export { COMMAND_BATCH_RESULT_SCHEMA, MAX_COMMAND_BATCH_CONCURRENCY, MAX_COMMAND
+ export { estimateProgress, formatProgressLine, formatProgressReport, formatRemaining, prioritizeProgressEstimates, progressRecordsFromTrace, progressTracksFromRecords, } from "./progress.js";
+ export { MAX_CURRENT_UPDATES, MAX_UPDATE_DATA_BYTES, UPDATE_RATE_BURST, UPDATE_RATE_PER_SECOND, updateProjection, validateProgressData, validateWorkflowUpdate, } from "./updates.js";
+ export { sanitizeText, stripAnsi } from "./text.js";
+-export { DEFINITION_SNAPSHOT_SCHEMA, RUN_STATE_SCHEMA, SESSION_BINDING_SCHEMA, WorkflowRunStore, createDefinitionSnapshot, createRunId, listWorkflowRuns, readLastTraceEvent, readWorkflowRun, workflowStateDatabasePath, } from "./store.js";
++export { DEFINITION_SNAPSHOT_SCHEMA, RUN_STATE_SCHEMA, SESSION_BINDING_SCHEMA, WorkflowRunStore, createDefinitionSnapshot, createRunId, listWorkflowRuns, readLastTraceEvent, readWorkflowContinuationRunId, readWorkflowRun, workflowStateDatabasePath, } from "./store.js";
+ //# sourceMappingURL=index.js.map
+\ No newline at end of file
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.d.ts b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.d.ts
+index ce317d9..a63ad60 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.d.ts
+@@ -205,6 +205,7 @@ export declare class WorkflowRunStore {
+     }>;
+     readRun(runId: string, options?: ReadWorkflowRunOptions): LoadedWorkflowRun | null;
+     listRuns(options?: ReadWorkflowRunOptions): LoadedWorkflowRun[];
++    continuationRunId(parentRunId: string): string | undefined;
+     readLastTraceEvent(runId: string): WorkflowTraceEvent | null;
+     private contextFor;
+     private withRunLock;
+@@ -274,6 +275,9 @@ export declare function readWorkflowRun(runId: string, options?: ReadWorkflowRun
+ export declare function listWorkflowRuns(options?: ReadWorkflowRunOptions & {
+     databasePath?: string;
+ }): LoadedWorkflowRun[];
++export declare function readWorkflowContinuationRunId(parentRunId: string, options?: {
++    databasePath?: string;
++}): string | undefined;
+ export declare function readLastTraceEvent(runId: string, options?: {
+     databasePath?: string;
+ }): WorkflowTraceEvent | null;
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
+index 33708e2..759554f 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
+@@ -1383,6 +1383,17 @@ export class WorkflowRunStore {
+         }
+         return loaded;
+     }
++    continuationRunId(parentRunId) {
++        const row = this.state.connection
++            .prepare(`SELECT decision_id AS decisionId, parent_run_id AS parentRunId,
++                continuation_run_id AS continuationRunId, created_at AS createdAt
++         FROM continuations
++         WHERE parent_run_id = ?
++         ORDER BY created_at DESC, continuation_run_id DESC
++         LIMIT 1`)
++            .get(parentRunId);
++        return isContinuationIdentityRow(row) ? row.continuationRunId : undefined;
++    }
+     readLastTraceEvent(runId) {
+         const run = this.readRunRow(runId);
+         if (run === undefined)
+@@ -2773,6 +2784,17 @@ export function listWorkflowRuns(options = {}) {
+         store.close();
+     }
+ }
++export function readWorkflowContinuationRunId(parentRunId, options = {}) {
++    const store = new WorkflowRunStore(options.databasePath ?? workflowStatePath(), {
++        readOnly: true,
++    });
++    try {
++        return store.continuationRunId(parentRunId);
++    }
++    finally {
++        store.close();
++    }
++}
+ export function readLastTraceEvent(runId, options = {}) {
+     const store = new WorkflowRunStore(options.databasePath ?? workflowStatePath(), {
+         readOnly: true,
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts b/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts
+index 9d7d4ef..291339f 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/protocol.ts
+@@ -5,7 +5,7 @@ import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
+ export const HOST_PROTOCOL_VERSION = 1;
+ export const HOST_REQUEST_SCHEMA = "pi-workflows.host-request.v1" as const;
+ export const HOST_RESPONSE_SCHEMA = "pi-workflows.host-response.v1" as const;
+-export const MAX_PROTOCOL_MESSAGE_BYTES = 1024 * 1024;
++export const MAX_PROTOCOL_MESSAGE_BYTES = 8 * 1024 * 1024;
+ 
+ export const HOST_OPERATIONS = [
+   "run.start",
+@@ -71,7 +71,7 @@ export class HostProtocolError extends Error {
+ export function encodeProtocolLine(message: HostRequest | HostResponse): Buffer {
+   const encoded = Buffer.from(`${canonicalJson(message)}\n`, "utf8");
+   if (encoded.byteLength > MAX_PROTOCOL_MESSAGE_BYTES) {
+-    throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++    throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+   }
+   return encoded;
+ }
+@@ -149,7 +149,7 @@ export class NdjsonFrameDecoder {
+   push(chunk: Buffer): Buffer[] {
+     this.buffered = Buffer.concat([this.buffered, chunk]);
+     if (this.buffered.byteLength > MAX_PROTOCOL_MESSAGE_BYTES && !this.buffered.includes(0x0a)) {
+-      throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++      throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+     }
+     const frames: Buffer[] = [];
+     for (;;) {
+@@ -159,7 +159,7 @@ export class NdjsonFrameDecoder {
+       this.buffered = this.buffered.subarray(newline + 1);
+       if (frame.byteLength === 0) continue;
+       if (frame.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+-        throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++        throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+       }
+       frames.push(frame);
+     }
+@@ -170,7 +170,7 @@ export class NdjsonFrameDecoder {
+ function parseProtocolValue(line: string | Buffer): Record<string, unknown> {
+   const buffer = Buffer.isBuffer(line) ? line : Buffer.from(line, "utf8");
+   if (buffer.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+-    throw new HostProtocolError("Host protocol message exceeds 1 MiB");
++    throw new HostProtocolError("Host protocol message exceeds 8 MiB");
+   }
+   let value: unknown;
+   try {
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/runner.ts b/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
+index 5d2bc23..55a1e05 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
+@@ -121,6 +121,26 @@ type ActiveRun = {
+   claimLost?: boolean;
+ };
+ 
++export type WorkerFailureRecoveryDecision = {
++  action: "retry" | "fail";
++  delayMs: number;
++};
++
++export function workerFailureRecoveryDecision(failure: {
++  count: number;
++  diagnostic: string;
++}): WorkerFailureRecoveryDecision {
++  if (!Number.isInteger(failure.count) || failure.count < 1) {
++    throw new Error("Worker failure count must be a positive integer");
++  }
++  if (failure.diagnostic.trim().length === 0) {
++    throw new Error("Worker failure diagnostic must be non-empty");
++  }
++  return failure.count >= 3
++    ? { action: "fail", delayMs: 0 }
++    : { action: "retry", delayMs: 1_000 * 2 ** (failure.count - 1) };
++}
++
+ type DeliveryClaim = {
+   clientId: string;
+   token: string;
+@@ -159,6 +179,7 @@ export class WorkflowHost {
+   private readonly registry: HostProcessRegistry;
+   private readonly activeRuns = new Map<string, ActiveRun>();
+   private readonly workerDescendants = new Map<string, Set<number>>();
++  private readonly workerFailures = new Map<string, { count: number; diagnostic: string }>();
+   private readonly activeControllers = new Map<string, ActiveController>();
+   private readonly controlClaims = new Map<string, string>();
+   private readonly activationTasks = new Map<string, Promise<void>>();
+@@ -1942,12 +1963,13 @@ export class WorkflowHost {
+         signal: result.signal,
+         ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
+       });
++      if (result.outcome === "exited") this.workerFailures.delete(active.record.runId);
+       if (
+         active.control === undefined &&
+         (result.outcome !== "exited" ||
+           this.hostState.validatingInteraction(active.record.runId) !== undefined)
+       ) {
+-        await this.recoverWorkerExit(active, result.outcome);
++        await this.recoverWorkerExit(active, result.outcome, result.diagnostic);
+       }
+     } catch (error) {
+       this.log(`worker ${envelope.workerEpoch} failed: ${errorMessage(error)}`);
+@@ -1965,7 +1987,7 @@ export class WorkflowHost {
+         // A completed worker record wins.
+       }
+       if (active.control === undefined) {
+-        await this.recoverWorkerExit(active, "crashed");
++        await this.recoverWorkerExit(active, "crashed", result.diagnostic ?? errorMessage(error));
+       }
+     } finally {
+       this.reapWorkerDescendants(envelope.workerEpoch);
+@@ -2677,7 +2699,11 @@ export class WorkflowHost {
+     });
+   }
+ 
+-  private async recoverWorkerExit(active: ActiveRun, outcome: string): Promise<void> {
++  private async recoverWorkerExit(
++    active: ActiveRun,
++    outcome: string,
++    diagnostic?: string,
++  ): Promise<void> {
+     if (
+       !this.queue.verifyWorkflowRunClaim({
+         runId: active.record.runId,
+@@ -2722,8 +2748,32 @@ export class WorkflowHost {
+       }
+       return;
+     }
++
++    const failureDiagnostic = diagnostic?.trim() || `Workflow worker ${outcome}`;
++    const previous = this.workerFailures.get(active.record.runId);
++    const failure = {
++      count: previous?.diagnostic === failureDiagnostic ? previous.count + 1 : 1,
++      diagnostic: failureDiagnostic,
++    };
++    const decision = workerFailureRecoveryDecision(failure);
++    if (decision.action === "fail") {
++      this.workerFailures.delete(active.record.runId);
++      this.queue.failWorkflowRun({
++        runId: active.record.runId,
++        claimToken: active.claimToken,
++        errorCode: "workerFailureLimit",
++        errorMessage: `Workflow worker failed ${failure.count} consecutive times with the same diagnostic: ${failureDiagnostic}`,
++      });
++      this.log(`run ${active.record.runId} failed after ${failure.count} deterministic worker failures`);
++      return;
++    }
++
++    this.workerFailures.set(active.record.runId, failure);
++    await new Promise<void>((resolve) => setTimeout(resolve, decision.delayMs));
+     this.queue.parkWorkflowRun({ runId: active.record.runId, claimToken: active.claimToken });
+-    this.log(`run ${active.record.runId} parked after worker ${outcome}`);
++    this.log(
++      `run ${active.record.runId} parked after worker ${outcome}; retry ${failure.count} in ${decision.delayMs}ms`,
++    );
+   }
+ 
+   private releaseLock(): void {
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-entry.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-entry.ts
+index 0ac197a..03ec362 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/worker-entry.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/worker-entry.ts
+@@ -26,6 +26,7 @@ import type {
+ } from "../workflows/types.js";
+ import { RpcStepExecutor } from "./rpc-executor.js";
+ import type { WorkerLaunchEnvelope } from "./state.js";
++import { MAX_PROTOCOL_MESSAGE_BYTES } from "./protocol.js";
+ import {
+   encodeWorkerLine,
+   parseWorkerResponse,
+@@ -130,8 +131,11 @@ class StdioWorkerTransport implements WorkerStoreTransport {
+ 
+   private onData(chunk: Buffer): void {
+     this.buffered = Buffer.concat([this.buffered, chunk]);
+-    if (this.buffered.byteLength > 1024 * 1024 && !this.buffered.includes(0x0a)) {
+-      this.failAll(new Error("Worker response exceeds 1 MiB"));
++    if (
++      this.buffered.byteLength > MAX_PROTOCOL_MESSAGE_BYTES
++      && !this.buffered.includes(0x0a)
++    ) {
++      this.failAll(new Error("Worker response exceeds 8 MiB"));
+       return;
+     }
+     for (;;) {
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts
+index 02bb8ad..ef62fec 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts
+@@ -97,7 +97,7 @@ export function workerKindForOperation(
+ export function encodeWorkerLine(message: WorkerMessage | WorkerResponse): Buffer {
+   const encoded = Buffer.from(`${canonicalJson(message)}\n`, "utf8");
+   if (encoded.byteLength > MAX_PROTOCOL_MESSAGE_BYTES) {
+-    throw new Error("Worker protocol message exceeds 1 MiB");
++    throw new Error("Worker protocol message exceeds 8 MiB");
+   }
+   return encoded;
+ }
+@@ -144,7 +144,7 @@ export function parseWorkerResponse(line: Buffer | string): WorkerResponse {
+ function parseWorkerValue(line: Buffer | string): Record<string, unknown> {
+   const buffer = Buffer.isBuffer(line) ? line : Buffer.from(line, "utf8");
+   if (buffer.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+-    throw new Error("Worker protocol message exceeds 1 MiB");
++    throw new Error("Worker protocol message exceeds 8 MiB");
+   }
+   const text = buffer.toString("utf8");
+   const value = parseJson(text);
+diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts
+index 06e01b1..b8968bd 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts
+@@ -165,6 +165,7 @@ export {
+   createRunId,
+   listWorkflowRuns,
+   readLastTraceEvent,
++  readWorkflowContinuationRunId,
+   readWorkflowRun,
+   workflowStateDatabasePath,
+   type LoadedWorkflowRun,
+diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
+index e6be803..0add16a 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
+@@ -2303,6 +2303,20 @@ export class WorkflowRunStore {
+     return loaded;
+   }
+ 
++  continuationRunId(parentRunId: string): string | undefined {
++    const row = this.state.connection
++      .prepare(
++        `SELECT decision_id AS decisionId, parent_run_id AS parentRunId,
++                continuation_run_id AS continuationRunId, created_at AS createdAt
++         FROM continuations
++         WHERE parent_run_id = ?
++         ORDER BY created_at DESC, continuation_run_id DESC
++         LIMIT 1`,
++      )
++      .get(parentRunId);
++    return isContinuationIdentityRow(row) ? row.continuationRunId : undefined;
++  }
++
+   readLastTraceEvent(runId: string): WorkflowTraceEvent | null {
+     const run = this.readRunRow(runId);
+     if (run === undefined) return null;
+@@ -4082,6 +4096,20 @@ export function listWorkflowRuns(
+   }
+ }
+ 
++export function readWorkflowContinuationRunId(
++  parentRunId: string,
++  options: { databasePath?: string } = {},
++): string | undefined {
++  const store = new WorkflowRunStore(options.databasePath ?? workflowStatePath(), {
++    readOnly: true,
++  });
++  try {
++    return store.continuationRunId(parentRunId);
++  } finally {
++    store.close();
++  }
++}
++
+ export function readLastTraceEvent(
+   runId: string,
+   options: { databasePath?: string } = {},

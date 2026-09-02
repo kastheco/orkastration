@@ -210,7 +210,7 @@ test("broker rejects cross-run reuse and fails closed after release", async () =
         new AbortController().signal,
         env,
       ),
-      /belongs to another workflow run/u,
+      /belongs to another workflow lineage/u,
     );
 
     await broker.releaseLaunch(binding.launchId);
@@ -223,6 +223,39 @@ test("broker rejects cross-run reuse and fails closed after release", async () =
       ),
       /originating session may have closed/u,
     );
+  } finally {
+    await broker.close();
+    await rm(runtime, { recursive: true, force: true });
+  }
+});
+
+test("accepted continuation preserves the Herdr launch lineage", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "orkastrator-broker-test-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const ownerRunIds: string[] = [];
+  const broker = new SessionDelegationBroker({
+    sessionId: "session-continuation",
+    env,
+    continuationRunIds: (parentRunId) => parentRunId === "parent-run" ? ["continuation-run"] : [],
+    run: async (spec) => {
+      ownerRunIds.push(spec.ownerRunId);
+      return completed(spec);
+    },
+  });
+  try {
+    await broker.start();
+    const binding = await broker.registerLaunch("pane-root");
+    broker.bindRun(binding.launchId, "parent-run");
+
+    const response = await delegateWithHerdrBroker(
+      { ...baseSpec, ownerRunId: "continuation-run", herdrLaunch: binding },
+      binding,
+      new AbortController().signal,
+      env,
+    );
+
+    assert.equal(response.status, "completed");
+    assert.deepEqual(ownerRunIds, ["continuation-run"]);
   } finally {
     await broker.close();
     await rm(runtime, { recursive: true, force: true });

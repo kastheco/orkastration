@@ -21,7 +21,7 @@ type LaunchRecord = {
   binding: HerdrLaunchBinding;
   capability: string;
   rootPaneId: string;
-  runId?: string;
+  runIds: Set<string>;
   active: Map<string, { controller: AbortController; socket: Socket }>;
   accepting: boolean;
 };
@@ -39,6 +39,7 @@ export interface SessionDelegationBrokerOptions {
   sessionId: string;
   env?: NodeJS.ProcessEnv;
   run?: typeof delegateSubagent;
+  continuationRunIds?: (parentRunId: string) => string[];
 }
 
 export class SessionDelegationBroker {
@@ -46,6 +47,7 @@ export class SessionDelegationBroker {
 
   private readonly env: NodeJS.ProcessEnv;
   private readonly run: typeof delegateSubagent;
+  private readonly continuationRunIds: (parentRunId: string) => string[];
   private readonly launches = new Map<string, LaunchRecord>();
   private readonly sockets = new Set<Socket>();
   private server: Server | undefined;
@@ -54,6 +56,7 @@ export class SessionDelegationBroker {
   constructor(options: SessionDelegationBrokerOptions) {
     this.env = options.env ?? process.env;
     this.run = options.run ?? delegateSubagent;
+    this.continuationRunIds = options.continuationRunIds ?? (() => []);
     const digest = createHash("sha256").update(options.sessionId).digest("hex").slice(0, 12);
     const nonce = randomBytes(6).toString("hex");
     this.socketPath = join(herdrBrokerRuntimeDirectory(this.env), `broker-${digest}-${nonce}.sock`);
@@ -93,6 +96,7 @@ export class SessionDelegationBroker {
       binding,
       capability,
       rootPaneId,
+      runIds: new Set(),
       active: new Map(),
       accepting: true,
     });
@@ -128,15 +132,26 @@ export class SessionDelegationBroker {
   bindRun(launchId: string, runId: string): void {
     const launch = this.requireLaunch(launchId);
     if (runId.trim().length === 0) throw new Error("Herdr launch runId is required");
-    if (launch.runId !== undefined && launch.runId !== runId) {
-      throw new Error(`Herdr launch ${launchId} is already bound to another workflow run`);
+    if (launch.runIds.size > 0 && !launch.runIds.has(runId)) {
+      throw new Error(`Herdr launch ${launchId} is already bound to another workflow lineage`);
     }
-    launch.runId = runId;
+    launch.runIds.add(runId);
+  }
+
+  bindContinuation(launchId: string, parentRunId: string, continuationRunId: string): void {
+    const launch = this.requireLaunch(launchId);
+    if (!launch.runIds.has(parentRunId)) {
+      throw new Error(`Herdr continuation parent ${parentRunId} is outside the bound workflow lineage`);
+    }
+    if (continuationRunId.trim().length === 0) {
+      throw new Error("Herdr continuation runId is required");
+    }
+    launch.runIds.add(continuationRunId);
   }
 
   cancelRun(runId: string): void {
     for (const launch of this.launches.values()) {
-      if (launch.runId !== runId) continue;
+      if (!launch.runIds.has(runId)) continue;
       launch.accepting = false;
       for (const active of launch.active.values()) {
         active.controller.abort();
@@ -227,11 +242,23 @@ export class SessionDelegationBroker {
       this.writeError(socket, envelope.requestId, "Herdr launch is unavailable or unauthorized");
       return;
     }
-    if (launch.runId !== undefined && launch.runId !== envelope.spec.ownerRunId) {
-      this.writeError(socket, envelope.requestId, "Herdr launch belongs to another workflow run");
+    if (launch.runIds.size > 0 && !launch.runIds.has(envelope.spec.ownerRunId)) {
+      try {
+        for (const parentRunId of [...launch.runIds]) {
+          for (const continuationRunId of this.continuationRunIds(parentRunId)) {
+            launch.runIds.add(continuationRunId);
+          }
+        }
+      } catch {
+        this.writeError(socket, envelope.requestId, "Herdr workflow lineage could not be verified");
+        return;
+      }
+    }
+    if (launch.runIds.size > 0 && !launch.runIds.has(envelope.spec.ownerRunId)) {
+      this.writeError(socket, envelope.requestId, "Herdr launch belongs to another workflow lineage");
       return;
     }
-    if (launch.runId === undefined) launch.runId = envelope.spec.ownerRunId;
+    if (launch.runIds.size === 0) launch.runIds.add(envelope.spec.ownerRunId);
     if (launch.active.has(envelope.requestId)) {
       this.writeError(socket, envelope.requestId, "Herdr delegation requestId is already active");
       return;

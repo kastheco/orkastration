@@ -12,6 +12,8 @@
   "files": [
     "extensions/orkastrator-workflows",
     ".pi/workflows",
+    "patches",
+    "scripts/apply-patches.mjs",
     "README.md"
   ],
   "engines": {
@@ -39,7 +41,8 @@
   "scripts": {
     "test:extension": "node --experimental-strip-types --test extensions/orkastrator-workflows/tests/*.test.ts",
     "test:orkastrator": "npm run test:extension",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/apply-patches.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",
@@ -51,6 +54,7 @@
   },
   "dependencies": {
     "@osolmaz/pi-workflows": "0.15.2",
+    "patch-package": "^8.0.1",
     "tsx": "^4.23.13"
   },
   "main": "index.js",

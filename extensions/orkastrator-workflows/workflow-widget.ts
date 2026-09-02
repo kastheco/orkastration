@@ -11,6 +11,7 @@ type OutlineChild = { nodeId: string; label?: string };
 type StatusKind = "cancelled" | "complete" | "failed" | "queued" | "running" | "timed_out" | "waiting";
 type OutlineStatus = { glyph: string; kind: StatusKind; label?: string };
 type WidgetTheme = Pick<Theme, "bold" | "fg">;
+export type WorkflowWidgetViewport = { start?: number };
 
 const OUTCOMES: Record<string, OutlineStatus> = {
   ok: { glyph: "✓", kind: "complete" },
@@ -24,9 +25,10 @@ export function renderWorkflowWidgetLines(
   width: number,
   theme: WidgetTheme,
   now = new Date(),
+  viewport?: WorkflowWidgetViewport,
 ): string[] {
   try {
-    return renderWorkflowWidgetLinesUnsafe(bundle, width, theme, now);
+    return renderWorkflowWidgetLinesUnsafe(bundle, width, theme, now, viewport);
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown rendering error";
     return [truncateToWidth(
@@ -42,6 +44,7 @@ function renderWorkflowWidgetLinesUnsafe(
   width: number,
   theme: WidgetTheme,
   now: Date,
+  viewport?: WorkflowWidgetViewport,
 ): string[] {
   const state = bundle.state;
   const title = sanitizeText(state.runTitle ?? state.workflowName);
@@ -58,7 +61,7 @@ function renderWorkflowWidgetLinesUnsafe(
     `${paintStatusGlyph(status, theme)} ${theme.fg("accent", theme.bold(title))}`
       + theme.fg("dim", `${unknownStatus}  ${elapsed} · ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}`),
   ];
-  const outline = renderCompactOutline(bundle.snapshot, state, now, theme);
+  const outline = renderCompactOutline(bundle.snapshot, state, now, theme, viewport);
   return [...header, ...outline].map((line) => truncateToWidth(line, width, "…"));
 }
 
@@ -81,6 +84,7 @@ function renderCompactOutline(
   state: WorkflowRunState,
   now: Date,
   theme: WidgetTheme,
+  viewport?: WorkflowWidgetViewport,
 ): string[] {
   const plain = renderWorkflowOutline(snapshot, state, now);
   const styled = renderWorkflowOutline(snapshot, state, now, theme);
@@ -88,8 +92,13 @@ function renderCompactOutline(
   const anchor = anchorNode === undefined
     ? 0
     : Math.max(0, plain.findIndex((line) => line.includes(`${sanitizeText(anchorNode)}  `)));
-  const start = Math.max(0, anchor - 2);
-  const end = Math.min(styled.length, anchor + 3);
+  const viewportRows = 5;
+  let start = viewport?.start ?? Math.max(0, anchor - 2);
+  start = Math.min(start, Math.max(0, styled.length - viewportRows));
+  if (anchor < start) start = anchor;
+  else if (anchor >= start + viewportRows) start = anchor - viewportRows + 1;
+  if (viewport !== undefined) viewport.start = start;
+  const end = Math.min(styled.length, start + viewportRows);
   const earlier = start;
   const later = styled.length - end;
   return [
