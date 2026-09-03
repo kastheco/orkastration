@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const projectRoot = resolve(import.meta.dirname, "../../..");
 
-test("the packed package applies its workflow and questionnaire patches without dev dependencies", async () => {
+test("the packed package resolves one pi-workflows client without dev dependencies", async () => {
   const root = await mkdtemp(join(tmpdir(), "orkastrator-package-install-"));
   const packed = join(root, "packed");
   const consumer = join(root, "consumer");
@@ -56,11 +56,11 @@ test("the packed package applies its workflow and questionnaire patches without 
         "tsx",
         "--input-type=module",
         "-e",
-        "import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; const rootRequire = createRequire(import.meta.url); const orkRequire = createRequire(rootRequire.resolve('orkastrator-pi/package.json')); const workflowPath = orkRequire.resolve('@osolmaz/pi-workflows'); const workflows = await import(pathToFileURL(workflowPath).href); const extension = await import(pathToFileURL(orkRequire.resolve('@osolmaz/pi-workflows/extension')).href); const questionnaire = await import(pathToFileURL(orkRequire.resolve('@juicesharp/rpiv-ask-user-question')).href); console.log([workflowPath === rootRequire.resolve('@osolmaz/pi-workflows'), workflows.readWorkflowContinuationRunId, extension.pendingDecisionForSession, extension.registerWorkflowHumanDecisionPresenter, questionnaire.presentQuestionnaire, extension.answerExactPendingDecision].map((value) => typeof value === 'boolean' ? String(value) : typeof value).join(','))",
+        "import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; const rootRequire = createRequire(import.meta.url); const orkRequire = createRequire(rootRequire.resolve('orkastrator-pi/package.json')); const workflowPath = orkRequire.resolve('@osolmaz/pi-workflows'); const workflows = await import(pathToFileURL(workflowPath).href); const extension = await import(pathToFileURL(orkRequire.resolve('@osolmaz/pi-workflows/extension')).href); const questionnaire = await import(pathToFileURL(orkRequire.resolve('@juicesharp/rpiv-ask-user-question')).href); const client = await import(pathToFileURL(orkRequire.resolve('@osolmaz/pi-workflows/client')).href); console.log([workflowPath === rootRequire.resolve('@osolmaz/pi-workflows'), typeof client.WorkflowClient, typeof workflows.readWorkflowRun, typeof questionnaire.presentQuestionnaire].join(','))",
       ],
       { cwd: consumer, encoding: "utf8", timeout: 30_000 },
     );
-    assert.equal(imported.stdout.trim(), "true,function,function,function,function,undefined");
+    assert.equal(imported.stdout.trim(), "true,function,function,function");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
