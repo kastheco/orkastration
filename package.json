@@ -55,7 +55,7 @@
   },
   "dependencies": {
     "@juicesharp/rpiv-ask-user-question": "2.9.0",
-    "@osolmaz/pi-workflows": "0.15.3",
+    "@osolmaz/pi-workflows": "0.16.0",
     "patch-package": "^8.0.1",
     "tsx": "^4.23.13"
   },

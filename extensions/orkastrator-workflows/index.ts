@@ -3,11 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import piWorkflows from "@osolmaz/pi-workflows/extension";
-import {
-  readWorkflowContinuationRunId,
-  readWorkflowRun,
-  type WorkflowRunState,
-} from "@osolmaz/pi-workflows";
+import { readWorkflowRun, type WorkflowRunState } from "@osolmaz/pi-workflows";
 
 import { WorkflowDecisionQuestionnaire } from "./decision-questionnaire.ts";
 import { detectDelegationBackend, installDelegationBridge } from "./delegation-bridge.ts";
@@ -207,9 +203,23 @@ function workflowWidgetRunAfterContinuation(
   return selectedLaunchId === continuingLaunchId ? continuationRunId : currentRunId;
 }
 
+/**
+ * Reads the continuation chain starting at `runId`.
+ *
+ * Pi Workflows 0.16.0 exposes no continuation read: the `continuations` table
+ * exists and the host writes it, but no client operation or run-view field
+ * returns it, and the host is now the only process permitted to open the live
+ * database. Chain following is therefore inert until upstream exposes it, so
+ * the widget and the Herdr broker stay on the launched run instead of hopping
+ * to its continuation.
+ *
+ * `continuationFor` stays injectable so the existing coverage still pins the
+ * traversal, including its cycle and depth guards, for when a supported read
+ * arrives.
+ */
 function workflowContinuationChain(
   runId: string,
-  continuationFor: (parentRunId: string) => string | undefined = readWorkflowContinuationRunId,
+  continuationFor: (parentRunId: string) => string | undefined = () => undefined,
 ): string[] {
   const chain: string[] = [];
   const seen = new Set([runId]);

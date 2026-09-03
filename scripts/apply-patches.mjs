@@ -52,11 +52,6 @@ function applyDependencyPatch(entry, packageName, patchName) {
 }
 
 applyDependencyPatch(
-  "@osolmaz/pi-workflows",
-  "@osolmaz/pi-workflows",
-  "@osolmaz+pi-workflows+0.15.3.patch",
-);
-applyDependencyPatch(
   "@juicesharp/rpiv-ask-user-question",
   "@juicesharp/rpiv-ask-user-question",
   "@juicesharp+rpiv-ask-user-question+2.9.0.patch",
