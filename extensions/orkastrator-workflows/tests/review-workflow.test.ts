@@ -19,9 +19,12 @@ import type {
 
 import cookWorkflow from "../../../.pi/workflows/orkastrator-cook.workflow.ts";
 import implementWorkflow from "../../../.pi/workflows/orkastrator-implement.workflow.ts";
+import planChangeWorkflow from "../../../.pi/workflows/orkastrator-plan-change.workflow.ts";
 import reviewWorkflow from "../../../.pi/workflows/orkastrator-review.workflow.ts";
 import {
+  captureRepositoryBaseline,
   createImplementationWorktree,
+  createPreparedTaskWorktree,
   parseLifecycleInput,
   parseOwnerResolvedStatus,
   parseRepositoryResolution,
@@ -158,15 +161,13 @@ test("/kas:cook resolves UTM coordination roots from ticket and repository evide
   } as never) as { repository: string };
   assert.equal(planning.repository, implementationRepository);
 
-  const createWorktree = (cookWorkflow as unknown as {
-    nodes: { createWorktree: { effect: { request(context: unknown): unknown } } };
-  }).nodes.createWorktree;
-  assert.deepEqual(createWorktree.effect.request({
-    state: { runId: "continuation-run" },
-    outputs: { resolveRepository: resolution },
+  const captureLaunchBaseline = (cookWorkflow as unknown as {
+    nodes: { captureLaunchBaseline: { effect: { request(context: unknown): unknown } } };
+  }).nodes.captureLaunchBaseline;
+  assert.deepEqual(captureLaunchBaseline.effect.request({
+    input: lifecycle,
   } as never), {
-    repository: implementationRepository,
-    runId: "continuation-run",
+    repository: launchRepository,
   });
 });
 
@@ -223,16 +224,32 @@ test("implementation workflows create Worktrunk isolation at the required stage"
     { from: "plan", to: "classifyPlan" },
   ]);
   assert.equal(
-    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "planning.ready" && edge.to === "createWorktree"),
+    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "verifyRepository" && edge.to === "captureLaunchBaseline"),
     true,
   );
   assert.equal(
-    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "createWorktree" && edge.to === "implementation"),
+    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "captureLaunchBaseline" && edge.to === "planning"),
     true,
   );
   assert.equal(
     cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "planning.ready" && edge.to === "implementation"),
+    true,
+  );
+  assert.equal(
+    cookWorkflow.edges.some((edge) => "to" in edge && edge.from === "planning.ready" && edge.to === "createWorktree"),
     false,
+  );
+  assert.equal(
+    planChangeWorkflow.edges.some(
+      (edge) => "switch" in edge
+        && edge.from === "assessPlan"
+        && edge.switch.cases.prepare === "prepareWorkspace",
+    ),
+    true,
+  );
+  assert.equal(
+    planChangeWorkflow.edges.some((edge) => "to" in edge && edge.from === "prepareWorkspace" && edge.to === "documentation"),
+    true,
   );
 });
 
@@ -344,6 +361,239 @@ test("Worktrunk creates and recovers one deterministic implementation worktree",
   assert.equal(calls[1]?.includes("--create"), true);
   assert.equal(calls[2]?.includes("--create"), false);
   assert.equal(await git(worktree, ["rev-parse", "HEAD"]), first.baseRevision);
+});
+
+test("prepared task worktree records and isolates initial launch-repository dirt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-prepared-worktree-"));
+  const repository = join(root, "repo");
+  const worktree = join(root, "task");
+  try {
+    await git(root, ["init", "--initial-branch=main", repository]);
+    await git(repository, ["config", "user.name", "Orkastrator Test"]);
+    await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+    await writeFile(join(repository, "tracked.md"), "base\n", "utf8");
+    await git(repository, ["add", "tracked.md"]);
+    await git(repository, ["commit", "-m", "base"]);
+    await writeFile(join(repository, "tracked.md"), "user change\n", "utf8");
+    await writeFile(join(repository, "untracked.md"), "user note\n", "utf8");
+
+    const before = await git(repository, ["status", "--short"]);
+    const baseline = await captureRepositoryBaseline(
+      repository,
+      new AbortController().signal,
+    );
+    const runner: WorktrunkRunner = async (source, args) => {
+      assert.equal(source, repository);
+      const branch = args[args.indexOf("--create") + 1]!;
+      await git(source, ["worktree", "add", "-b", branch, worktree, "HEAD"]);
+      return JSON.stringify({ action: "created", branch, path: worktree });
+    };
+    const prepared = await createPreparedTaskWorktree(
+      repository,
+      "cook-run",
+      new AbortController().signal,
+      runner,
+    );
+
+    assert.deepEqual(baseline.changedPaths, ["tracked.md", "untracked.md"]);
+    assert.equal(prepared.schema, "pi-workflows.prepared-workspace.v1");
+    assert.equal(prepared.mode, "worktree");
+    assert.equal(prepared.repository, repository);
+    assert.equal(prepared.worktreePath, worktree);
+    assert.equal(prepared.baseRevision, baseline.headRevision);
+    assert.deepEqual(prepared.preExistingChangedPaths, baseline.changedPaths);
+    assert.equal(await git(repository, ["status", "--short"]), before);
+    assert.equal(await git(worktree, ["status", "--short"]), "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow-owned documentation changes reuse one prepared worktree across replan and resume", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-replan-worktree-"));
+  const repository = join(root, "repo");
+  const taskWorktree = join(root, "task");
+  try {
+    await git(root, ["init", "--initial-branch=main", repository]);
+    await git(repository, ["config", "user.name", "Orkastrator Test"]);
+    await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+    await writeFile(join(repository, "base.txt"), "base\n", "utf8");
+    await git(repository, ["add", "base.txt"]);
+    await git(repository, ["commit", "-m", "base"]);
+    const runner: WorktrunkRunner = async (source, args) => {
+      const branch = args[args.indexOf("--create") + 1]!;
+      await git(source, ["worktree", "add", "-b", branch, taskWorktree, "HEAD"]);
+      return JSON.stringify({ action: "created", branch, path: taskWorktree });
+    };
+    const prepared = await createPreparedTaskWorktree(
+      repository,
+      "planning-run",
+      new AbortController().signal,
+      runner,
+    );
+    await writeFile(join(taskWorktree, "plan.md"), "workflow-owned documentation\n", "utf8");
+    assert.match(await git(taskWorktree, ["status", "--short"]), /plan\.md/u);
+
+    const request = {
+      task: "update the scheduler",
+      repository: prepared.repository,
+      approval: { mode: "required", audience: "operator", maxReplans: 3 },
+    };
+    const prepareWorkspace = (planChangeWorkflow as unknown as {
+      nodes: {
+        prepareWorkspace: {
+          effect: {
+            idempotencyKey(context: unknown): string;
+            request(context: unknown): unknown;
+          };
+          run(context: unknown): Promise<unknown>;
+        };
+      };
+    }).nodes.prepareWorkspace;
+    const effectContext = {
+      input: request,
+      outputs: {},
+      state: { runId: "same-run", steps: [] },
+    } as never;
+    const resumedEffectContext = {
+      input: request,
+      outputs: { prepareWorkspace: prepared },
+      state: { runId: "same-run", steps: [] },
+    } as never;
+    assert.equal(
+      prepareWorkspace.effect.idempotencyKey(effectContext),
+      prepareWorkspace.effect.idempotencyKey(resumedEffectContext),
+    );
+    assert.deepEqual(
+      prepareWorkspace.effect.request(effectContext),
+      prepareWorkspace.effect.request(resumedEffectContext),
+    );
+
+    const replanned = await prepareWorkspace.run({
+      input: request,
+      outputs: { prepareWorkspace: prepared },
+      state: { runId: "continuation-replan", steps: [] },
+      signal: new AbortController().signal,
+    } as never);
+    assert.deepEqual(replanned, prepared);
+
+    const resumed = await prepareWorkspace.run({
+      input: request,
+      outputs: {},
+      state: {
+        runId: "continuation-resume",
+        steps: [{ nodeId: "prepareWorkspace", outcome: "ok", output: prepared }],
+      },
+      signal: new AbortController().signal,
+    } as never);
+    assert.deepEqual(resumed, prepared);
+    assert.match(await git(taskWorktree, ["status", "--short"]), /plan\.md/u);
+
+    const documentation = (planChangeWorkflow as unknown as {
+      includes: { documentation: { input(context: unknown): unknown } };
+    }).includes.documentation.input({
+      input: request,
+      outputs: {
+        design: { exit: "ready", output: { plan: { steps: ["update docs"] } } },
+        prepareWorkspace: prepared,
+      },
+    } as never) as { repository: string; preparedWorkspace: unknown };
+    assert.equal(documentation.repository, prepared.repository);
+    assert.deepEqual(documentation.preparedWorkspace, prepared);
+
+    const implementation = (cookWorkflow as unknown as {
+      includes: { implementation: { input(context: unknown): unknown } };
+    }).includes.implementation.input({
+      input: parseLifecycleInput({ task: request.task, repository: prepared.repository }),
+      outputs: {
+        planning: {
+          exit: "ready",
+          output: {
+            status: "ready",
+            plan: { steps: ["update docs"] },
+            planDigest: "sha256:plan",
+            documents: ["plan.md"],
+            preparedWorkspace: prepared,
+          },
+        },
+      },
+    } as never) as { repository: string; preparedWorkspace: unknown };
+    assert.equal(implementation.repository, prepared.repository);
+    assert.deepEqual(implementation.preparedWorkspace, prepared);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelled task-worktree preparation leaves launch changes untouched", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-cancelled-worktree-"));
+  const repository = join(root, "repo");
+  try {
+    await git(root, ["init", "--initial-branch=main", repository]);
+    await git(repository, ["config", "user.name", "Orkastrator Test"]);
+    await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+    await writeFile(join(repository, "base.txt"), "base\n", "utf8");
+    await git(repository, ["add", "base.txt"]);
+    await git(repository, ["commit", "-m", "base"]);
+    await writeFile(join(repository, "mine.txt"), "keep\n", "utf8");
+    const before = await git(repository, ["status", "--short"]);
+    const controller = new AbortController();
+    const runner: WorktrunkRunner = async () => {
+      controller.abort(new Error("cancelled"));
+      throw controller.signal.reason;
+    };
+
+    await assert.rejects(
+      createPreparedTaskWorktree(repository, "cancelled-run", controller.signal, runner),
+      /cancelled/u,
+    );
+    assert.equal(await git(repository, ["status", "--short"]), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("implementation child worktrees can branch from the prepared task worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-child-worktree-"));
+  const repository = join(root, "repo");
+  const taskWorktree = join(root, "task");
+  const childWorktree = join(root, "child");
+  try {
+    await git(root, ["init", "--initial-branch=main", repository]);
+    await git(repository, ["config", "user.name", "Orkastrator Test"]);
+    await git(repository, ["config", "user.email", "orkastrator@example.test"]);
+    await writeFile(join(repository, "base.txt"), "base\n", "utf8");
+    await git(repository, ["add", "base.txt"]);
+    await git(repository, ["commit", "-m", "base"]);
+
+    const taskRunner: WorktrunkRunner = async (source, args) => {
+      const branch = args[args.indexOf("--create") + 1]!;
+      await git(source, ["worktree", "add", "-b", branch, taskWorktree, "HEAD"]);
+      return JSON.stringify({ action: "created", branch, path: taskWorktree });
+    };
+    const prepared = await createPreparedTaskWorktree(
+      repository,
+      "parent-run",
+      new AbortController().signal,
+      taskRunner,
+    );
+    const childRunner: WorktrunkRunner = async (source, args) => {
+      assert.equal(source, taskWorktree);
+      const branch = args[args.indexOf("--create") + 1]!;
+      await git(source, ["worktree", "add", "-b", branch, childWorktree, "HEAD"]);
+      return JSON.stringify({ action: "created", branch, path: childWorktree });
+    };
+    const child = await createImplementationWorktree(
+      prepared.worktreePath!,
+      "child-run",
+      new AbortController().signal,
+      childRunner,
+    );
+    assert.equal(child.repository, childWorktree);
+    assert.equal(await git(childWorktree, ["rev-parse", "HEAD"]), prepared.baseRevision);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("review target requires one reported clean implementation repository", async () => {

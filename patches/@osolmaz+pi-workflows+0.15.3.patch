@@ -1,3 +1,39 @@
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js b/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js
+index 828fca1..af40a33 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js
+@@ -112,6 +112,11 @@ function currentPlan(context) {
+         return located.plan;
+     throw new Error("autodoc does not have a selected plan");
+ }
++function inspectionRepository(request) {
++    return request.preparedWorkspace?.worktreePath ??
++        request.preparedWorkspace?.repository ??
++        request.repository;
++}
+ function mutationRepository(request) {
+     if (request.repository !== undefined)
+         return request.repository;
+@@ -248,8 +253,9 @@ export const autodocWorkflow = defineWorkflow({
+                     "Look in the current conversation context and in the referenced canonical documents.",
+                     "Do not devise, improve, replace, or implement the plan.",
+                     "Return blocked when no single clear selected plan exists.",
++                    "Read repository files only under the exact absolute repository path below.",
+                     `Task: ${request.task}`,
+-                    `Repository: ${request.repository ?? "current repository"}`,
++                    `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+                     `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
+                 ].join("\n");
+             },
+@@ -279,6 +285,8 @@ export const autodocWorkflow = defineWorkflow({
+                     "Choose current only when the documents already preserve the whole selected plan and its boundaries.",
+                     "Choose update when documents are missing or stale and can be corrected in scope.",
+                     "Choose blocked only when no safe canonical target exists or repository rules prohibit the documentation change.",
++                    "Read and assess documentation only under the exact absolute repository path below. Do not use an equivalent file from another checkout.",
++                    `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+                     `Task: ${request.task}`,
+                     `Selected plan: ${JSON.stringify(currentPlan(context))}`,
+                     `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts b/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
 index 4fc12ac..f90c7cb 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
@@ -380,6 +416,32 @@ index a2e53a4..864c4f2 100644
      }
      const text = buffer.toString("utf8");
      const value = parseJson(text);
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
+index 9d68505..ce5437f 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
+@@ -33,17 +33,19 @@ export class HostBackedWorkflowStore {
+         return await this.call("store.publishUpdate", { runId, state, nodeId, attemptId, update }, attemptId);
+     }
+     async findSettingsScope(runId, mountPath, invocation) {
+-        return await this.call("store.findSettingsScope", {
++        const scope = await this.call("store.findSettingsScope", {
+             runId,
+             mountPath,
+             invocation,
+         });
++        return scope === null ? undefined : scope;
+     }
+     async ensureSettingsScope(options) {
+         return await this.call("store.ensureSettingsScope", { options });
+     }
+     async getSettingsScopeAtChange(scopeId, changeNumber) {
+-        return await this.call("store.getSettingsScopeAtChange", { scopeId, changeNumber });
++        const scope = await this.call("store.getSettingsScopeAtChange", { scopeId, changeNumber });
++        return scope === null ? undefined : scope;
+     }
+     async createHumanDecisionRequest(request) {
+         return await this.call("store.createHumanDecisionRequest", { request }, request.attemptId);
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts b/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts
 index 907101f..af70a25 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/workflows/index.d.ts
@@ -465,6 +527,45 @@ index 33708e2..759554f 100644
  export function readLastTraceEvent(runId, options = {}) {
      const store = new WorkflowRunStore(options.databasePath ?? workflowStatePath(), {
          readOnly: true,
+diff --git a/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts b/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts
+index a3d34be..a2148f9 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts
+@@ -191,6 +191,14 @@ function currentPlan(context: WorkflowNodeContext): unknown {
+   throw new Error("autodoc does not have a selected plan");
+ }
+ 
++function inspectionRepository(request: AutodocInput): string | undefined {
++  return (
++    request.preparedWorkspace?.worktreePath
++    ?? request.preparedWorkspace?.repository
++    ?? request.repository
++  );
++}
++
+ function mutationRepository(request: AutodocInput): string {
+   if (request.repository !== undefined) return request.repository;
+   if (request.preparedWorkspace !== undefined) return request.preparedWorkspace.repository;
+@@ -329,8 +337,9 @@ export const autodocWorkflow = defineWorkflow({
+           "Look in the current conversation context and in the referenced canonical documents.",
+           "Do not devise, improve, replace, or implement the plan.",
+           "Return blocked when no single clear selected plan exists.",
++          "Read repository files only under the exact absolute repository path below.",
+           `Task: ${request.task}`,
+-          `Repository: ${request.repository ?? "current repository"}`,
++          `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+           `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
+         ].join("\n");
+       },
+@@ -361,6 +370,8 @@ export const autodocWorkflow = defineWorkflow({
+           "Choose current only when the documents already preserve the whole selected plan and its boundaries.",
+           "Choose update when documents are missing or stale and can be corrected in scope.",
+           "Choose blocked only when no safe canonical target exists or repository rules prohibit the documentation change.",
++          "Read and assess documentation only under the exact absolute repository path below. Do not use an equivalent file from another checkout.",
++          `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+           `Task: ${request.task}`,
+           `Selected plan: ${JSON.stringify(currentPlan(context))}`,
+           `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
 diff --git a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
 index 5e8f58f..b990683 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
@@ -853,6 +954,40 @@ index 02bb8ad..ef62fec 100644
    }
    const text = buffer.toString("utf8");
    const value = parseJson(text);
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
+index 5d76c77..6d89260 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
+@@ -104,11 +104,11 @@ export class HostBackedWorkflowStore implements WorkflowExecutionStore {
+     mountPath: string,
+     invocation: number,
+   ): Promise<WorkflowSettingsScopeRecord | undefined> {
+-    return await this.call<WorkflowSettingsScopeRecord | undefined>("store.findSettingsScope", {
+-      runId,
+-      mountPath,
+-      invocation,
+-    });
++    const scope = await this.call<WorkflowSettingsScopeRecord | null>(
++      "store.findSettingsScope",
++      { runId, mountPath, invocation },
++    );
++    return scope === null ? undefined : scope;
+   }
+ 
+   async ensureSettingsScope(options: {
+@@ -124,10 +124,11 @@ export class HostBackedWorkflowStore implements WorkflowExecutionStore {
+     scopeId: string,
+     changeNumber: number,
+   ): Promise<WorkflowSettingsScopeRecord | undefined> {
+-    return await this.call<WorkflowSettingsScopeRecord | undefined>(
++    const scope = await this.call<WorkflowSettingsScopeRecord | null>(
+       "store.getSettingsScopeAtChange",
+       { scopeId, changeNumber },
+     );
++    return scope === null ? undefined : scope;
+   }
+ 
+   async createHumanDecisionRequest(request: HumanDecisionRequest): Promise<"created" | "adopted"> {
 diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts
 index 06e01b1..b8968bd 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/workflows/index.ts

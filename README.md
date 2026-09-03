@@ -89,7 +89,7 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 ```
 
 - `/kas` starts `orkastrator-implement.workflow.ts`. it immediately creates an isolated Worktrunk branch and worktree, then one durable workflow owns the implementation-ready plan, implementation, verification, delivery, committed review target, review, repair waves, and final result there.
-- `/kas:cook` starts `orkastrator-cook.workflow.ts`. It first resolves one implementation repository from ticket labels, repository routing documents, and code ownership evidence. Planning, canonical documentation, and required operator approval use that resolved repository. Once the plan is approved, the workflow creates an isolated Worktrunk branch and worktree there for implementation, verification, delivery, and the full Orkastrator review policy. Ambiguous ownership stops before planning.
+- `/kas:cook` starts `orkastrator-cook.workflow.ts`. it resolves one implementation repository from ticket labels, repository routing documents, and code ownership evidence, records the launch checkout baseline, and keeps solution design read-only. before autodoc can mutate a canonical file, the workflow creates one isolated Worktrunk task branch and worktree. documentation, protected approval and replanning, implementation, verification, delivery, and Orkastrator review all reuse that prepared workspace. ambiguous ownership stops before planning.
 - `/kas:check` starts `orkastrator-review.workflow.ts` against the repository's committed `HEAD`. it won't guess when the worktree is dirty.
 - `/kas:workflow` expands the attached workflow into a scrollable overlay. use `↑`/`↓` or `j`/`k`, jump with home/end, and close with `q` or escape.
 - `/kas:status [run-id]` reports the active workflow or the specified durable run.
@@ -100,6 +100,16 @@ run pi from a trusted git repository, then choose how much ceremony you want:
 each command addresses its packaged workflow by exact installed file path. the command turn only resolves the repository and launches the workflow. planning, implementation, grilling, and review stay inside the graph.
 
 implementation worktrees use deterministic per-run branches based on the invoking `HEAD`. Worktrunk runs non-interactively with hooks disabled, and the workflow verifies the returned root, branch, base revision, and clean state before passing it to autoimplementation. creation or identity failures block the run instead of falling back to the invoking checkout.
+
+### `/kas:cook` workspace lifecycle
+
+`/kas:cook` keeps three repository identities separate:
+
+1. **launch repository** — the checkout supplied when the command starts. repository routing and solution design may read it, but the workflow records its branch, `HEAD`, and changed paths before any workspace mutation. pre-existing tracked or untracked user paths remain there and are never reset, stashed, copied into the task branch, or treated as workflow output.
+2. **prepared task worktree** — one deterministic Worktrunk worktree created from the resolved repository's committed `HEAD`. the durable `pi-workflows.prepared-workspace.v1` receipt records its owner repository, path, base and task branches, base revision, original changed paths, and scope. autodoc is the first mutating stage and receives this receipt. replans and resumed continuations adopt the same receipt even after workflow-owned documentation changes make the task worktree dirty.
+3. **child implementation worktrees** — implementation or review workers may create child Worktrunk worktrees from the prepared task worktree. those children do not change the launch checkout or replace the prepared workspace identity owned by the workflow.
+
+cleanliness checks are relative to the prepared-workspace baseline. the task worktree must begin clean, but it is expected to change after autodoc and implementation begin. final review still requires the reported implementation repository to be committed and clean. cancellation retains durable workflow state and existing worktree safety behavior; it never cleans up by rewriting user changes.
 
 the direct equivalent of `/kas:check` is:
 
@@ -143,7 +153,7 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 65 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
+A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 94 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
 
 The session broker has a real separate-process Unix socket test for result delivery, cancellation, and accepted continuation runs. Herdr worker placement remains rooted in the originating session while the widget follows the newest continuation through its terminal state. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
 

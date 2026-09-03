@@ -1,4 +1,5 @@
 import {
+  action,
   compute,
   defineWorkflow,
   includeWorkflow,
@@ -19,6 +20,11 @@ import {
   type PlanApprovalResolution,
   type ResolvedPlanApprovalPolicy,
 } from "@osolmaz/pi-workflows/builtins";
+
+import {
+  createPreparedTaskWorktree,
+  type PreparedTaskWorkspace,
+} from "../../extensions/orkastrator-workflows/lifecycle-runtime.ts";
 
 export type PlanChangeInput = {
   task: string;
@@ -46,6 +52,7 @@ export type PlanChangeReady = {
   revision: number;
   approval: PlanApprovalResolution;
   documentation: { files: string[] };
+  preparedWorkspace?: PreparedTaskWorkspace;
 };
 
 export type PlanChangeBlocked = {
@@ -180,6 +187,29 @@ function latestReplanInstructions(outputs: Record<string, unknown>): string | un
   return result.exit === "replan" ? result.output.instructions : undefined;
 }
 
+function parsePreparedTaskWorkspace(value: unknown): PreparedTaskWorkspace {
+  const parsed = parseAutodocOptions({ preparedWorkspace: value }).preparedWorkspace;
+  if (parsed === undefined) throw new Error("plan change prepared workspace is missing");
+  return parsed;
+}
+
+function currentPreparedWorkspace(
+  context: Pick<WorkflowNodeContext, "input" | "outputs" | "state">,
+): PreparedTaskWorkspace | undefined {
+  const request = context.input as NormalizedPlanChangeInput;
+  if (request.preparedWorkspace !== undefined) return request.preparedWorkspace;
+  if (context.outputs.prepareWorkspace !== undefined) {
+    return parsePreparedTaskWorkspace(context.outputs.prepareWorkspace);
+  }
+  for (let index = context.state.steps.length - 1; index >= 0; index -= 1) {
+    const step = context.state.steps[index];
+    if (step?.nodeId === "prepareWorkspace" && step.outcome === "ok") {
+      return parsePreparedTaskWorkspace(step.output);
+    }
+  }
+  return undefined;
+}
+
 function blockedResult(context: WorkflowNodeContext): PlanChangeBlocked {
   if (context.outputs.approval !== undefined) {
     const approval = includedResult(planApprovalWorkflow, context.outputs.approval);
@@ -191,7 +221,14 @@ function blockedResult(context: WorkflowNodeContext): PlanChangeBlocked {
       };
     }
   }
-  const candidates = ["replanGuard", "assessPlan", "approval", "documentation", "design"];
+  const candidates = [
+    "replanGuard",
+    "assessPlan",
+    "prepareWorkspace",
+    "approval",
+    "documentation",
+    "design",
+  ];
   for (let index = context.state.steps.length - 1; index >= 0; index -= 1) {
     const step = context.state.steps[index];
     if (step === undefined || !candidates.some((candidate) => step.nodeId.startsWith(candidate))) {
@@ -256,13 +293,14 @@ export const planChangeWorkflow = defineWorkflow({
       input: (context): AutodocInput => {
         const request = context.input as NormalizedPlanChangeInput;
         const design = currentDesign(context);
+        const workspace = currentPreparedWorkspace(context);
         return {
           task: request.task,
           plan: design.plan,
           ...(request.repository !== undefined ? { repository: request.repository } : {}),
-          ...(request.preparedWorkspace === undefined
+          ...(workspace === undefined
             ? {}
-            : { preparedWorkspace: request.preparedWorkspace as NonNullable<AutodocInput["preparedWorkspace"]> }),
+            : { preparedWorkspace: workspace as NonNullable<AutodocInput["preparedWorkspace"]> }),
           ...(request.directDefaultBranchAuthorized === undefined
             ? {}
             : { directDefaultBranchAuthorized: request.directDefaultBranchAuthorized }),
@@ -308,13 +346,49 @@ export const planChangeWorkflow = defineWorkflow({
       run: (context) => {
         const request = context.input as NormalizedPlanChangeInput;
         const design = currentDesign(context);
-        return request.previousPlan !== undefined && design.changed !== true
-          ? {
-              route: "blocked",
-              reason: "Planning returned the same plan for the unresolved evidence.",
-              evidence: design,
-            }
-          : { route: "document", planDigest: design.planDigest };
+        if (request.previousPlan !== undefined && design.changed !== true) {
+          return {
+            route: "blocked",
+            reason: "Planning returned the same plan for the unresolved evidence.",
+            evidence: design,
+          };
+        }
+        return {
+          route:
+            request.repository !== undefined || request.preparedWorkspace !== undefined
+              ? "prepare"
+              : "document",
+          planDigest: design.planDigest,
+        };
+      },
+    }),
+    prepareWorkspace: action({
+      statusDetail: "preparing the durable task worktree before documentation changes",
+      timeoutMs: 30_000,
+      effect: {
+        type: "orkastrator.prepare-task-worktree",
+        idempotencyKey: (context) => `${context.state.runId}:prepare-task-worktree`,
+        request: (context: WorkflowNodeContext) => {
+          const request = context.input as NormalizedPlanChangeInput;
+          return {
+            repository: request.repository ?? request.preparedWorkspace?.repository,
+            runId: context.state.runId,
+          };
+        },
+        recovery: "idempotent",
+      },
+      run: async (context) => {
+        const existing = currentPreparedWorkspace(context);
+        if (existing !== undefined) return existing;
+        const request = context.input as NormalizedPlanChangeInput;
+        if (request.repository === undefined) {
+          throw new Error("plan change workspace preparation requires a repository");
+        }
+        return await createPreparedTaskWorktree(
+          request.repository,
+          context.state.runId,
+          context.signal,
+        );
       },
     }),
     replanGuard: compute({
@@ -340,6 +414,7 @@ export const planChangeWorkflow = defineWorkflow({
         const revision = context.state.steps.filter(
           (step) => step.nodeId === "approval/routePolicy",
         ).length;
+        const workspace = currentPreparedWorkspace(context);
         return {
           status: "ready",
           plan: documented.plan,
@@ -348,6 +423,7 @@ export const planChangeWorkflow = defineWorkflow({
           revision,
           approval: approval.resolution,
           documentation: { files: documented.documentation.files },
+          ...(workspace === undefined ? {} : { preparedWorkspace: workspace }),
         } satisfies PlanChangeReady;
       },
     }),
@@ -359,8 +435,12 @@ export const planChangeWorkflow = defineWorkflow({
     { from: "design.blocked", to: "blocked" },
     {
       from: "assessPlan",
-      switch: { on: "$.route", cases: { document: "documentation", blocked: "blocked" } },
+      switch: {
+        on: "$.route",
+        cases: { prepare: "prepareWorkspace", document: "documentation", blocked: "blocked" },
+      },
     },
+    { from: "prepareWorkspace", to: "documentation" },
     { from: "documentation.ready", to: "approval" },
     { from: "documentation.blocked", to: "blocked" },
     { from: "approval.continue", to: "finalize" },

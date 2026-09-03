@@ -4,7 +4,10 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import type { AutoimplementCompleted } from "@osolmaz/pi-workflows/builtins";
+import type {
+  AutodocInput,
+  AutoimplementCompleted,
+} from "@osolmaz/pi-workflows/builtins";
 
 import {
   parseOptionalHerdrLaunchBinding,
@@ -34,6 +37,15 @@ export type ImplementationWorktree = {
   branch: string;
   baseRevision: string;
 };
+
+export type RepositoryBaseline = {
+  repository: string;
+  branch: string;
+  headRevision: string;
+  changedPaths: string[];
+};
+
+export type PreparedTaskWorkspace = NonNullable<AutodocInput["preparedWorkspace"]>;
 
 export type ReviewTarget = {
   repository: string;
@@ -244,6 +256,141 @@ function parseWorktrunkPath(stdout: string, branch: string): string {
   return output.path;
 }
 
+async function repositoryChangedPaths(
+  repository: string,
+  signal: AbortSignal,
+): Promise<string[]> {
+  const result = await execFileAsync(
+    "git",
+    ["-C", repository, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    { encoding: "utf8", maxBuffer: 2_000_000, signal },
+  );
+  const entries = result.stdout.split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    const status = entry.slice(0, 2);
+    paths.push(entry.slice(3));
+    if ((status.includes("R") || status.includes("C")) && entries[index + 1] !== undefined) {
+      paths.push(entries[index + 1]!);
+      index += 1;
+    }
+  }
+  return [...new Set(paths)].sort();
+}
+
+export async function captureRepositoryBaseline(
+  repository: string,
+  signal: AbortSignal,
+): Promise<RepositoryBaseline> {
+  const source = await realpath(repository);
+  const topLevel = await realpath(await git(source, ["rev-parse", "--show-toplevel"], signal));
+  if (topLevel !== source) {
+    throw new Error("Repository baseline must name a Git worktree root");
+  }
+  const branch = await git(source, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal);
+  const headRevision = await git(source, ["rev-parse", "HEAD"], signal);
+  if (!SHA.test(headRevision)) {
+    throw new Error("Repository baseline HEAD is not a full Git revision");
+  }
+  return {
+    repository: source,
+    branch,
+    headRevision,
+    changedPaths: await repositoryChangedPaths(source, signal),
+  };
+}
+
+async function createOrAdoptWorktrunk(
+  source: string,
+  branch: string,
+  signal: AbortSignal,
+  runner: WorktrunkRunner,
+): Promise<string> {
+  try {
+    return await runner(
+      source,
+      ["switch", "--create", branch, "--base", "@", "--no-hooks", "--no-cd", "--format=json"],
+      signal,
+    );
+  } catch (error) {
+    const exists = await git(source, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], signal)
+      .then(() => true, () => false);
+    if (!exists) throw error;
+    return await runner(
+      source,
+      ["switch", branch, "--no-hooks", "--no-cd", "--format=json"],
+      signal,
+    );
+  }
+}
+
+export async function createPreparedTaskWorktree(
+  repository: string,
+  runId: string,
+  signal: AbortSignal,
+  runner: WorktrunkRunner = runWorktrunk,
+): Promise<PreparedTaskWorkspace> {
+  const baseline = await captureRepositoryBaseline(repository, signal);
+  const runDigest = createHash("sha256").update(runId).digest("hex").slice(0, 16);
+  const workBranch = `orkastrator/${runDigest}/task`;
+  const stdout = await createOrAdoptWorktrunk(
+    baseline.repository,
+    workBranch,
+    signal,
+    runner,
+  );
+  const worktree = await realpath(parseWorktrunkPath(stdout, workBranch));
+  const worktreeRoot = await realpath(await git(worktree, ["rev-parse", "--show-toplevel"], signal));
+  if (worktreeRoot !== worktree) {
+    throw new Error("Prepared task worktree must name the worktree root");
+  }
+  const sourceCommonDir = resolve(
+    baseline.repository,
+    await git(baseline.repository, ["rev-parse", "--git-common-dir"], signal),
+  );
+  const worktreeCommonDir = resolve(
+    worktree,
+    await git(worktree, ["rev-parse", "--git-common-dir"], signal),
+  );
+  if (sourceCommonDir !== worktreeCommonDir) {
+    throw new Error("Prepared task worktree must belong to the resolved repository");
+  }
+  if ((await git(worktree, ["branch", "--show-current"], signal)) !== workBranch) {
+    throw new Error("Prepared task worktree is on an unexpected branch");
+  }
+  if ((await git(worktree, ["rev-parse", "HEAD"], signal)) !== baseline.headRevision) {
+    throw new Error("Prepared task worktree does not start at the recorded launch revision");
+  }
+  if ((await repositoryChangedPaths(worktree, signal)).length !== 0) {
+    throw new Error("Prepared task worktree must start clean");
+  }
+  const launchAfter = await captureRepositoryBaseline(baseline.repository, signal);
+  if (
+    launchAfter.branch !== baseline.branch
+    || launchAfter.headRevision !== baseline.headRevision
+    || JSON.stringify(launchAfter.changedPaths) !== JSON.stringify(baseline.changedPaths)
+  ) {
+    throw new Error("Preparing the task worktree changed the launch repository");
+  }
+  return {
+    schema: "pi-workflows.prepared-workspace.v1",
+    mode: "worktree",
+    repository: baseline.repository,
+    worktreePath: worktree,
+    baseBranch: baseline.branch,
+    baseRevision: baseline.headRevision,
+    workBranch,
+    directDefaultBranchAuthorized: false,
+    preExistingChangedPaths: baseline.changedPaths,
+    evidence: [
+      `Recorded launch repository at ${baseline.headRevision}`,
+      `Prepared dedicated task worktree ${worktree}`,
+    ],
+    scope: `Only ${baseline.repository}`,
+  };
+}
+
 export async function createImplementationWorktree(
   repository: string,
   runId: string,
@@ -265,23 +412,7 @@ export async function createImplementationWorktree(
 
   const runDigest = createHash("sha256").update(runId).digest("hex").slice(0, 16);
   const branch = `orkastrator/${runDigest}/worker`;
-  let stdout: string;
-  try {
-    stdout = await runner(
-      source,
-      ["switch", "--create", branch, "--base", "@", "--no-hooks", "--no-cd", "--format=json"],
-      signal,
-    );
-  } catch (error) {
-    const exists = await git(source, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], signal)
-      .then(() => true, () => false);
-    if (!exists) throw error;
-    stdout = await runner(
-      source,
-      ["switch", branch, "--no-hooks", "--no-cd", "--format=json"],
-      signal,
-    );
-  }
+  const stdout = await createOrAdoptWorktrunk(source, branch, signal, runner);
 
   const worktree = await realpath(parseWorktrunkPath(stdout, branch));
   const worktreeRoot = await realpath(await git(worktree, ["rev-parse", "--show-toplevel"], signal));

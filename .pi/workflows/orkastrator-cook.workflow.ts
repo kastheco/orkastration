@@ -15,7 +15,7 @@ import {
 import planChangeWorkflow from "./orkastrator-plan-change.workflow.ts";
 
 import {
-  createImplementationWorktree,
+  captureRepositoryBaseline,
   parseLifecycleInput,
   parseOwnerResolvedStatus,
   parseRepositoryResolution,
@@ -66,10 +66,15 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
         if (planning.exit !== "ready") {
           throw new Error("implementation requires an approved documented plan");
         }
+        const preparedWorkspace = planning.output.preparedWorkspace;
+        if (preparedWorkspace === undefined) {
+          throw new Error("implementation requires the prepared planning worktree");
+        }
         return {
           task: request.task,
           plan: planning.output.plan,
-          repository: (outputs.createWorktree as { repository: string }).repository,
+          repository: preparedWorkspace.repository,
+          preparedWorkspace,
           documents: planning.output.documents,
           documentation: {
             status: "current",
@@ -146,21 +151,19 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
         context.signal,
       ),
     }),
-    createWorktree: action({
-      statusDetail: "creating the isolated implementation worktree",
+    captureLaunchBaseline: action({
+      statusDetail: "recording the launch repository baseline before workspace preparation",
       timeoutMs: 30_000,
       effect: {
-        type: "orkastrator.create-implementation-worktree",
-        idempotencyKey: (context) => `${context.state.runId}:create-implementation-worktree`,
+        type: "orkastrator.capture-launch-repository-baseline",
+        idempotencyKey: (context) => `${context.state.runId}:capture-launch-repository-baseline`,
         request: (context: WorkflowNodeContext) => ({
-          repository: resolvedRepository(context.outputs),
-          runId: context.state.runId,
+          repository: (context.input as OrkastratorLifecycleInput).repository,
         }),
         recovery: "idempotent",
       },
-      run: async (context) => await createImplementationWorktree(
-        resolvedRepository(context.outputs),
-        context.state.runId,
+      run: async (context) => await captureRepositoryBaseline(
+        (context.input as OrkastratorLifecycleInput).repository,
         context.signal,
       ),
     }),
@@ -194,6 +197,7 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
             ? "planning"
             : "implementation",
         repositoryResolution: outputs.resolveRepository,
+        launchBaseline: outputs.captureLaunchBaseline,
         planning: outputs.planning,
         implementation: outputs.implementation,
       }),
@@ -201,6 +205,7 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
     completed: compute({
       run: ({ outputs }) => ({
         status: "completed",
+        launchBaseline: outputs.captureLaunchBaseline,
         planning: outputs.planning,
         implementation: outputs.implementation,
         review: outputs.review,
@@ -214,6 +219,7 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
         }
         return {
           status: parseOwnerResolvedStatus(review.output),
+          launchBaseline: outputs.captureLaunchBaseline,
           planning: outputs.planning,
           implementation: outputs.implementation,
           review: outputs.review,
@@ -230,9 +236,9 @@ export default defineWorkflow<OrkastratorLifecycleInput>({
       from: "classifyRepository",
       switch: { on: "$.route", cases: { verify: "verifyRepository", blocked: "blocked" } },
     },
-    { from: "verifyRepository", to: "planning" },
-    { from: "planning.ready", to: "createWorktree" },
-    { from: "createWorktree", to: "implementation" },
+    { from: "verifyRepository", to: "captureLaunchBaseline" },
+    { from: "captureLaunchBaseline", to: "planning" },
+    { from: "planning.ready", to: "implementation" },
     { from: "planning.blocked", to: "blocked" },
     { from: "implementation.completed", to: "prepareReview" },
     { from: "implementation.blocked", to: "blocked" },
