@@ -281,6 +281,89 @@ index e5d258b..18502a9 100644
          };
      }
      session(sessionId) {
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js
+index 7dd9b23..6e20dcf 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js
+@@ -1,7 +1,10 @@
++import { gunzipSync, gzipSync } from "node:zlib";
+ import { MAX_PROTOCOL_MESSAGE_BYTES } from "../client/protocol.js";
+ import { canonicalJson, parseJson } from "../state/json.js";
+ export const WORKER_MESSAGE_SCHEMA = "pi-workflows.worker-message.v1";
+ export const WORKER_RESPONSE_SCHEMA = "pi-workflows.worker-response.v1";
++const COMPRESSED_WORKER_FRAME_SCHEMA = "pi-workflows.worker-compressed.v1";
++const MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES = 8 * 1024 * 1024;
+ export const WORKER_MESSAGE_KINDS = [
+     "worker.ready",
+     "node.started",
+@@ -55,9 +58,22 @@ export function workerKindForOperation(operation, payload) {
+     return "worker.progress";
+ }
+ export function encodeWorkerLine(message) {
+-    const encoded = Buffer.from(`${canonicalJson(message)}\n`, "utf8");
++    const messageBuffer = Buffer.from(canonicalJson(message), "utf8");
++    if (messageBuffer.byteLength + 1 <= MAX_PROTOCOL_MESSAGE_BYTES) {
++        return Buffer.concat([messageBuffer, Buffer.from("\n")]);
++    }
++    if (messageBuffer.byteLength > MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES) {
++        throw new Error("Uncompressed worker protocol message exceeds 8 MiB");
++    }
++    const compressed = gzipSync(messageBuffer).toString("base64");
++    const encoded = Buffer.from(`${canonicalJson({
++        schema: COMPRESSED_WORKER_FRAME_SCHEMA,
++        encoding: "gzip+base64",
++        uncompressedBytes: messageBuffer.byteLength,
++        data: compressed,
++    })}\n`, "utf8");
+     if (encoded.byteLength > MAX_PROTOCOL_MESSAGE_BYTES) {
+-        throw new Error("Worker protocol message exceeds 1 MiB");
++        throw new Error("Compressed worker protocol message exceeds 1 MiB");
+     }
+     return encoded;
+ }
+@@ -104,6 +120,42 @@ function parseWorkerValue(line) {
+     if (buffer.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+         throw new Error("Worker protocol message exceeds 1 MiB");
+     }
++    const value = parseCanonicalWorkerObject(buffer);
++    if (value.schema !== COMPRESSED_WORKER_FRAME_SCHEMA)
++        return value;
++    if (value.encoding !== "gzip+base64" ||
++        !Number.isSafeInteger(value.uncompressedBytes) ||
++        value.uncompressedBytes <= 0 ||
++        value.uncompressedBytes > MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES ||
++        typeof value.data !== "string" ||
++        Object.keys(value).sort().join(",") !== "data,encoding,schema,uncompressedBytes") {
++        throw new Error("Invalid compressed worker protocol message");
++    }
++    try {
++        const compressed = Buffer.from(value.data, "base64");
++        if (compressed.toString("base64") !== value.data) {
++            throw new Error("Compressed worker protocol payload must use canonical base64");
++        }
++        const decoded = gunzipSync(compressed, {
++            maxOutputLength: MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES,
++        });
++        if (decoded.byteLength !== value.uncompressedBytes) {
++            throw new Error("Compressed worker protocol length mismatch");
++        }
++        const decodedValue = parseCanonicalWorkerObject(decoded);
++        if (decodedValue.schema === COMPRESSED_WORKER_FRAME_SCHEMA) {
++            throw new Error("Nested compressed worker protocol messages are not supported");
++        }
++        return decodedValue;
++    }
++    catch (error) {
++        if (error instanceof Error && error.message.startsWith("Compressed worker protocol")) {
++            throw error;
++        }
++        throw new Error("Invalid compressed worker protocol payload");
++    }
++}
++function parseCanonicalWorkerObject(buffer) {
+     const text = buffer.toString("utf8");
+     const value = parseJson(text);
+     if (!isRecord(value) || canonicalJson(value) !== text) {
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
 index 9d68505..ce5437f 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
@@ -613,6 +696,94 @@ index fd36986..2d3d002 100644
      };
    }
 
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts
+index c26abe8..0c25747 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/worker-protocol.ts
+@@ -1,8 +1,11 @@
++import { gunzipSync, gzipSync } from "node:zlib";
+ import { MAX_PROTOCOL_MESSAGE_BYTES } from "../client/protocol.js";
+ import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
+
+ export const WORKER_MESSAGE_SCHEMA = "pi-workflows.worker-message.v1" as const;
+ export const WORKER_RESPONSE_SCHEMA = "pi-workflows.worker-response.v1" as const;
++const COMPRESSED_WORKER_FRAME_SCHEMA = "pi-workflows.worker-compressed.v1" as const;
++const MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES = 8 * 1024 * 1024;
+
+ export const WORKER_MESSAGE_KINDS = [
+   "worker.ready",
+@@ -95,9 +98,25 @@ export function workerKindForOperation(
+ }
+
+ export function encodeWorkerLine(message: WorkerMessage | WorkerResponse): Buffer {
+-  const encoded = Buffer.from(`${canonicalJson(message)}\n`, "utf8");
++  const messageBuffer = Buffer.from(canonicalJson(message), "utf8");
++  if (messageBuffer.byteLength + 1 <= MAX_PROTOCOL_MESSAGE_BYTES) {
++    return Buffer.concat([messageBuffer, Buffer.from("\n")]);
++  }
++  if (messageBuffer.byteLength > MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES) {
++    throw new Error("Uncompressed worker protocol message exceeds 8 MiB");
++  }
++  const compressed = gzipSync(messageBuffer).toString("base64");
++  const encoded = Buffer.from(
++    `${canonicalJson({
++      schema: COMPRESSED_WORKER_FRAME_SCHEMA,
++      encoding: "gzip+base64",
++      uncompressedBytes: messageBuffer.byteLength,
++      data: compressed,
++    })}\n`,
++    "utf8",
++  );
+   if (encoded.byteLength > MAX_PROTOCOL_MESSAGE_BYTES) {
+-    throw new Error("Worker protocol message exceeds 1 MiB");
++    throw new Error("Compressed worker protocol message exceeds 1 MiB");
+   }
+   return encoded;
+ }
+@@ -146,6 +165,43 @@ function parseWorkerValue(line: Buffer | string): Record<string, unknown> {
+   if (buffer.byteLength + 1 > MAX_PROTOCOL_MESSAGE_BYTES) {
+     throw new Error("Worker protocol message exceeds 1 MiB");
+   }
++  const value = parseCanonicalWorkerObject(buffer);
++  if (value.schema !== COMPRESSED_WORKER_FRAME_SCHEMA) return value;
++  if (
++    value.encoding !== "gzip+base64" ||
++    !Number.isSafeInteger(value.uncompressedBytes) ||
++    (value.uncompressedBytes as number) <= 0 ||
++    (value.uncompressedBytes as number) > MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES ||
++    typeof value.data !== "string" ||
++    Object.keys(value).sort().join(",") !== "data,encoding,schema,uncompressedBytes"
++  ) {
++    throw new Error("Invalid compressed worker protocol message");
++  }
++  try {
++    const compressed = Buffer.from(value.data, "base64");
++    if (compressed.toString("base64") !== value.data) {
++      throw new Error("Compressed worker protocol payload must use canonical base64");
++    }
++    const decoded = gunzipSync(compressed, {
++      maxOutputLength: MAX_UNCOMPRESSED_WORKER_MESSAGE_BYTES,
++    });
++    if (decoded.byteLength !== value.uncompressedBytes) {
++      throw new Error("Compressed worker protocol length mismatch");
++    }
++    const decodedValue = parseCanonicalWorkerObject(decoded);
++    if (decodedValue.schema === COMPRESSED_WORKER_FRAME_SCHEMA) {
++      throw new Error("Nested compressed worker protocol messages are not supported");
++    }
++    return decodedValue;
++  } catch (error) {
++    if (error instanceof Error && error.message.startsWith("Compressed worker protocol")) {
++      throw error;
++    }
++    throw new Error("Invalid compressed worker protocol payload");
++  }
++}
++
++function parseCanonicalWorkerObject(buffer: Buffer): Record<string, unknown> {
+   const text = buffer.toString("utf8");
+   const value = parseJson(text);
+   if (!isRecord(value) || canonicalJson(value) !== text) {
 diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
 index 5d76c77..6d89260 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts

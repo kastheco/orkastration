@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { test } from "node:test";
@@ -6,6 +7,7 @@ import { test } from "node:test";
 import {
   encodeWorkerLine,
   parseWorkerMessage,
+  parseWorkerResponse,
 } from "../../../node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js";
 import { autodocWorkflow } from "../../../node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js";
 import { HostBackedWorkflowStore } from "../../../node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js";
@@ -40,11 +42,7 @@ test("an external presenter owns decisions without disabling agent delivery", ()
 
 });
 
-test("worker protocol bounds one frame at the upstream limit", () => {
-  // The removed package patch raised this ceiling to 8 MiB because attachment
-  // payloads exceeded it. Pi Workflows 0.16.0 owns the limit at 1 MiB, so this
-  // pins the real constraint rather than the patched one. A workflow that must
-  // carry a large payload has to pass a reference instead of inlining bytes.
+test("worker protocol keeps small frames as canonical JSON", () => {
   const message = {
     schema: "pi-workflows.worker-message.v1" as const,
     launchSchema: "pi-workflows.worker-launch.v1" as const,
@@ -61,6 +59,30 @@ test("worker protocol bounds one frame at the upstream limit", () => {
 
   const encoded = encodeWorkerLine(message);
   assert.deepEqual(parseWorkerMessage(encoded.subarray(0, -1)), message);
+});
+
+test("worker protocol compresses oversized workflow state within the wire limit", () => {
+  const response = {
+    schema: "pi-workflows.worker-response.v1" as const,
+    messageId: "large-state",
+    outcome: "accepted" as const,
+    result: { state: { steps: [LARGE_WORKFLOW_PAYLOAD] } },
+  };
+
+  const encoded = encodeWorkerLine(response);
+  assert.ok(encoded.byteLength <= 1024 * 1024);
+  assert.deepEqual(parseWorkerResponse(encoded.subarray(0, -1)), response);
+});
+
+test("worker protocol still rejects incompressible oversized wire frames", () => {
+  const response = {
+    schema: "pi-workflows.worker-response.v1" as const,
+    messageId: "incompressible-state",
+    outcome: "accepted" as const,
+    result: { state: randomBytes(1024 * 1024).toString("base64") },
+  };
+
+  assert.throws(() => encodeWorkerLine(response), /exceeds 1 MiB/u);
 });
 
 test("intentional interaction parking is not reported as an interruption", async () => {
