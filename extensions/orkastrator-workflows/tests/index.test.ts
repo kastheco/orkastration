@@ -544,6 +544,74 @@ test("the published package includes every command-addressed workflow and runtim
   }
 });
 
+test("desktop pi-subagents launch binds hosted workers without a Herdr pane", async () => {
+  const lifecycle = new Map<string, (...args: unknown[]) => unknown>();
+  const events = new EventEmitter();
+  const eventBus = {
+    on(event: string, handler: (payload: unknown) => void) {
+      events.on(event, handler);
+      return () => events.off(event, handler);
+    },
+    emit(event: string, payload: unknown) {
+      if (event === "prompt-template:subagent:request") {
+        const request = payload as { requestId: string; ownerRunId: string; nodeId: string };
+        events.emit("prompt-template:subagent:response", {
+          requestId: request.requestId,
+          ownerRunId: request.ownerRunId,
+          nodeId: request.nodeId,
+          status: "invalid_request",
+        });
+      }
+      events.emit(event, payload);
+    },
+  };
+  const api = {
+    events: eventBus,
+    getAllTools: () => [],
+    registerCommand() {},
+    sendUserMessage() {},
+    on(event: string, handler: (...args: unknown[]) => unknown) { lifecycle.set(event, handler); },
+  };
+  const ctx = {
+    isProjectTrusted: () => true,
+    sessionManager: { getSessionId: () => "desktop-session" },
+    ui: {
+      notify() {},
+      setWidget() {},
+      setStatus() {},
+    },
+  };
+  installOrkastratorWorkflows(api as never);
+  try {
+    await lifecycle.get("session_start")?.({}, ctx);
+    const workflowInput: Record<string, unknown> = {
+      task: "desktop task",
+      repository: "/tmp/repository",
+    };
+    const cookWorkflow = [...__indexTest__.workflowPaths]
+      .find((path) => path.endsWith("orkastrator-cook.workflow.ts"));
+    assert.notEqual(cookWorkflow, undefined);
+    const result = await lifecycle.get("tool_call")?.({
+      toolName: "workflow",
+      toolCallId: "desktop-start",
+      input: { action: "start", workflow: cookWorkflow, input: workflowInput },
+    }, ctx);
+
+    assert.equal(result, undefined);
+    assert.deepEqual(workflowInput.herdrLaunch, {
+      version: 1,
+      transport: "unix",
+      launchId: (workflowInput.herdrLaunch as { launchId: string }).launchId,
+    });
+    assert.match(
+      (workflowInput.herdrLaunch as { launchId: string }).launchId,
+      /^[0-9a-f-]{36}$/u,
+    );
+  } finally {
+    await lifecycle.get("session_shutdown")?.({});
+  }
+});
+
 test("a stale async session_start cannot install after shutdown", async () => {
   const lifecycle = new Map<string, (...args: unknown[]) => unknown>();
   const events = new EventEmitter();
@@ -668,4 +736,59 @@ test("all kas execution and management commands require project trust", async ()
     notifications,
     names.map(() => ["Orkastrator requires project trust", "error"]),
   );
+});
+
+test("the continuation chain follows the durable parentRunId link", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { WorkflowRunStore, createDefinitionSnapshot } = await import("@osolmaz/pi-workflows");
+  const { compute, defineWorkflow } = await import("@osolmaz/pi-workflows");
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-continuation-chain-"));
+  const databasePath = join(root, "state.sqlite");
+  const workflow = defineWorkflow({
+    name: "chain",
+    startAt: "only",
+    nodes: { only: compute({ run: () => ({}) }) },
+    edges: [],
+  });
+  const snapshot = createDefinitionSnapshot(workflow);
+  const state = (runId: string, parentRunId?: string) => {
+    const now = new Date().toISOString();
+    return {
+      schema: "pi-workflows.run-state.v1",
+      traceSeq: 0,
+      runId,
+      workflowName: workflow.name,
+      startedAt: now,
+      updatedAt: now,
+      status: "running",
+      input: {},
+      outputs: {},
+      results: {},
+      steps: [],
+      updates: [],
+      ...(parentRunId === undefined ? {} : { parentRunId }),
+    } as never;
+  };
+  try {
+    const store = new WorkflowRunStore(databasePath);
+    try {
+      await store.initializeRunFromSnapshot(snapshot, workflow.name, state("parent-run"));
+      await store.initializeRunFromSnapshot(snapshot, workflow.name, state("continuation-1", "parent-run"));
+      await store.initializeRunFromSnapshot(snapshot, workflow.name, state("continuation-2", "continuation-1"));
+    } finally {
+      store.close();
+    }
+    const continuationFor = (parentRunId: string) =>
+      __indexTest__.durableContinuationFor(parentRunId, databasePath);
+    assert.equal(continuationFor("parent-run"), "continuation-1");
+    assert.equal(continuationFor("continuation-2"), undefined);
+    assert.deepEqual(
+      __indexTest__.workflowContinuationChain("parent-run", continuationFor),
+      ["continuation-1", "continuation-2"],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

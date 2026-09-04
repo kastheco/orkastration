@@ -2,7 +2,7 @@
 
 ## Orkastrator dependency and composition
 
-Orkastrator pins `@osolmaz/pi-workflows` to `0.15.2`. `package.json` and `package-lock.json` must remain on the same exact version.
+Orkastrator pins `@osolmaz/pi-workflows` to `0.16.0`. `package.json` and `package-lock.json` must remain on the same exact version. Orkastrator loads that dependency's extension from its own package closure, so users must not install a second standalone `@osolmaz/pi-workflows` Pi package beside it.
 
 Custom Orkastrator workflows mount package workflows through canonical references such as `builtin:autoimplement`. Imported workflow objects are contracts for TypeScript inference and runtime contract checks, not source identity. Orkastrator's plan-change composition follows the same rule for `builtin:autoplan`, `builtin:autodoc`, and `builtin:plan-approval`.
 
@@ -10,40 +10,44 @@ This boundary matters because Pi can load the custom workflow in one package con
 
 Project workflow files remain file-backed. Their path and SHA-256 hash are still checked on resume, so editing an Orkastrator workflow continues to trigger normal source-change protection.
 
-## Remaining npm 0.15.2 composition defect
+## Maintained 0.16.0 compatibility patch
 
-Canonical references fix the process-local object-identity mismatch for registered built-ins. They do not make npm 0.15.2 safe for custom composition of `autoimplement` or `autodoc`.
+The exact 0.16.0 dependency is patched during installation by `scripts/apply-patches.mjs`. The patch is part of Orkastrator's runtime contract, not an optional local modification. It currently covers two integration gaps:
 
-Both registered built-ins directly include unregistered internal workflows. The resolver launched from the Pi extension records those children from the installed `src/builtins/*.workflow.ts` tree. The worker resolves the same children from `dist/builtins/*.workflow.js`. `sourceForDirectDefinition()` falls back to file path and hash because the internal definitions are absent from `builtinWorkflowCatalog`.
+1. It exposes process-local human-decision presenter registration so Orkastrator can render a protected decision through Pi's trusted UI boundary without exporting a model-callable answer API.
+2. It replaces a continuation row's reserved empty `input_hash` with the parent run's carried input when the continuation worker initializes. Without that update, every post-decision continuation reads `{}` and `/kas:cook` eventually loses its task and repository input.
 
-Fresh diagnostic run `20260901T030232861Z-orkastrator-cook-52edb722` reproduced the remaining defect after commit `887a0f7`. Its top-level `implementation` mount was correctly recorded as `builtin:autoimplement` revision 11, but nested mounts such as `implementation/redesign`, `implementation/workspace`, and `implementation/localVerification` were recorded from the global TypeScript source tree. The worker parked the run with `workflowSourceChanged` before executing a node.
+Canonical nested workflow sources are provided separately by the shipped 0.16.0 resolver and Orkastrator's explicit built-in references. `extensions/orkastrator-workflows/tests/pi-workflows-host-regressions.test.ts` pins the patched host behavior, while `extensions/orkastrator-workflows/tests/workflow-source-identity.test.ts` covers source identity across package instances. `scripts/test-decision-questionnaire-runtime.mjs` proves the protected decision and continuation path through a real RPC client. `scripts/test-cook-lifecycle.mjs` runs a disposable `/kas:cook` fixture through the real host, continuation, desktop `pi-subagents` broker, reviewer child, implementation, and verification.
 
-This cannot be corrected safely inside Orkastrator 0.15.2 without importing unpublished package internals, pinning installation-specific paths, or copying the full Autoimplement and Autodoc implementations. Those are unsupported source-identity hacks and were not applied.
+The compatibility patch should shrink or disappear when an upstream release provides equivalent contracts. Until then, upgrading `@osolmaz/pi-workflows` requires regenerating the patch against the exact new version and rerunning the complete Orkastrator suite.
 
-The upstream npm fix should give every directly included package workflow a canonical identity independent of `src` versus `dist`. Either of these designs is sufficient:
+## Verification
 
-1. Register internal compositions such as `plan-change`, `workspace-preparation`, and `change-verification` in the package catalog with explicit revisions.
-2. Treat nested definitions owned by a registered built-in as part of that built-in's revision and omit file-backed package paths from persisted mounted-source metadata.
+A clean installation must allow the reviewed postinstall hook to apply the package patch:
 
-The release needs a regression test that launches a custom file workflow through the source extension context and resolves it in the built worker context, then compares the complete mounted-source map and definition digest. Orkastrator can update its exact dependency pin after that release. Until then, the failed diagnostic run should remain parked as evidence and custom Cook/Implement workflows that include Autoimplement should not be forced to resume.
+```bash
+npm ci
+npm run typecheck
+npm run test:extension
+npm run test:decision-runtime
+```
 
-## Rust `piw` 0.15.2 packaging defect
+The disposable lifecycle proof additionally requires Worktrunk's `wt` executable:
 
-The crates.io `pi-workflows` 0.15.2 package and npm `@osolmaz/pi-workflows` 0.15.2 package do not describe the same durable schema.
+```bash
+npm run test:cook-lifecycle -- --runs 2
+```
 
-| Distribution | Declared app version | Schema digest |
-| --- | --- | --- |
-| crates.io `pi-workflows` 0.15.2 | `0.13.3` | `b5bcda1034e2ee3013d8ee2cc65dcfe8a2ad6e6ad8ab1eebab7f890de60031ed` |
-| npm `@osolmaz/pi-workflows` 0.15.2 | `0.14.0` | `27923e72ec95306d20a5cea087d8d5821dee9b3c36ebd099471e28202d9f51f5` |
+Do not use `npm ci --ignore-scripts` unless `node scripts/apply-patches.mjs` is run explicitly before typechecking or testing.
 
-The installed Rust source confirms the stale constants in `pi-workflows-0.15.2/src/state/reader.rs`. The npm host owns and can read the active database. The Rust viewer rejects it before opening it for normal read-only use.
+## Rust `piw` compatibility
 
-This is an upstream release packaging defect, not an Orkastrator schema defect. Orkastrator must not edit, migrate, replace, or patch `~/.pi/agent/workflows/state.sqlite` to satisfy the stale viewer.
+The Rust `piw` viewer must describe the same durable schema as the active npm host. A viewer built for an older schema can reject the active database before opening it for normal read-only use. This is an upstream release-packaging concern, not a reason to edit, migrate, replace, or patch `~/.pi/agent/workflows/state.sqlite`.
 
-Until a corrected Rust release is published:
+Use the npm viewer from the same package release as the host when the installed Rust viewer reports an app-version or schema-digest mismatch:
 
-1. Use the npm viewer from the same package release as the host:
-   `node ~/.pi/agent/npm/node_modules/@osolmaz/pi-workflows/dist/viewer/cli.js view`
-2. Do not use `~/.cargo/bin/piw` against the active database.
-3. After upstream updates the Rust reader to app version `0.14.0` and digest `27923e72ec95306d20a5cea087d8d5821dee9b3c36ebd099471e28202d9f51f5`, install the corrected crates.io release with `cargo install --locked pi-workflows --version <corrected-version> --force`.
-4. If upstream provides a reviewed fix commit before publishing, an interim installation may use `cargo install --locked --git https://github.com/osolmaz/pi-workflows.git --rev <reviewed-fix-commit> pi-workflows --force`. Pin the exact commit. Do not install from an unpinned branch.
+```bash
+node ~/.pi/agent/npm/node_modules/@osolmaz/pi-workflows/dist/viewer/cli.js view
+```
+
+Install a corrected Rust release only from an exact published version or reviewed commit. Do not install an unpinned branch against active workflow state.

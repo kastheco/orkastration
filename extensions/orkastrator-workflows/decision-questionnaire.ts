@@ -1,53 +1,13 @@
-import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HumanDecisionRequest, HumanDecisionResponse } from "@osolmaz/pi-workflows";
 import {
-  WorkflowClient,
-  type ClientEvent,
-  type WorkflowSessionView,
-} from "@osolmaz/pi-workflows/client";
-
-/**
- * Mirrors `ClientInteractiveRequest` from `@osolmaz/pi-workflows/client`.
- *
- * Pi Workflows 0.16.0 defines the type in `dist/client/view.d.ts` but omits it
- * from the `./client` barrel, and package exports block the deep path. Only the
- * fields this presenter reads are declared. Drop this in favour of the upstream
- * import once the barrel re-exports it.
- */
-export type ClientInteractiveRequest = {
-  requestId: string;
-  runId: string;
-  revision: number;
-  kind: "agent" | "assistant" | "decision";
-  status: "pending" | "presenting" | "settled" | "cancelled";
-  contract: unknown;
-  presentationClaimExpiresAt: string | null;
-};
-
-/**
- * One pending decision this presenter may claim and answer.
- *
- * Pi Workflows 0.16.0 replaced the process-global presenter hook with a
- * claim-based protocol: a presenter claims `requestId` at an exact `revision`,
- * presents, then settles. A live claim held by another presenter is skipped
- * rather than stolen, so a ClickClack presenter and the TUI can watch the same
- * session without racing a decision away from each other.
- */
-export type WorkflowHumanDecisionPresentation = {
-  requestId: string;
-  runId: string;
-  revision: number;
-  request: HumanDecisionRequest;
-};
-
-export type WorkflowHumanDecisionPresenter = (
-  presentation: WorkflowHumanDecisionPresentation,
-  context: ExtensionContext,
-) => Promise<HumanDecisionResponse | undefined>;
+  registerWorkflowHumanDecisionPresenter,
+  type WorkflowHumanDecisionPresentation,
+  type WorkflowHumanDecisionPresenter,
+} from "@osolmaz/pi-workflows/extension";
 
 const MAX_OPTION_LABEL = 60;
 
@@ -96,21 +56,7 @@ type DecisionQuestionnaire = {
 type QuestionnaireEnvelope = { details?: unknown };
 
 type DecisionQuestionnaireDependencies = {
-  /**
-   * Subscribes to one session's pending interactions. Returns an unsubscribe.
-   * Injected so tests drive the presenter without a running workflow host.
-   */
-  watch: (
-    sessionId: string,
-    listener: (interactions: ClientInteractiveRequest[]) => void,
-  ) => Promise<() => Promise<void>>;
-  /** Claims one pending decision. Resolves false when another presenter holds it. */
-  claim: (interaction: ClientInteractiveRequest) => Promise<boolean>;
-  /** Settles a claimed decision with the operator's answer. */
-  submit: (
-    interaction: ClientInteractiveRequest,
-    response: HumanDecisionResponse,
-  ) => Promise<void>;
+  register: (presenter: WorkflowHumanDecisionPresenter) => () => void;
   present: QuestionnairePresenter;
 };
 
@@ -128,70 +74,8 @@ async function loadQuestionnairePresenter(): Promise<QuestionnairePresenter> {
   return imported.presentQuestionnaire;
 }
 
-let sharedClient: WorkflowClient | undefined;
-
-function workflowClient(): WorkflowClient {
-  sharedClient ??= new WorkflowClient({ clientId: `orkastrator-${randomUUID()}` });
-  return sharedClient;
-}
-
-function sessionInteractions(event: ClientEvent): ClientInteractiveRequest[] | undefined {
-  const view = (event as { view?: unknown }).view;
-  if (typeof view !== "object" || view === null) return undefined;
-  const pending: unknown = (view as WorkflowSessionView).pendingInteractions;
-  if (!Array.isArray(pending)) return undefined;
-  return pending.filter(
-    (entry): entry is ClientInteractiveRequest =>
-      isRecord(entry) && typeof entry.requestId === "string" && typeof entry.runId === "string",
-  );
-}
-
 const defaultDependencies: DecisionQuestionnaireDependencies = {
-  watch: async (sessionId, listener) => {
-    const client = workflowClient();
-    await client.ensureAvailable();
-    return await client.watchSession(sessionId, (event) => {
-      const interactions = sessionInteractions(event);
-      if (interactions !== undefined) listener(interactions);
-    });
-  },
-  claim: async (interaction) => {
-    const client = workflowClient();
-    await client.ensureAvailable();
-    const key = `claim-presentation-${interaction.requestId}-${interaction.revision}-${client.clientId}`;
-    const response = await client.request({
-      operation: "interaction.update",
-      requestId: key,
-      idempotencyKey: key,
-      runId: interaction.runId,
-      expectedRevision: interaction.revision,
-      payload: { requestId: interaction.requestId, claimPresentation: true },
-    });
-    if (response.outcome === "conflict") return false;
-    if (response.outcome !== "accepted" && response.outcome !== "adopted") {
-      throw new Error(response.error ?? "Workflow host rejected the presentation claim");
-    }
-    return true;
-  },
-  submit: async (interaction, response) => {
-    const client = workflowClient();
-    await client.ensureAvailable();
-    const submissionId = randomUUID();
-    const settled = await client.requestDurable({
-      operation: "decision.answer",
-      idempotencyKey: submissionId,
-      runId: interaction.runId,
-      expectedRevision: interaction.revision,
-      payload: {
-        requestId: interaction.requestId,
-        submissionId,
-        response,
-      } as never,
-    });
-    if (settled.outcome !== "accepted" && settled.outcome !== "adopted") {
-      throw new Error(settled.error ?? "Workflow host rejected decision.answer");
-    }
-  },
+  register: registerWorkflowHumanDecisionPresenter,
   present: async (pi, context, params) => {
     presenterPromise ??= loadQuestionnairePresenter();
     return await (await presenterPromise)(pi, context, params);
@@ -201,7 +85,6 @@ const defaultDependencies: DecisionQuestionnaireDependencies = {
 export class WorkflowDecisionQuestionnaire {
   private activeRequestId: string | undefined;
   private generation = 0;
-  private unwatch: (() => Promise<void>) | undefined;
   private readonly pi: ExtensionAPI;
   private readonly dependencies: DecisionQuestionnaireDependencies;
 
@@ -211,76 +94,17 @@ export class WorkflowDecisionQuestionnaire {
   ) {
     this.pi = pi;
     this.dependencies = { ...defaultDependencies, ...dependencies };
+    this.dependencies.register(async (presentation, context) =>
+      await this.presentDecision(presentation, context));
   }
 
-  /**
-   * Subscribes to this session's pending decisions. The host replays pending
-   * interactions on subscribe, so a decision raised before the session started
-   * is still delivered and cannot race session_start.
-   */
-  start(context: ExtensionContext): void {
-    const sessionId = context.sessionManager.getSessionId();
-    const generation = this.generation;
-    void this.dependencies
-      .watch(sessionId, (interactions) => {
-        if (generation !== this.generation) return;
-        void this.consume(interactions, context);
-      })
-      .then((unwatch) => {
-        if (generation === this.generation) this.unwatch = unwatch;
-        else void unwatch();
-      })
-      .catch((error: unknown) => {
-        context.ui.notify(
-          `Workflow decisions are unavailable: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-          "warning",
-        );
-      });
+  start(_context: ExtensionContext): void {
+    // Registration happens during extension loading so restored decisions cannot race session_start.
   }
 
   stop(): void {
     this.generation += 1;
     this.activeRequestId = undefined;
-    const unwatch = this.unwatch;
-    this.unwatch = undefined;
-    if (unwatch !== undefined) void unwatch();
-  }
-
-  /**
-   * Presents the first claimable decision. Only one decision is presented at a
-   * time; the rest stay pending and arrive on a later subscription event.
-   */
-  private async consume(
-    interactions: ClientInteractiveRequest[],
-    context: ExtensionContext,
-  ): Promise<void> {
-    if (this.activeRequestId !== undefined) return;
-    const generation = this.generation;
-    for (const interaction of interactions) {
-      if (interaction.kind !== "decision" || interaction.status !== "pending") continue;
-      if (claimIsLive(interaction)) continue;
-
-      const contract = interactionRequest(interaction);
-      if (contract === undefined) continue;
-      if (!await this.dependencies.claim(interaction)) continue;
-      if (generation !== this.generation) return;
-
-      const response = await this.presentDecision(
-        {
-          requestId: interaction.requestId,
-          runId: interaction.runId,
-          revision: interaction.revision,
-          request: contract,
-        },
-        context,
-      );
-      if (response !== undefined && generation === this.generation) {
-        await this.dependencies.submit(interaction, response);
-      }
-      return;
-    }
   }
 
   async presentDecision(
@@ -472,18 +296,3 @@ export const __decisionQuestionnaireTest__ = {
   decisionPreview,
   responseForChoice,
 };
-
-/** True when another presenter holds an unexpired claim on this decision. */
-function claimIsLive(interaction: ClientInteractiveRequest): boolean {
-  const expiry = interaction.presentationClaimExpiresAt;
-  return expiry !== null && Date.parse(expiry) > Date.now();
-}
-
-/** Reads the human-decision request out of one pending interaction's contract. */
-function interactionRequest(
-  interaction: ClientInteractiveRequest,
-): HumanDecisionRequest | undefined {
-  const contract = interaction.contract;
-  if (!isRecord(contract)) return undefined;
-  return decisionRequest(contract.request ?? contract);
-}

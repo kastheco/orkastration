@@ -20,8 +20,11 @@ jobs:
         with:
           node-version: "22.19.0"
           cache: npm
-      - run: npm ci --ignore-scripts
+      - name: install reviewed package patches
+        run: npm ci
       - name: typecheck
         run: npm run typecheck
       - name: policy tests
         run: npm run test:extension
+      - name: protected decision runtime
+        run: npm run test:decision-runtime

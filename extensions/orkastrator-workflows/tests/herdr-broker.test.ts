@@ -103,6 +103,38 @@ test("hosted delegation crosses the Unix broker and receives server-owned pane p
   }
 });
 
+test("desktop delegation crosses the Unix broker without Herdr pane placement", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "orkastrator-broker-test-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const calls: DelegationSpec[] = [];
+  const broker = new SessionDelegationBroker({
+    sessionId: "desktop-session",
+    env,
+    run: async (spec) => {
+      calls.push(spec);
+      return completed(spec);
+    },
+  });
+  try {
+    await broker.start();
+    const binding = await broker.registerLaunch();
+    broker.bindRun(binding.launchId, "run-1");
+
+    const response = await delegateWithHerdrBroker(
+      { ...baseSpec, herdrLaunch: binding },
+      binding,
+      new AbortController().signal,
+      env,
+    );
+    assert.equal(response.status, "completed");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.panePlacement, undefined);
+  } finally {
+    await broker.close();
+    await rm(runtime, { recursive: true, force: true });
+  }
+});
+
 test("a separate hosted process can await the interactive broker result", async () => {
   const runtime = await mkdtemp(join(tmpdir(), "orkastrator-broker-test-"));
   const env = { ...process.env, XDG_RUNTIME_DIR: runtime };

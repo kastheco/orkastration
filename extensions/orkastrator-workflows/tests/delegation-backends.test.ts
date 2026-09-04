@@ -106,40 +106,71 @@ function installHerdr(result: Record<string, unknown>, controller?: AbortControl
   };
 }
 
-test("capability detection routes either backend and rejects both or neither", async () => {
+test("capability detection selects a backend for the current runtime", async () => {
   delete herdrGlobal[HERDR_API];
-  assert.equal(await detectDelegationBackend([], new CapabilityEvents(true), 5), "pi-subagents");
+  assert.equal(
+    await detectDelegationBackend([], new CapabilityEvents(true), 5, {}),
+    "pi-subagents",
+  );
 
   herdrGlobal[HERDR_API] = { version: 1, capabilities: HERDR_CAPABILITIES, runSubagent() {} };
-  assert.equal(await detectDelegationBackend([], new CapabilityEvents(false), 5), "pi-herdr-subagents");
-  await assert.rejects(
-    detectDelegationBackend([], new CapabilityEvents(true), 5),
-    /both pi-subagents and pi-herdr-subagents.*exactly one/u,
+  assert.equal(
+    await detectDelegationBackend([], new CapabilityEvents(false), 5, { HERDR_PANE_ID: "pane-1" }),
+    "pi-herdr-subagents",
+  );
+  assert.equal(
+    await detectDelegationBackend([], new CapabilityEvents(true), 5, {}),
+    "pi-subagents",
+  );
+  assert.equal(
+    await detectDelegationBackend([], new CapabilityEvents(true), 5, { HERDR_PANE_ID: "pane-1" }),
+    "pi-herdr-subagents",
   );
   delete herdrGlobal[HERDR_API];
 
-  await assert.rejects(
-    detectDelegationBackend([], new CapabilityEvents(false), 5),
-    /requires either/u,
+  assert.equal(
+    await detectDelegationBackend([], new CapabilityEvents(false), 5, {}),
+    "pi-sdk",
   );
+});
+
+test("desktop sessions never select Herdr without a Herdr pane", async () => {
+  herdrGlobal[HERDR_API] = {
+    version: 1,
+    capabilities: HERDR_CAPABILITIES,
+    runSubagent() {},
+  };
+  try {
+    assert.equal(
+      await detectDelegationBackend([], new CapabilityEvents(false), 5, {}),
+      "pi-sdk",
+    );
+  } finally {
+    delete herdrGlobal[HERDR_API];
+  }
 });
 
 test("Herdr metadata only refines incompatible-version errors", async () => {
   delete herdrGlobal[HERDR_API];
   await assert.rejects(
-    detectDelegationBackend([tool("pi-herdr-subagents")], new CapabilityEvents(false), 5),
+    detectDelegationBackend(
+      [tool("pi-herdr-subagents")],
+      new CapabilityEvents(false),
+      5,
+      { HERDR_PANE_ID: "pane-1" },
+    ),
     /tool metadata without the required delegation API.*0\.2\.1-orkastrator\.1/u,
   );
 
   herdrGlobal[HERDR_API] = { version: 1, runSubagent() {} };
   await assert.rejects(
-    detectDelegationBackend([], new CapabilityEvents(false), 5),
+    detectDelegationBackend([], new CapabilityEvents(false), 5, { HERDR_PANE_ID: "pane-1" }),
     /pane placement, resource isolation, and writable-root sandbox capabilities/u,
   );
 
   herdrGlobal[HERDR_API] = { version: 0, runSubagent() {} };
   await assert.rejects(
-    detectDelegationBackend([], new CapabilityEvents(false), 5),
+    detectDelegationBackend([], new CapabilityEvents(false), 5, { HERDR_PANE_ID: "pane-1" }),
     /delegation API version 1/u,
   );
   delete herdrGlobal[HERDR_API];

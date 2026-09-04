@@ -41,9 +41,10 @@
   "scripts": {
     "test:extension": "node --experimental-strip-types --test extensions/orkastrator-workflows/tests/*.test.ts",
     "test:decision-runtime": "node scripts/test-decision-questionnaire-runtime.mjs",
-    "test:orkastrator": "npm run test:extension && npm run test:decision-runtime",
+    "test:orkastrator": "npm run test:extension && npm run test:decision-runtime && npm run test:cook-lifecycle",
     "typecheck": "tsc --noEmit",
-    "postinstall": "node scripts/apply-patches.mjs"
+    "postinstall": "node scripts/apply-patches.mjs",
+    "test:cook-lifecycle": "node scripts/test-cook-lifecycle.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.3",

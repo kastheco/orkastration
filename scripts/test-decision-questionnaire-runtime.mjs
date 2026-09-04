@@ -157,10 +157,10 @@ try {
   const { HostStateStore } = await import(
     pathToFileURL(join(repository, "node_modules/@osolmaz/pi-workflows/dist/host/state.js")).href
   );
-  const { WorkflowHostClient } = await import(
-    pathToFileURL(join(repository, "node_modules/@osolmaz/pi-workflows/dist/host/client.js")).href
+  const { WorkflowClient } = await import(
+    pathToFileURL(require.resolve("@osolmaz/pi-workflows/client")).href
   );
-  hostClient = new WorkflowHostClient({ clientId: "runtime-test-cleanup", databasePath });
+  hostClient = new WorkflowClient({ clientId: "runtime-test-cleanup", databasePath });
 
   const deadline = Date.now() + 20_000;
   let verified = false;

@@ -29,7 +29,7 @@ const resolverProgram = `
   }
 `;
 
-test("launcher and worker contract package instances resolve canonical mounted sources", async () => {
+test("separate package instances preserve registered built-in identities and file fingerprints", async () => {
   const root = await mkdtemp(join(repository, ".tmp-piw-contexts-"));
   const launcherPackage = join(root, "launcher/pi-workflows");
   const workerPackage = join(root, "worker/pi-workflows");
@@ -41,7 +41,11 @@ test("launcher and worker contract package instances resolve canonical mounted s
     const launcher = await resolveFixture(launcherPackage);
     const worker = await resolveFixture(workerPackage);
 
-    assert.deepEqual(worker, launcher);
+    assert.deepEqual(worker.source, launcher.source);
+    assert.deepEqual(canonicalSources(worker.sources), canonicalSources(launcher.sources));
+    assert.deepEqual(fileSourceFingerprints(worker.sources), fileSourceFingerprints(launcher.sources));
+    assert.ok(fileSourcePaths(launcher.sources).every((path) => path.startsWith(launcherPackage)));
+    assert.ok(fileSourcePaths(worker.sources).every((path) => path.startsWith(workerPackage)));
     assert.deepEqual(launcher.sources[0], {
       mountPath: ["implementation"],
       workflowName: "autoimplement",
@@ -138,13 +142,42 @@ test("canonical references do not weaken file source-change protection", async (
   }
 });
 
+function canonicalSources(sources: unknown[]): unknown[] {
+  return sources.filter((entry) =>
+    (entry as { source?: { kind?: string } }).source?.kind === "builtin"
+  );
+}
+
+function fileSourceFingerprints(sources: unknown[]): unknown[] {
+  return sources.flatMap((entry) => {
+    const mounted = entry as {
+      mountPath?: string[];
+      workflowName?: string;
+      source?: { kind?: string; hash?: string };
+    };
+    if (mounted.source?.kind !== "file") return [];
+    return [{
+      mountPath: mounted.mountPath,
+      workflowName: mounted.workflowName,
+      hash: mounted.source.hash,
+    }];
+  });
+}
+
+function fileSourcePaths(sources: unknown[]): string[] {
+  return sources.flatMap((entry) => {
+    const source = (entry as { source?: { kind?: string; path?: string } }).source;
+    return source?.kind === "file" && typeof source.path === "string" ? [source.path] : [];
+  });
+}
+
 async function resolveFixture(
   contractPackage: string,
   workflowPath = fixture,
 ): Promise<{ source: { kind: string; hash?: string }; sources: unknown[] }> {
   const result = await execFileAsync(
     process.execPath,
-    ["--input-type=module", "--eval", resolverProgram, localPackage, workflowPath, repository],
+    ["--input-type=module", "--eval", resolverProgram, contractPackage, workflowPath, repository],
     {
       cwd: repository,
       encoding: "utf8",

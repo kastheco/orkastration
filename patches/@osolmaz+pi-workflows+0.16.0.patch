@@ -1,0 +1,473 @@
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js b/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js
+index 828fca1..af40a33 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js
+@@ -112,6 +112,11 @@ function currentPlan(context) {
+         return located.plan;
+     throw new Error("autodoc does not have a selected plan");
+ }
++function inspectionRepository(request) {
++    return request.preparedWorkspace?.worktreePath ??
++        request.preparedWorkspace?.repository ??
++        request.repository;
++}
+ function mutationRepository(request) {
+     if (request.repository !== undefined)
+         return request.repository;
+@@ -248,8 +253,9 @@ export const autodocWorkflow = defineWorkflow({
+                     "Look in the current conversation context and in the referenced canonical documents.",
+                     "Do not devise, improve, replace, or implement the plan.",
+                     "Return blocked when no single clear selected plan exists.",
++                    "Read repository files only under the exact absolute repository path below.",
+                     `Task: ${request.task}`,
+-                    `Repository: ${request.repository ?? "current repository"}`,
++                    `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+                     `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
+                 ].join("\n");
+             },
+@@ -279,6 +285,8 @@ export const autodocWorkflow = defineWorkflow({
+                     "Choose current only when the documents already preserve the whole selected plan and its boundaries.",
+                     "Choose update when documents are missing or stale and can be corrected in scope.",
+                     "Choose blocked only when no safe canonical target exists or repository rules prohibit the documentation change.",
++                    "Read and assess documentation only under the exact absolute repository path below. Do not use an equivalent file from another checkout.",
++                    `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+                     `Task: ${request.task}`,
+                     `Selected plan: ${JSON.stringify(currentPlan(context))}`,
+                     `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts b/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
+index b5901b1..fd02215 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/extension/index.d.ts
+@@ -1,6 +1,15 @@
+-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
++import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
++import type { HumanDecisionRequest, HumanDecisionResponse } from "../workflows/types.js";
+ export { parseControllerArgs, type ParsedControllerArgs } from "./controller-command.js";
+ export { PiDecisionChannel, TelegramDecisionChannel, audienceChannels, createTelegramChannels, decisionConfigDir, loadDecisionChannelConfig, verifyTelegramTokenFile, writeDecisionChannelProfile, type DecisionChannelConfig, type DecisionCredentialConfig, type HumanDecisionChannel, type HumanDecisionChannelAnswer, type HumanDecisionDeliveryResult, type LoadedDecisionChannelConfig, type PiDecisionUi, type SettledHumanDecision, type TelegramFetch, } from "./decision-channels.js";
++export type WorkflowHumanDecisionPresentation = {
++    requestId: string;
++    runId: string;
++    revision: number;
++    request: HumanDecisionRequest;
++};
++export type WorkflowHumanDecisionPresenter = (presentation: WorkflowHumanDecisionPresentation, context: ExtensionContext) => Promise<HumanDecisionResponse | undefined>;
++export declare function registerWorkflowHumanDecisionPresenter(presenter: WorkflowHumanDecisionPresenter): () => void;
+ export declare function activityStateForConnection(state: "started" | "refresh" | "settled", previousConnectionId: string | null, connectionId: string): "started" | "refresh" | "settled";
+ export type ParsedWorkflowArgs = {
+     kind: "list";
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/extension/index.js b/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
+index abe532f..8ab208d 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
+@@ -20,7 +20,26 @@ const INTERACTION_POLL_MS = 1_000;
+ const WORKFLOW_INTERACTION_MESSAGE_TYPE = "pi-workflows-interaction";
+ const WORKFLOW_NOTIFICATION_MESSAGE_TYPE = "pi-workflows-notification";
+ const WORKFLOW_PRESENTATION_MESSAGE_TYPE = "pi-workflows-presentation";
++const HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.human-decision-presenter.v1");
+ const sessionSnapshots = new Map();
++function humanDecisionPresenterRegistry() {
++    const globals = globalThis;
++    const current = globals[HUMAN_DECISION_PRESENTER_KEY];
++    if (typeof current === "object" && current !== null) {
++        return current;
++    }
++    const registry = {};
++    globals[HUMAN_DECISION_PRESENTER_KEY] = registry;
++    return registry;
++}
++export function registerWorkflowHumanDecisionPresenter(presenter) {
++    const registry = humanDecisionPresenterRegistry();
++    registry.presenter = presenter;
++    return () => {
++        if (registry.presenter === presenter)
++            registry.presenter = undefined;
++    };
++}
+ export function activityStateForConnection(state, previousConnectionId, connectionId) {
+     return state === "refresh" && previousConnectionId !== connectionId ? "started" : state;
+ }
+@@ -153,6 +172,13 @@ export default function piWorkflows(pi) {
+         });
+         await prior;
+         try {
++            try {
++                if (await presentPendingDecisionWithRegisteredPresenter(client, ctx))
++                    return;
++            }
++            catch (error) {
++                ctx.ui.notify(`Workflow decision popup failed: ${errorMessage(error)}`, "error");
++            }
+             const deliveries = sessionSnapshots.get(ctx.sessionManager.getSessionId())?.deliveries;
+             await sessionDelivery.synchronize(ctx, [
+                 () => claimPendingInteractionDelivery(pi, client, ctx, startOriginActivity),
+@@ -651,6 +677,74 @@ async function executeControllerCommand(client, ctx, command) {
+         details: { action: command.kind, resource: response.receipt ?? null },
+     };
+ }
++async function presentPendingDecisionWithRegisteredPresenter(client, context) {
++    const presenter = humanDecisionPresenterRegistry().presenter;
++    if (presenter === undefined)
++        return false;
++    const sessionId = context.sessionManager.getSessionId();
++    const storedInteraction = pendingInteractionForSession(sessionId);
++    if (storedInteraction === undefined ||
++        storedInteraction.kind !== "decision" ||
++        storedInteraction.status !== "pending" ||
++        storedInteraction.presentationSessionEntryId !== null) {
++        return false;
++    }
++    const interaction = {
++        ...storedInteraction,
++        contract: await client.hydrateContent(storedInteraction.runId, storedInteraction.contract),
++    };
++    rememberInteractiveRequest(sessionId, interaction);
++    if (workflowRunPaused(interaction.runId))
++        return false;
++    if (interaction.presentationClaimExpiresAt !== null &&
++        Date.parse(interaction.presentationClaimExpiresAt) > Date.now()) {
++        return false;
++    }
++    const claimKey = `claim-presentation-${interaction.requestId}-${interaction.revision}-${client.clientId}`;
++    const claim = await client.request({
++        operation: "interaction.update",
++        requestId: claimKey,
++        idempotencyKey: claimKey,
++        runId: interaction.runId,
++        expectedRevision: interaction.revision,
++        payload: { requestId: interaction.requestId, claimPresentation: true },
++    });
++    if (claim.outcome === "conflict")
++        return false;
++    if (claim.outcome !== "accepted" && claim.outcome !== "adopted") {
++        throw new Error(claim.error ?? "Workflow host rejected interaction.update");
++    }
++    if (claim.revision === undefined)
++        throw new Error("Presentation claim has no revision");
++    rememberInteractiveRequest(sessionId, claim.receipt);
++    const contract = interactionContract(interaction);
++    if (contract.schema !== "pi-workflows.human-decision-request.v1") {
++        throw new Error("Stored workflow decision contract is invalid");
++    }
++    const response = await presenter({
++        requestId: interaction.requestId,
++        runId: interaction.runId,
++        revision: claim.revision,
++        request: contract,
++    }, context);
++    if (response === undefined)
++        return true;
++    const submissionId = randomUUID();
++    const settled = await requestAccepted(client, {
++        operation: "decision.answer",
++        requestId: `answer-${submissionId}`,
++        idempotencyKey: submissionId,
++        runId: interaction.runId,
++        expectedRevision: claim.revision,
++        payload: {
++            requestId: interaction.requestId,
++            submissionId,
++            response: decisionResponse(response),
++        },
++    });
++    rememberInteractiveRequest(sessionId, settled.receipt);
++    return true;
++}
+ async function claimPendingInteractionDelivery(pi, client, ctx, onPresented) {
+     const storedInteraction = pendingInteractionForSession(ctx.sessionManager.getSessionId());
+     if (storedInteraction === undefined || storedInteraction.presentationSessionEntryId !== null)
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
+index 9d68505..ce5437f 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
+@@ -33,17 +33,19 @@ export class HostBackedWorkflowStore {
+         return await this.call("store.publishUpdate", { runId, state, nodeId, attemptId, update }, attemptId);
+     }
+     async findSettingsScope(runId, mountPath, invocation) {
+-        return await this.call("store.findSettingsScope", {
++        const scope = await this.call("store.findSettingsScope", {
+             runId,
+             mountPath,
+             invocation,
+         });
++        return scope === null ? undefined : scope;
+     }
+     async ensureSettingsScope(options) {
+         return await this.call("store.ensureSettingsScope", { options });
+     }
+     async getSettingsScopeAtChange(scopeId, changeNumber) {
+-        return await this.call("store.getSettingsScopeAtChange", { scopeId, changeNumber });
++        const scope = await this.call("store.getSettingsScopeAtChange", { scopeId, changeNumber });
++        return scope === null ? undefined : scope;
+     }
+     async createHumanDecisionRequest(request) {
+         return await this.call("store.createHumanDecisionRequest", { request }, request.attemptId);
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
+index 33aceb9..25cea11 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
+@@ -320,6 +320,11 @@ export class WorkflowRunStore {
+                         payload: { workflowName },
+                     };
+                     insertRunEvent(this.state, reserved.resourceId, revision, at, traceEvent);
++                    // A reserved continuation row was queued with a placeholder input; persist the
++                    // engine's real input so later worker generations read the same state.
++                    this.state.connection
++                      .prepare("UPDATE runs SET input_hash = ? WHERE run_id = ?")
++                      .run(this.state.putJson(state.input, now), state.runId);
+                     this.persistRunState(reserved, state, revision, now);
+                     initializeViewerRun(this.state, state.runId, now);
+                     this.initializeRunSettingsAndFollowUps(state, options.initialSettings ?? [], now);
+diff --git a/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts b/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts
+index a3d34be..a2148f9 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/builtins/autodoc.workflow.ts
+@@ -191,6 +191,14 @@ function currentPlan(context: WorkflowNodeContext): unknown {
+   throw new Error("autodoc does not have a selected plan");
+ }
+ 
++function inspectionRepository(request: AutodocInput): string | undefined {
++  return (
++    request.preparedWorkspace?.worktreePath
++    ?? request.preparedWorkspace?.repository
++    ?? request.repository
++  );
++}
++
+ function mutationRepository(request: AutodocInput): string {
+   if (request.repository !== undefined) return request.repository;
+   if (request.preparedWorkspace !== undefined) return request.preparedWorkspace.repository;
+@@ -329,8 +337,9 @@ export const autodocWorkflow = defineWorkflow({
+           "Look in the current conversation context and in the referenced canonical documents.",
+           "Do not devise, improve, replace, or implement the plan.",
+           "Return blocked when no single clear selected plan exists.",
++          "Read repository files only under the exact absolute repository path below.",
+           `Task: ${request.task}`,
+-          `Repository: ${request.repository ?? "current repository"}`,
++          `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+           `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
+         ].join("\n");
+       },
+@@ -361,6 +370,8 @@ export const autodocWorkflow = defineWorkflow({
+           "Choose current only when the documents already preserve the whole selected plan and its boundaries.",
+           "Choose update when documents are missing or stale and can be corrected in scope.",
+           "Choose blocked only when no safe canonical target exists or repository rules prohibit the documentation change.",
++          "Read and assess documentation only under the exact absolute repository path below. Do not use an equivalent file from another checkout.",
++          `Repository: ${inspectionRepository(request) ?? "current repository"}`,
+           `Task: ${request.task}`,
+           `Selected plan: ${JSON.stringify(currentPlan(context))}`,
+           `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
+diff --git a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
+index a990e7e..eb245a7 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
+@@ -15,7 +15,11 @@ import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
+ import { errorMessage } from "../workflows/errors.js";
+ import { discoverWorkflows } from "../workflows/loader.js";
+ import { createRunId } from "../workflows/store.js";
+-import type { AgentStepContract, HumanDecisionResponse } from "../workflows/types.js";
++import type {
++  AgentStepContract,
++  HumanDecisionRequest,
++  HumanDecisionResponse,
++} from "../workflows/types.js";
+ import { parseControllerArgs, type ParsedControllerArgs } from "./controller-command.js";
+ import {
+   HerdrWorkflowViewer,
+@@ -61,8 +65,48 @@ const INTERACTION_POLL_MS = 1_000;
+ const WORKFLOW_INTERACTION_MESSAGE_TYPE = "pi-workflows-interaction";
+ const WORKFLOW_NOTIFICATION_MESSAGE_TYPE = "pi-workflows-notification";
+ const WORKFLOW_PRESENTATION_MESSAGE_TYPE = "pi-workflows-presentation";
++const HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.human-decision-presenter.v1");
+ const sessionSnapshots = new Map<string, WorkflowSessionView>();
+ 
++export type WorkflowHumanDecisionPresentation = {
++  requestId: string;
++  runId: string;
++  revision: number;
++  request: HumanDecisionRequest;
++};
++
++export type WorkflowHumanDecisionPresenter = (
++  presentation: WorkflowHumanDecisionPresentation,
++  context: ExtensionContext,
++) => Promise<HumanDecisionResponse | undefined>;
++
++type HumanDecisionPresenterRegistry = {
++  presenter?: WorkflowHumanDecisionPresenter;
++};
++
++function humanDecisionPresenterRegistry(): HumanDecisionPresenterRegistry {
++  const globals = globalThis as typeof globalThis & {
++    [HUMAN_DECISION_PRESENTER_KEY]?: unknown;
++  };
++  const current = globals[HUMAN_DECISION_PRESENTER_KEY];
++  if (typeof current === "object" && current !== null) {
++    return current as HumanDecisionPresenterRegistry;
++  }
++  const registry: HumanDecisionPresenterRegistry = {};
++  globals[HUMAN_DECISION_PRESENTER_KEY] = registry;
++  return registry;
++}
++
++export function registerWorkflowHumanDecisionPresenter(
++  presenter: WorkflowHumanDecisionPresenter,
++): () => void {
++  const registry = humanDecisionPresenterRegistry();
++  registry.presenter = presenter;
++  return () => {
++    if (registry.presenter === presenter) registry.presenter = undefined;
++  };
++}
++
+ type PresentedOriginActivity = {
+   sessionId: string;
+   runId: string;
+@@ -222,6 +266,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
+     });
+     await prior;
+     try {
++      try {
++        if (await presentPendingDecisionWithRegisteredPresenter(client, ctx)) return;
++      } catch (error) {
++        ctx.ui.notify(`Workflow decision popup failed: ${errorMessage(error)}`, "error");
++      }
+       const deliveries = sessionSnapshots.get(ctx.sessionManager.getSessionId())?.deliveries;
+       await sessionDelivery.synchronize(ctx, [
+         () => claimPendingInteractionDelivery(pi, client, ctx, startOriginActivity),
+@@ -764,6 +813,86 @@ async function executeControllerCommand(
+   };
+ }
+ 
++async function presentPendingDecisionWithRegisteredPresenter(
++  client: WorkflowClient,
++  context: ExtensionContext,
++): Promise<boolean> {
++  const presenter = humanDecisionPresenterRegistry().presenter;
++  if (presenter === undefined) return false;
++
++  const sessionId = context.sessionManager.getSessionId();
++  const storedInteraction = pendingInteractionForSession(sessionId);
++  if (
++    storedInteraction === undefined ||
++    storedInteraction.kind !== "decision" ||
++    storedInteraction.status !== "pending" ||
++    storedInteraction.presentationSessionEntryId !== null
++  ) {
++    return false;
++  }
++  const interaction = {
++    ...storedInteraction,
++    contract: await client.hydrateContent(storedInteraction.runId, storedInteraction.contract),
++  };
++  rememberInteractiveRequest(sessionId, interaction);
++
++  if (workflowRunPaused(interaction.runId)) return false;
++  if (
++    interaction.presentationClaimExpiresAt !== null &&
++    Date.parse(interaction.presentationClaimExpiresAt) > Date.now()
++  ) {
++    return false;
++  }
++
++  const claimKey =
++    `claim-presentation-${interaction.requestId}-${interaction.revision}-${client.clientId}`;
++  const claim = await client.request({
++    operation: "interaction.update",
++    requestId: claimKey,
++    idempotencyKey: claimKey,
++    runId: interaction.runId,
++    expectedRevision: interaction.revision,
++    payload: { requestId: interaction.requestId, claimPresentation: true },
++  });
++  if (claim.outcome === "conflict") return false;
++  if (claim.outcome !== "accepted" && claim.outcome !== "adopted") {
++    throw new Error(claim.error ?? "Workflow host rejected interaction.update");
++  }
++  if (claim.revision === undefined) throw new Error("Presentation claim has no revision");
++  rememberInteractiveRequest(sessionId, claim.receipt);
++
++  const contract = interactionContract(interaction);
++  if (contract.schema !== "pi-workflows.human-decision-request.v1") {
++    throw new Error("Stored workflow decision contract is invalid");
++  }
++  const response = await presenter(
++    {
++      requestId: interaction.requestId,
++      runId: interaction.runId,
++      revision: claim.revision,
++      request: contract as unknown as HumanDecisionRequest,
++    },
++    context,
++  );
++  if (response === undefined) return true;
++
++  const submissionId = randomUUID();
++  const settled = await requestAccepted(client, {
++    operation: "decision.answer",
++    requestId: `answer-${submissionId}`,
++    idempotencyKey: submissionId,
++    runId: interaction.runId,
++    expectedRevision: claim.revision,
++    payload: {
++      requestId: interaction.requestId,
++      submissionId,
++      response: decisionResponse(response),
++    },
++  });
++  rememberInteractiveRequest(sessionId, settled.receipt);
++  return true;
++}
++
+ async function claimPendingInteractionDelivery(
+   pi: ExtensionAPI,
+   client: WorkflowClient,
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
+index 5d76c77..6d89260 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
+@@ -104,11 +104,11 @@ export class HostBackedWorkflowStore implements WorkflowExecutionStore {
+     mountPath: string,
+     invocation: number,
+   ): Promise<WorkflowSettingsScopeRecord | undefined> {
+-    return await this.call<WorkflowSettingsScopeRecord | undefined>("store.findSettingsScope", {
+-      runId,
+-      mountPath,
+-      invocation,
+-    });
++    const scope = await this.call<WorkflowSettingsScopeRecord | null>(
++      "store.findSettingsScope",
++      { runId, mountPath, invocation },
++    );
++    return scope === null ? undefined : scope;
+   }
+ 
+   async ensureSettingsScope(options: {
+@@ -124,10 +124,11 @@ export class HostBackedWorkflowStore implements WorkflowExecutionStore {
+     scopeId: string,
+     changeNumber: number,
+   ): Promise<WorkflowSettingsScopeRecord | undefined> {
+-    return await this.call<WorkflowSettingsScopeRecord | undefined>(
++    const scope = await this.call<WorkflowSettingsScopeRecord | null>(
+       "store.getSettingsScopeAtChange",
+       { scopeId, changeNumber },
+     );
++    return scope === null ? undefined : scope;
+   }
+ 
+   async createHumanDecisionRequest(request: HumanDecisionRequest): Promise<"created" | "adopted"> {
+diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
+index f0f87eb..cbacade 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
+@@ -889,6 +889,11 @@ export class WorkflowRunStore {
+             payload: { workflowName },
+           };
+           insertRunEvent(this.state, reserved.resourceId, revision, at, traceEvent);
++          // A reserved continuation row was queued with a placeholder input; persist the
++          // engine's real input so later worker generations read the same state.
++          this.state.connection
++            .prepare("UPDATE runs SET input_hash = ? WHERE run_id = ?")
++            .run(this.state.putJson(state.input, now), state.runId);
+           this.persistRunState(reserved, state, revision, now);
+           initializeViewerRun(this.state, state.runId, now);
+           this.initializeRunSettingsAndFollowUps(state, options.initialSettings ?? [], now);

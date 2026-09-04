@@ -33,35 +33,17 @@ test("worker protocol bounds one frame at the upstream limit", () => {
   assert.deepEqual(parseWorkerMessage(encoded.subarray(0, -1)), message);
 });
 
-test("worker store returns the host's own empty settings-scope result", async () => {
-  // The removed patch coerced this null to undefined. Orkastrator never calls
-  // findSettingsScope or getSettingsScopeAtChange, so the upstream shape is
-  // recorded here rather than corrected.
+test("worker store restores optional settings scopes lost to JSON null", async () => {
   const store = new HostBackedWorkflowStore(
     "settings-run",
     { request: async () => ({ result: null }) } as never,
   );
 
-  assert.equal(await store.findSettingsScope("settings-run", "implementation", 1), null);
+  assert.equal(await store.findSettingsScope("settings-run", "implementation", 1), undefined);
+  assert.equal(await store.getSettingsScopeAtChange("missing-scope", 0), undefined);
 });
 
-test("autodoc inspection cannot yet be pinned to the prepared worktree", async () => {
-  // Known gap, not a passing behaviour.
-  //
-  // The removed package patch added an inspectionRepository() helper to autodoc
-  // so its read-only nodes read the prepared worktree while mutation still
-  // targeted the launch repository. Pi Workflows 0.16.0 prints
-  // `repository ?? "current repository"` in locatePlan and prints no repository
-  // line at all in inspectDocumentation.
-  //
-  // This cannot be corrected from plan change. includeWorkflow() accepts only
-  // `input` and `settings`, so an included workflow's prompts are not
-  // overridable, and overwriting `repository` with the worktree path would
-  // break mutationRepository(), which must stay the launch repository.
-  //
-  // Effect: documentation inspection may read the launch checkout while the
-  // prepared worktree holds the newer files. Needs an upstream inspection-path
-  // hook. Flip these assertions once one exists.
+test("autodoc inspection is pinned to the prepared worktree", async () => {
   const launchRepository = "/tmp/launch-repository";
   const worktreePath = "/tmp/prepared-task-worktree";
   const request = {
@@ -89,12 +71,11 @@ test("autodoc inspection cannot yet be pinned to the prepared worktree", async (
   >;
   const context = { input: request, outputs: {}, results: {}, state: {} };
 
-  const locatePlan = await nodes.locatePlan.prompt(context);
-  assert.match(locatePlan, new RegExp(`Repository: ${launchRepository}`));
-  assert.doesNotMatch(locatePlan, new RegExp(worktreePath));
-
-  const inspectDocumentation = await nodes.inspectDocumentation.prompt(context);
-  assert.doesNotMatch(inspectDocumentation, /Repository:/u);
+  for (const nodeId of ["locatePlan", "inspectDocumentation"] as const) {
+    const prompt = await nodes[nodeId].prompt(context);
+    assert.match(prompt, new RegExp(`Repository: ${worktreePath}`));
+    assert.doesNotMatch(prompt, new RegExp(`Repository: ${launchRepository}(?:\\n|$)`));
+  }
 });
 
 test("worker transport recovery is owned by the workflow host", async () => {
@@ -108,4 +89,96 @@ test("worker transport recovery is owned by the workflow host", async () => {
   );
 
   assert.equal(typeof runner, "object");
+});
+
+test("a reserved continuation run persists the engine's carried input", async () => {
+  // The host reserves a human-decision continuation row before the worker
+  // exists, and it has no parent input at that moment, so it queues the row
+  // with `input: {}`. Upstream 0.16.0 then initialized the run without
+  // rewriting input_hash, so every later worker generation read `{}` as the
+  // run input. `/kas:cook` reached the review include after approval with an
+  // empty task and failed with "review workflow objective is required".
+  const { SqliteControllerStore } = await import(
+    "../../../node_modules/@osolmaz/pi-workflows/dist/controllers/sqlite.js"
+  );
+  const { WorkflowRunStore, createDefinitionSnapshot } = await import(
+    "../../../node_modules/@osolmaz/pi-workflows/dist/workflows/store.js"
+  );
+  const { compute, defineWorkflow } = await import(
+    "../../../node_modules/@osolmaz/pi-workflows/dist/workflows/index.js"
+  );
+  const { createHash } = await import("node:crypto");
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const root = await mkdtemp(join(tmpdir(), "orkastrator-continuation-input-"));
+  const databasePath = join(root, "state.sqlite");
+  const workflow = defineWorkflow({
+    name: "continuation-input",
+    startAt: "only",
+    nodes: { only: compute({ run: ({ input }) => input }) },
+    edges: [],
+  });
+  const snapshot = createDefinitionSnapshot(workflow);
+  const definitionDigest = createHash("sha256")
+    .update(JSON.stringify(snapshot))
+    .digest("hex");
+  const carriedInput = { task: "keep me", repository: "/tmp/repository" };
+  const claimToken = "continuation-claim-token";
+  try {
+    const queue = new SqliteControllerStore(databasePath, { projectPath: root });
+    const prepared = queue.prepareOrAdoptWorkflowRun({
+      runId: "continuation-1",
+      workflowName: workflow.name,
+      workflowSourceRef: "continuation-input",
+      workflowSource: { kind: "builtin", id: "continuation-input", revision: "test" },
+      definitionDigest,
+      definitionSnapshot: snapshot,
+      input: {},
+      launchOptions: {},
+      runnerId: "host-test",
+      claimToken,
+      leaseMs: 60_000,
+      originSessionId: "session-1",
+      executionMode: "interactive",
+    });
+    assert.equal(prepared.state, "claimed");
+    const generation = (prepared.run as { claimGeneration: number }).claimGeneration;
+    queue.close();
+
+    const store = new WorkflowRunStore(databasePath, {
+      authorityProvider: () => ({
+        actor: { type: "system" },
+        ownerType: "host",
+        ownerId: "host-test",
+        token: claimToken,
+        generation,
+      }),
+    });
+    try {
+      const now = new Date().toISOString();
+      await store.initializeRunFromSnapshot(snapshot, workflow.name, {
+        schema: "pi-workflows.run-state.v1",
+        traceSeq: 0,
+        runId: "continuation-1",
+        workflowName: workflow.name,
+        startedAt: now,
+        updatedAt: now,
+        status: "running",
+        input: carriedInput,
+        outputs: {},
+        results: {},
+        steps: [],
+        updates: [],
+      } as never);
+      const loaded = store.readRun("continuation-1");
+      assert.ok(loaded !== null && !(loaded instanceof Promise));
+      assert.deepEqual(loaded.state.input, carriedInput);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

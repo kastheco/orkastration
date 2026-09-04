@@ -20,7 +20,7 @@ const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhi
 type LaunchRecord = {
   binding: HerdrLaunchBinding;
   capability: string;
-  rootPaneId: string;
+  rootPaneId?: string;
   runIds: Set<string>;
   active: Map<string, { controller: AbortController; socket: Socket }>;
   accepting: boolean;
@@ -80,12 +80,14 @@ export class SessionDelegationBroker {
     this.server = server;
   }
 
-  async registerLaunch(rootPaneId: string): Promise<HerdrLaunchBinding> {
+  async registerLaunch(rootPaneId?: string): Promise<HerdrLaunchBinding> {
     const server = this.server;
     if (server === undefined || this.closing) {
-      throw new Error("Herdr delegation broker is unavailable");
+      throw new Error("Workflow delegation broker is unavailable");
     }
-    if (rootPaneId.trim().length === 0) throw new Error("Herdr workflow root pane is required");
+    if (rootPaneId !== undefined && rootPaneId.trim().length === 0) {
+      throw new Error("Herdr workflow root pane is required");
+    }
     const binding: HerdrLaunchBinding = {
       version: 1,
       transport: "unix",
@@ -95,7 +97,7 @@ export class SessionDelegationBroker {
     this.launches.set(binding.launchId, {
       binding,
       capability,
-      rootPaneId,
+      ...(rootPaneId === undefined ? {} : { rootPaneId }),
       runIds: new Set(),
       active: new Map(),
       accepting: true,
@@ -278,11 +280,15 @@ export class SessionDelegationBroker {
       const { herdrLaunch: _binding, panePlacement: _placement, ...delegation } = envelope.spec;
       const response = await this.run({
         ...delegation,
-        panePlacement: {
-          parentPaneId: launch.rootPaneId,
-          stackId: launch.binding.launchId,
-          firstDirection: "right",
-        },
+        ...(launch.rootPaneId === undefined
+          ? {}
+          : {
+              panePlacement: {
+                parentPaneId: launch.rootPaneId,
+                stackId: launch.binding.launchId,
+                firstDirection: "right" as const,
+              },
+            }),
       }, controller.signal);
       terminal = true;
       this.write(socket, {

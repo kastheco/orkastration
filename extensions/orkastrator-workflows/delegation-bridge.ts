@@ -78,7 +78,7 @@ export interface DelegationSpec extends Omit<SubagentDelegationRequest, "request
   panePlacement?: HerdrPanePlacement;
 }
 
-export type DelegationBackend = "pi-subagents" | "pi-herdr-subagents";
+export type DelegationBackend = "pi-sdk" | "pi-subagents" | "pi-herdr-subagents";
 
 export interface ToolSourceMetadata {
   name: string;
@@ -166,30 +166,35 @@ export async function probePiSubagents(
   });
 }
 
-/** Detect non-collapsing delegation capabilities, not duplicate tool names. */
+/**
+ * Selects the delegation transport that can actually run in this session.
+ * Herdr is eligible only inside a real Herdr pane. Desktop and headless
+ * sessions prefer pi-subagents and otherwise use the isolated Pi SDK runner.
+ */
 export async function detectDelegationBackend(
   tools: ToolSourceMetadata[],
   events: DelegationEvents,
   probeTimeoutMs = 25,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<DelegationBackend> {
   const [hasPiSubagents, herdr] = await Promise.all([
     probePiSubagents(events, probeTimeoutMs),
     Promise.resolve(inspectHerdrApi()),
   ]);
-  if (hasPiSubagents && herdr.available) {
-    throw new Error(
-      "Orkastrator found both pi-subagents and pi-herdr-subagents. Install exactly one delegation backend.",
-    );
+  const paneId = env.HERDR_PANE_ID;
+  const hasHerdrPane = typeof paneId === "string" && paneId.trim().length > 0;
+
+  if (hasHerdrPane) {
+    if (herdr.error) throw herdr.error;
+    if (herdr.available) return "pi-herdr-subagents";
+    if (herdrMetadataPresent(tools)) {
+      throw new Error(
+        "Orkastrator found pi-herdr-subagents tool metadata without the required delegation API; install version 0.2.1-orkastrator.1",
+      );
+    }
   }
-  if (herdr.error) throw herdr.error;
-  if (herdr.available) return "pi-herdr-subagents";
   if (hasPiSubagents) return "pi-subagents";
-  if (herdrMetadataPresent(tools)) {
-    throw new Error(
-      "Orkastrator found pi-herdr-subagents tool metadata without the required delegation API; install version 0.2.1-orkastrator.1",
-    );
-  }
-  throw new Error("Orkastrator requires either pi-subagents or pi-herdr-subagents");
+  return "pi-sdk";
 }
 
 /** Install the extension-to-extension transport used by workflow action nodes. */
@@ -485,7 +490,11 @@ export async function delegateSubagent(
     }
     return await hostedRunner(spec, signal);
   }
-  return bridge.backend === "pi-herdr-subagents"
-    ? delegateWithHerdr(bridge, spec, signal)
-    : delegateWithEvents(bridge, spec, signal);
+  if (bridge.backend === "pi-herdr-subagents") {
+    return await delegateWithHerdr(bridge, spec, signal);
+  }
+  if (bridge.backend === "pi-subagents") {
+    return await delegateWithEvents(bridge, spec, signal);
+  }
+  return await hostedRunner(spec, signal);
 }

@@ -19,10 +19,10 @@ orkastrator is an opinionated software delivery policy and workflow suite for pi
 
 ## install and run
 
-install orkastrator and exactly one subagent backend:
+install orkastrator with `pi-subagents` for ClickClack and other desktop sessions:
 
 ```bash
-pi install npm:pi-subagents
+pi install npm:pi-subagents@0.59.0
 pi install git:github.com/kastheco/orkastrator
 ```
 
@@ -38,11 +38,11 @@ to use herdr instead, replace the `pi-subagents` line with the forked runner whi
 pi install git:github.com/brkastner/pi-herdr-subagents@1817e6d670110100fbdc67ef08a31316a3a05bf4
 ```
 
-orkastrator detects the interactive backend through its non-launching delegation capabilities. it refuses to delegate when both backends are installed. the `pi-subagents` backend uses its correlated event protocol. the herdr backend uses the fork's versioned global delegation api and public awaitable runner, and it requires a working herdr installation.
+orkastrator selects a backend that can run in the current session. ClickClack, desktop, and headless sessions prefer `pi-subagents`; a session with `HERDR_PANE_ID` uses the herdr backend when its versioned delegation API is available. if neither interactive backend is available, hosted workflow workers use the isolated in-memory pi SDK runner instead of blocking workflow startup.
 
 for an orkastrator workflow started from herdr, the extension renders a compact, theme-aware workflow widget above pi's editor. it shows a bounded window around the active step and summarizes omitted nodes above and below. `/kas:workflow` opens the complete graph in a scrollable overlay. unary steps stay in one lane, real branches indent, node types carry distinct colors, and implied queued labels are omitted. the extension adds a non-secret launch id to the accepted workflow input and keeps the socket capability in a user-private runtime descriptor. hosted reviewer and fixer actions use that binding to call a session-owned unix socket broker. active workers open in a right-hand column beside the originating pi session, and concurrent workers stack downward there. completed worker panes close automatically. a terminal workflow collapses to a concise in-editor receipt without dumping its raw json output. a bound request fails closed if the originating session or broker disappears instead of silently creating an invisible child.
 
-reviewer children receive only read-only tools. fixer children receive repository editing tools inside their assigned worktree. both run with discovered extensions, skills, prompt templates, themes, and context files disabled while retaining the explicit completion extension. they use the configured pi model instead of hard-coded provider dispatches. unbound and non-herdr hosted runs retain the isolated in-memory pi sdk fallback.
+reviewer children receive only read-only tools. fixer children receive repository editing tools inside their assigned worktree. both run with discovered extensions, skills, prompt templates, themes, and context files disabled while retaining the explicit completion extension. they use the configured pi model instead of hard-coded provider dispatches. hosted `pi-subagents` requests cross the same authenticated session-owned unix broker without requesting pane placement; unbound runs retain the isolated in-memory pi SDK fallback.
 
 ## configuration
 
@@ -153,9 +153,9 @@ a finding observed during scoped re-review takes one of four routes:
 
 historical run records show that a live fixture produced two disjoint fixer groups in one parallel wave, re-reviewed each exact commit, and integrated both serially at `a543512`.
 
-A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 94 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
+A later run of the former review-only `/kas` command, now `/kas:check`, found and repaired three policy-boundary defects in `4e6f478`: finding identity after sorting, deferred evidence across rejected rounds, and scope enforcement across renames. The Orkastrator suite now passes 99 tests plus TypeScript checking. The Herdr runner passes 247 tests and lint.
 
-The session broker has a real separate-process Unix socket test for result delivery, cancellation, and accepted continuation runs. Herdr worker placement remains rooted in the originating session while the widget follows the newest continuation through its terminal state. The composed `/kas` and `/kas:cook` workflows still don't have a complete live dogfood run.
+The session broker has a real separate-process Unix socket test for result delivery, cancellation, and accepted continuation runs. Herdr worker placement remains rooted in the originating session while the widget follows the newest continuation through its terminal state. `/kas:cook` completes end to end in the disposable lifecycle test on the desktop `pi-subagents` path, including the protected plan approval, its continuation run, and the hosted reviewer child. `/kas` still lacks an equivalent live run.
 
 After installing these changes, reload Pi before retrying `/kas:cook`. Start a new run instead of resuming a failed run created from an older workflow snapshot. Durable history remains available through `/kas:status <run-id>`.
 
@@ -190,6 +190,10 @@ The extension registers `/kas`, `/kas:cook`, `/kas:check`, `/kas:workflow`, `/ka
 npm install
 npm run typecheck
 npm run test:extension
+npm run test:decision-runtime
+npm run test:cook-lifecycle
 ```
+
+`test:cook-lifecycle` is the disposable system test for `/kas:cook`. it builds a temporary git fixture with one obvious defect, starts the installed `pi` in rpc mode with this repository and `pi-subagents` as packages and `HERDR_PANE_ID` removed, serves every model turn from a local scripted server, answers the plan approval through pi's rpc ui boundary, and asserts the task worktree ends committed, clean, and passing its tests while the launch checkout stays untouched. `--runs N` repeats it on fresh fixtures; `--keep` retains the temporary root; a failure keeps it and writes `failure-report.txt`. `npm run test:orkastrator` runs all three.
 
 the old custom lifecycle, reducer, ledger, worktrunk identity, rpc worker manager, and monitor extension were removed at cutover. git history remains the reference for that implementation.

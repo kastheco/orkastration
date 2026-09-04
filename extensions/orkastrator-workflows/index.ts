@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import piWorkflows from "@osolmaz/pi-workflows/extension";
-import { readWorkflowRun, type WorkflowRunState } from "@osolmaz/pi-workflows";
+import { listWorkflowRuns, readWorkflowRun, type WorkflowRunState } from "@osolmaz/pi-workflows";
 
 import { WorkflowDecisionQuestionnaire } from "./decision-questionnaire.ts";
 import { detectDelegationBackend, installDelegationBridge } from "./delegation-bridge.ts";
@@ -204,22 +204,37 @@ function workflowWidgetRunAfterContinuation(
 }
 
 /**
+ * Finds the run that continued `parentRunId` after an accepted human decision.
+ *
+ * Pi Workflows 0.16.0 records the link on the continuation run itself as
+ * `WorkflowRunState.parentRunId`, and the read-only store the widget already
+ * uses exposes it. The `continuations` table is host-private, so the child is
+ * located by scanning run states instead.
+ */
+function durableContinuationFor(
+  parentRunId: string,
+  databasePath?: string,
+): string | undefined {
+  let runs: ReturnType<typeof listWorkflowRuns>;
+  try {
+    runs = listWorkflowRuns(databasePath === undefined ? {} : { databasePath });
+  } catch {
+    return undefined;
+  }
+  return runs.find((run) => run.state.parentRunId === parentRunId)?.runId;
+}
+
+/**
  * Reads the continuation chain starting at `runId`.
  *
- * Pi Workflows 0.16.0 exposes no continuation read: the `continuations` table
- * exists and the host writes it, but no client operation or run-view field
- * returns it, and the host is now the only process permitted to open the live
- * database. Chain following is therefore inert until upstream exposes it, so
- * the widget and the Herdr broker stay on the launched run instead of hopping
- * to its continuation.
- *
- * `continuationFor` stays injectable so the existing coverage still pins the
- * traversal, including its cycle and depth guards, for when a supported read
- * arrives.
+ * Every accepted protected decision parks the parent run and starts a new run
+ * with a fresh id, so hosted delegations after approval carry the
+ * continuation's `ownerRunId`. The broker and the widget must both follow that
+ * chain or the review stage is rejected as "another workflow lineage".
  */
 function workflowContinuationChain(
   runId: string,
-  continuationFor: (parentRunId: string) => string | undefined = () => undefined,
+  continuationFor: (parentRunId: string) => string | undefined = durableContinuationFor,
 ): string[] {
   const chain: string[] = [];
   const seen = new Set([runId]);
@@ -347,11 +362,13 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     currentBackend = detected;
     decisionQuestionnaire.start(ctx);
     uninstallUiGuard = installCompetingUiGuard(ctx);
-    uninstall = installDelegationBridge(pi.events, owner, {
-      backend: detected,
-      getContext: () => currentContext,
-    });
-    if (detected === "pi-herdr-subagents") {
+    uninstall = detected === "pi-sdk"
+      ? undefined
+      : installDelegationBridge(pi.events, owner, {
+          backend: detected,
+          getContext: () => currentContext,
+        });
+    if (detected !== "pi-sdk") {
       const nextBroker = new SessionDelegationBroker({
         sessionId: ctx.sessionManager.getSessionId(),
         continuationRunIds: workflowContinuationChain,
@@ -380,14 +397,17 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     if (start === undefined) return;
 
     delete start.workflowInput.herdrLaunch;
-    if (currentBackend !== "pi-herdr-subagents") return;
-    if (broker === undefined || currentContext === undefined) {
-      return { block: true, reason: "Orkastrator Herdr delegation broker is unavailable" };
+    if (currentBackend === "pi-sdk") return;
+    if (currentBackend === undefined || broker === undefined || currentContext === undefined) {
+      return { block: true, reason: "Orkastrator worker delegation is unavailable" };
     }
 
     let binding: HerdrLaunchBinding | undefined;
     try {
-      binding = await broker.registerLaunch(currentHerdrPaneId());
+      const rootPaneId = currentBackend === "pi-herdr-subagents"
+        ? currentHerdrPaneId()
+        : undefined;
+      binding = await broker.registerLaunch(rootPaneId);
       start.workflowInput.herdrLaunch = binding;
       pendingByToolCall.set(event.toolCallId, { binding });
       activeLaunches.add(binding.launchId);
@@ -397,7 +417,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
       if (binding !== undefined) await broker.releaseLaunch(binding.launchId);
       return {
         block: true,
-        reason: `Orkastrator could not bind Herdr worker placement: ${error instanceof Error ? error.message : String(error)}`,
+        reason: `Orkastrator could not bind worker delegation: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
   });
@@ -430,7 +450,7 @@ export function installOrkastratorWorkflows(pi: ExtensionAPI): void {
     } catch (error) {
       await releaseLaunch(pending.binding.launchId);
       ctx.ui.notify(
-        `Orkastrator workflow ${runId} started without a valid Herdr binding: ${error instanceof Error ? error.message : String(error)}`,
+        `Orkastrator workflow ${runId} started without a valid worker delegation binding: ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
     }
@@ -561,6 +581,7 @@ export const __indexTest__ = {
   acceptedCancellationRunId,
   workflowManagementPrompt,
   workflowContinuationChain,
+  durableContinuationFor,
   workflowWidgetRunAfterContinuation,
   setAttachedWorkflowWidget,
   clearCompetingWorkflowUi,

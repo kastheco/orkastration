@@ -102,23 +102,60 @@ all still pass. Legacy and unmarked worktrees are never swept automatically.
 
 ## Delegation backends
 
-Install exactly one backend. `pi-subagents` uses correlated request, response,
-and cancellation events. The Herdr path uses the forked
-`pi-herdr-subagents` delegation API v1 with additive pane placement and resource
-isolation options. Orkastrator detects backend capabilities without launching a
-child and fails closed when both or neither backend is available.
+`pi-subagents` is the default for ClickClack, desktop, and headless sessions. It
+uses correlated request, response, and cancellation events. The Herdr path uses
+the forked `pi-herdr-subagents` delegation API v1 with additive pane placement
+and resource isolation options. Orkastrator probes both capabilities without
+launching a child, but selects Herdr only when the current session has a real
+`HERDR_PANE_ID`. If neither interactive backend is available, hosted workers use
+the isolated Pi SDK runner instead of blocking workflow startup.
 
-An Orkastrator workflow started from Herdr receives a non-secret launch binding
-before the workflow tool executes. The interactive extension owns a user-private
-Unix socket broker and renders live workflow state through Pi's persistent widget
-area above the editor. The widget uses a theme-aware vertical outline: unary paths
-stay flat, branches indent, node types carry semantic colors, and queued state is
-implied rather than repeated. Hosted reviewers and fixers open in a right-hand
-worker column beside the originating Pi session, with concurrent workers stacked
-downward. The broker validates run ownership, applies tool and resource policy,
+An Orkastrator workflow using either interactive backend receives a non-secret
+launch binding before the workflow tool executes. The interactive extension owns
+a user-private Unix socket broker and renders live workflow state through Pi's
+persistent widget area above the editor. The widget uses a theme-aware vertical
+outline: unary paths stay flat, branches indent, node types carry semantic colors,
+and queued state is implied rather than repeated. Herdr reviewers and fixers open
+in a right-hand worker column beside the originating Pi session, with concurrent
+workers stacked downward. Desktop requests cross the same broker into
+`pi-subagents` without pane placement. The broker validates run ownership,
 propagates cancellation, and rejects stale or cross-run capabilities. Terminal
-runs collapse to a concise in-editor receipt. Headless and unbound runs retain the
-isolated Pi SDK fallback.
+runs collapse to a concise in-editor receipt. Unbound runs retain the isolated Pi
+SDK fallback.
+
+## Disposable lifecycle test
+
+`npm run test:cook-lifecycle` runs the complete `/kas:cook` lifecycle without a
+real model, a real repository, or a person at the keyboard. It creates a
+temporary home, agent directory, and Git fixture with a broken `sum(a, b)`,
+installs this repository and `pi-subagents` as Pi packages there, and starts
+the installed `pi` CLI in RPC mode with `HERDR_PANE_ID` removed. Every model
+turn is served by a local OpenAI-compatible server (`scripts/lib/`) whose
+replies are keyed on the Pi Workflows step contract, so the workflow host,
+worker processes, the Unix broker, the `pi-subagents` reviewer child, Worktrunk
+worktrees, and the fixture's `npm test` all run for real.
+
+The plan-approval decision is answered only through Pi's RPC extension UI
+sub-protocol, the same trusted client boundary ClickClack uses. The script
+never talks to the workflow host to forge an approval.
+
+Pass `--runs 2` to repeat on fresh fixtures and `--keep` to retain the
+temporary root after success. A failure keeps the root and writes
+`failure-report.txt` with the run lineage, terminal status, current node, run
+error, extension errors, scripted model errors, decisions presented, and the Pi
+stderr and event tail.
+
+Two defects surfaced on the first complete runs and are fixed in this tree:
+
+- Pi Workflows 0.16.0 reserved each human-decision continuation run with an
+  empty input and never rewrote it when the engine initialized the run, so
+  every worker generation after plan approval read `{}` as the run input and
+  the review include failed with "review workflow objective is required". The
+  package patch persists the carried input at initialization.
+- The extension treated continuation following as inert, so the session broker
+  stayed bound to the launched run and rejected the review delegation issued by
+  the continuation run as another workflow lineage. The chain now follows the
+  durable `parentRunId` link that the read-only run store already exposes.
 
 ## Remaining limitations
 
@@ -135,8 +172,10 @@ isolated Pi SDK fallback.
 - Autoimplementation delivery happens before Orkastrator review. Fixes integrated
   during the later review stage are not automatically republished or sent through
   a second CI and delivery pass.
-- The composed `/kas` and `/kas:cook` graphs have static definition and package
-  coverage, but no live end-to-end dogfood run yet.
+- `/kas:cook` has a disposable end-to-end test (`npm run test:cook-lifecycle`)
+  that runs the real Pi, workflow host, `pi-subagents`, broker, and Worktrunk
+  path against a scripted model. `/kas` and the fixer wave of `/kas:check` are
+  still covered only by static and unit tests.
 
 These are bounded adapter limitations, not reasons to restore the removed
 workflow engine.
