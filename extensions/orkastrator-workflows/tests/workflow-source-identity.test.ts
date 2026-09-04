@@ -35,8 +35,8 @@ test("separate package instances preserve registered built-in identities and fil
   const workerPackage = join(root, "worker/pi-workflows");
   try {
     await Promise.all([
-      cp(localPackage, launcherPackage, { recursive: true }),
-      cp(localPackage, workerPackage, { recursive: true }),
+      cp(localPackage, launcherPackage, { recursive: true, dereference: true }),
+      cp(localPackage, workerPackage, { recursive: true, dereference: true }),
     ]);
     const launcher = await resolveFixture(launcherPackage);
     const worker = await resolveFixture(workerPackage);

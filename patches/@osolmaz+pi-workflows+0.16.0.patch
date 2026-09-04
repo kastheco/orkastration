@@ -56,14 +56,15 @@ index b5901b1..fd02215 100644
  export type ParsedWorkflowArgs = {
      kind: "list";
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/extension/index.js b/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
-index abe532f..8ab208d 100644
+index abe532f..6cbdfa4 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
 +++ b/node_modules/@osolmaz/pi-workflows/dist/extension/index.js
-@@ -20,7 +20,26 @@ const INTERACTION_POLL_MS = 1_000;
+@@ -20,7 +20,36 @@ const INTERACTION_POLL_MS = 1_000;
  const WORKFLOW_INTERACTION_MESSAGE_TYPE = "pi-workflows-interaction";
  const WORKFLOW_NOTIFICATION_MESSAGE_TYPE = "pi-workflows-notification";
  const WORKFLOW_PRESENTATION_MESSAGE_TYPE = "pi-workflows-presentation";
 +const HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.human-decision-presenter.v1");
++const EXTERNAL_HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.external-human-decision-presenter.v1");
  const sessionSnapshots = new Map();
 +function humanDecisionPresenterRegistry() {
 +    const globals = globalThis;
@@ -83,10 +84,19 @@ index abe532f..8ab208d 100644
 +            registry.presenter = undefined;
 +    };
 +}
++function hasExternalHumanDecisionPresenter() {
++    const globals = globalThis;
++    const registry = globals[EXTERNAL_HUMAN_DECISION_PRESENTER_KEY];
++    return typeof registry === "object"
++        && registry !== null
++        && "registrations" in registry
++        && typeof registry.registrations === "number"
++        && registry.registrations > 0;
++}
  export function activityStateForConnection(state, previousConnectionId, connectionId) {
      return state === "refresh" && previousConnectionId !== connectionId ? "started" : state;
  }
-@@ -153,6 +172,13 @@ export default function piWorkflows(pi) {
+@@ -153,6 +182,13 @@ export default function piWorkflows(pi) {
          });
          await prior;
          try {
@@ -100,11 +110,13 @@ index abe532f..8ab208d 100644
              const deliveries = sessionSnapshots.get(ctx.sessionManager.getSessionId())?.deliveries;
              await sessionDelivery.synchronize(ctx, [
                  () => claimPendingInteractionDelivery(pi, client, ctx, startOriginActivity),
-@@ -651,6 +677,74 @@ async function executeControllerCommand(client, ctx, command) {
+@@ -651,10 +687,82 @@ async function executeControllerCommand(client, ctx, command) {
          details: { action: command.kind, resource: response.receipt ?? null },
      };
  }
 +async function presentPendingDecisionWithRegisteredPresenter(client, context) {
++    if (hasExternalHumanDecisionPresenter())
++        return false;
 +    const presenter = humanDecisionPresenterRegistry().presenter;
 +    if (presenter === undefined)
 +        return false;
@@ -175,6 +187,12 @@ index abe532f..8ab208d 100644
  async function claimPendingInteractionDelivery(pi, client, ctx, onPresented) {
      const storedInteraction = pendingInteractionForSession(ctx.sessionManager.getSessionId());
      if (storedInteraction === undefined || storedInteraction.presentationSessionEntryId !== null)
+         return undefined;
++    if (storedInteraction.kind === "decision" && hasExternalHumanDecisionPresenter())
++        return undefined;
+     const interaction = {
+         ...storedInteraction,
+         contract: await client.hydrateContent(storedInteraction.runId, storedInteraction.contract),
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
 index 9d68505..ce5437f 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
@@ -257,7 +275,7 @@ index a3d34be..a2148f9 100644
            `Selected plan: ${JSON.stringify(currentPlan(context))}`,
            `Preferred documents: ${JSON.stringify(request.documents ?? [])}`,
 diff --git a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
-index a990e7e..eb245a7 100644
+index a990e7e..030cacd 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
 +++ b/node_modules/@osolmaz/pi-workflows/src/extension/index.ts
 @@ -15,7 +15,11 @@ import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
@@ -273,11 +291,14 @@ index a990e7e..eb245a7 100644
  import { parseControllerArgs, type ParsedControllerArgs } from "./controller-command.js";
  import {
    HerdrWorkflowViewer,
-@@ -61,8 +65,48 @@ const INTERACTION_POLL_MS = 1_000;
+@@ -61,8 +65,63 @@ const INTERACTION_POLL_MS = 1_000;
  const WORKFLOW_INTERACTION_MESSAGE_TYPE = "pi-workflows-interaction";
  const WORKFLOW_NOTIFICATION_MESSAGE_TYPE = "pi-workflows-notification";
  const WORKFLOW_PRESENTATION_MESSAGE_TYPE = "pi-workflows-presentation";
 +const HUMAN_DECISION_PRESENTER_KEY = Symbol.for("pi-workflows.human-decision-presenter.v1");
++const EXTERNAL_HUMAN_DECISION_PRESENTER_KEY = Symbol.for(
++  "pi-workflows.external-human-decision-presenter.v1",
++);
  const sessionSnapshots = new Map<string, WorkflowSessionView>();
  
 +export type WorkflowHumanDecisionPresentation = {
@@ -319,10 +340,22 @@ index a990e7e..eb245a7 100644
 +  };
 +}
 +
++function hasExternalHumanDecisionPresenter(): boolean {
++  const globals = globalThis as typeof globalThis & {
++    [EXTERNAL_HUMAN_DECISION_PRESENTER_KEY]?: unknown;
++  };
++  const registry = globals[EXTERNAL_HUMAN_DECISION_PRESENTER_KEY];
++  return typeof registry === "object"
++    && registry !== null
++    && "registrations" in registry
++    && typeof registry.registrations === "number"
++    && registry.registrations > 0;
++}
++
  type PresentedOriginActivity = {
    sessionId: string;
    runId: string;
-@@ -222,6 +266,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
+@@ -222,6 +281,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
      });
      await prior;
      try {
@@ -334,7 +367,7 @@ index a990e7e..eb245a7 100644
        const deliveries = sessionSnapshots.get(ctx.sessionManager.getSessionId())?.deliveries;
        await sessionDelivery.synchronize(ctx, [
          () => claimPendingInteractionDelivery(pi, client, ctx, startOriginActivity),
-@@ -764,6 +813,86 @@ async function executeControllerCommand(
+@@ -764,6 +828,87 @@ async function executeControllerCommand(
    };
  }
  
@@ -342,6 +375,7 @@ index a990e7e..eb245a7 100644
 +  client: WorkflowClient,
 +  context: ExtensionContext,
 +): Promise<boolean> {
++  if (hasExternalHumanDecisionPresenter()) return false;
 +  const presenter = humanDecisionPresenterRegistry().presenter;
 +  if (presenter === undefined) return false;
 +
@@ -421,6 +455,14 @@ index a990e7e..eb245a7 100644
  async function claimPendingInteractionDelivery(
    pi: ExtensionAPI,
    client: WorkflowClient,
+@@ -773,6 +918,7 @@ async function claimPendingInteractionDelivery(
+   const storedInteraction = pendingInteractionForSession(ctx.sessionManager.getSessionId());
+   if (storedInteraction === undefined || storedInteraction.presentationSessionEntryId !== null)
+     return undefined;
++  if (storedInteraction.kind === "decision" && hasExternalHumanDecisionPresenter()) return undefined;
+   const interaction = {
+     ...storedInteraction,
+     contract: await client.hydrateContent(storedInteraction.runId, storedInteraction.contract),
 diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
 index 5d76c77..6d89260 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts

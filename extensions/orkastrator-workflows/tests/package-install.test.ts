@@ -9,13 +9,15 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const projectRoot = resolve(import.meta.dirname, "../../..");
 
-test("the packed package resolves one pi-workflows client without dev dependencies", async () => {
+test("the packed package resolves one patched pi-workflows client under npm and pnpm", async () => {
   const root = await mkdtemp(join(tmpdir(), "orkastrator-package-install-"));
   const packed = join(root, "packed");
   const consumer = join(root, "consumer");
+  const pnpmConsumer = join(root, "pnpm-consumer");
   try {
     await mkdir(packed, { recursive: true });
     await mkdir(consumer, { recursive: true });
+    await mkdir(pnpmConsumer, { recursive: true });
     const { stdout } = await execFileAsync(
       "npm",
       ["pack", "--json", "--pack-destination", packed],
@@ -61,6 +63,43 @@ test("the packed package resolves one pi-workflows client without dev dependenci
       { cwd: consumer, encoding: "utf8", timeout: 30_000 },
     );
     assert.equal(imported.stdout.trim(), "true,function,function,function,function,true,true,true");
+
+    await writeFile(join(pnpmConsumer, "package.json"), JSON.stringify({
+      name: "orkastrator-pnpm-consumer",
+      version: "1.0.0",
+      private: true,
+      type: "module",
+      dependencies: {
+        "orkastrator-pi": `file:${tarball}`,
+        "@earendil-works/pi-coding-agent": "0.84.3",
+        "@earendil-works/pi-tui": "0.84.3",
+      },
+    }), "utf8");
+    await writeFile(join(pnpmConsumer, "pnpm-workspace.yaml"), [
+      "allowBuilds:",
+      "  '@google/genai': true",
+      "  better-sqlite3: true",
+      "  esbuild: true",
+      "  orkastrator-pi: true",
+      `  'orkastrator-pi@file:../packed/${result[0]!.filename}': true`,
+      "  protobufjs: true",
+      "",
+    ].join("\n"), "utf8");
+    await execFileAsync(
+      "pnpm",
+      ["install", "--no-frozen-lockfile"],
+      { cwd: pnpmConsumer, encoding: "utf8", timeout: 120_000 },
+    );
+    const pnpmImported = await execFileAsync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        "import { readFileSync } from 'node:fs'; import { createRequire } from 'node:module'; import { dirname, resolve } from 'node:path'; const rootRequire = createRequire(import.meta.url); const orkRequire = createRequire(rootRequire.resolve('orkastrator-pi/package.json')); const workflowRoot = resolve(dirname(orkRequire.resolve('@osolmaz/pi-workflows')), '../..'); const extension = readFileSync(resolve(workflowRoot, 'dist/extension/index.js'), 'utf8'); const runStore = readFileSync(resolve(workflowRoot, 'dist/workflows/store.js'), 'utf8'); console.log([extension.includes('pi-workflows.external-human-decision-presenter.v1'), runStore.includes('UPDATE runs SET input_hash = ? WHERE run_id = ?')].join(','))",
+      ],
+      { cwd: pnpmConsumer, encoding: "utf8", timeout: 30_000 },
+    );
+    assert.equal(pnpmImported.stdout.trim(), "true,true");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

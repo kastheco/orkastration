@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -9,6 +11,34 @@ import { autodocWorkflow } from "../../../node_modules/@osolmaz/pi-workflows/dis
 import { HostBackedWorkflowStore } from "../../../node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js";
 
 const LARGE_WORKFLOW_PAYLOAD = "x".repeat(1_200_000);
+
+test("an external presenter owns decisions without disabling agent delivery", () => {
+  const source = readFileSync(resolve(
+    import.meta.dirname,
+    "../../../node_modules/@osolmaz/pi-workflows/src/extension/index.ts",
+  ), "utf8");
+  const production = readFileSync(resolve(
+    import.meta.dirname,
+    "../../../node_modules/@osolmaz/pi-workflows/dist/extension/index.js",
+  ), "utf8");
+
+  for (const implementation of [source, production]) {
+    assert.match(implementation, /pi-workflows\.external-human-decision-presenter\.v1/u);
+    assert.match(
+      implementation,
+      /presentPendingDecisionWithRegisteredPresenter[\s\S]+?hasExternalHumanDecisionPresenter\(\)[\s\S]+?return false;/u,
+    );
+    assert.match(
+      implementation,
+      /storedInteraction\.kind === ["']decision["'] && hasExternalHumanDecisionPresenter\(\)[\s\S]+?return undefined;/u,
+    );
+    assert.match(
+      implementation,
+      /claimPendingInteractionDelivery\(pi, client, ctx, startOriginActivity\)/u,
+    );
+  }
+
+});
 
 test("worker protocol bounds one frame at the upstream limit", () => {
   // The removed package patch raised this ceiling to 8 MiB because attachment

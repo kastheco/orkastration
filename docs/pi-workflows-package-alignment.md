@@ -12,10 +12,11 @@ Project workflow files remain file-backed. Their path and SHA-256 hash are still
 
 ## Maintained 0.16.0 compatibility patch
 
-The exact 0.16.0 dependency is patched during installation by `scripts/apply-patches.mjs`. The patch is part of Orkastrator's runtime contract, not an optional local modification. It currently covers two integration gaps:
+The exact 0.16.0 dependency is patched during installation by `scripts/apply-patches.mjs`. The patch is part of Orkastrator's runtime contract, not an optional local modification. It currently covers three integration gaps:
 
 1. It exposes process-local human-decision presenter registration so Orkastrator can render a protected decision through Pi's trusted UI boundary without exporting a model-callable answer API.
-2. It replaces a continuation row's reserved empty `input_hash` with the parent run's carried input when the continuation worker initializes. Without that update, every post-decision continuation reads `{}` and `/kas:cook` eventually loses its task and repository input.
+2. It yields decision presentation to a process-local external authority, such as the ClickClack bridge, while leaving workflow agent-step delivery active. This prevents the embedded Pi extension and the external presenter from racing to claim the same decision.
+3. It replaces a continuation row's reserved empty `input_hash` with the parent run's carried input when the continuation worker initializes. Without that update, every post-decision continuation reads `{}` and `/kas:cook` eventually loses its task and repository input.
 
 Canonical nested workflow sources are provided separately by the shipped 0.16.0 resolver and Orkastrator's explicit built-in references. `extensions/orkastrator-workflows/tests/pi-workflows-host-regressions.test.ts` pins the patched host behavior, while `extensions/orkastrator-workflows/tests/workflow-source-identity.test.ts` covers source identity across package instances. `scripts/test-decision-questionnaire-runtime.mjs` proves the protected decision and continuation path through a real RPC client. `scripts/test-cook-lifecycle.mjs` runs a disposable `/kas:cook` fixture through the real host, continuation, desktop `pi-subagents` broker, reviewer child, implementation, and verification.
 
@@ -39,6 +40,15 @@ npm run test:cook-lifecycle -- --runs 2
 ```
 
 Do not use `npm ci --ignore-scripts` unless `node scripts/apply-patches.mjs` is run explicitly before typechecking or testing.
+
+pnpm blocks dependency lifecycle scripts unless the consumer approves them. A pnpm consumer must allow `orkastrator-pi` in its workspace before installation so the mandatory patch hook runs:
+
+```yaml
+allowBuilds:
+  orkastrator-pi: true
+```
+
+A pnpm install that reports `Ignored build scripts: orkastrator-pi` is incomplete and must not be used to run Orkastrator. The package installation regression covers both npm and an approved pnpm isolated layout.
 
 ## Rust `piw` compatibility
 

@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
@@ -35,8 +35,11 @@ if (typeof bin !== "string") throw new Error("patch-package executable is unavai
 function applyDependencyPatch(entry, packageName, patchName) {
   const root = dependencyRoot(entry, packageName);
   const installRoot = dirname(dirname(dirname(root)));
-  const temporaryPatches = mkdtempSync(join(installRoot, ".orkastrator-patches-"));
+  const temporaryPatches = mkdtempSync(join(installRoot, "orkastrator-patches-"));
+  const installManifest = join(installRoot, "package.json");
+  const createdInstallManifest = !existsSync(installManifest);
   try {
+    if (createdInstallManifest) writeFileSync(installManifest, "{\"private\":true}\n");
     copyFileSync(join(patches, patchName), join(temporaryPatches, patchName));
     const patchDirectory = relative(installRoot, temporaryPatches);
     const result = spawnSync(
@@ -45,9 +48,12 @@ function applyDependencyPatch(entry, packageName, patchName) {
       { cwd: installRoot, stdio: "inherit" },
     );
     if (result.error !== undefined) throw result.error;
-    if (result.status !== 0) process.exit(result.status ?? 1);
+    if (result.status !== 0) {
+      throw new Error(`Could not apply ${patchName} (exit ${result.status ?? 1})`);
+    }
   } finally {
     rmSync(temporaryPatches, { recursive: true, force: true });
+    if (createdInstallManifest) unlinkSync(installManifest);
   }
 }
 
