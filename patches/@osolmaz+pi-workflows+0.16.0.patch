@@ -193,6 +193,94 @@ index abe532f..6cbdfa4 100644
      const interaction = {
          ...storedInteraction,
          contract: await client.hydrateContent(storedInteraction.runId, storedInteraction.contract),
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts b/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
+index dd34ef8..5eaa280 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/runner.d.ts
+@@ -1,4 +1,10 @@
++import type { WorkflowRunState } from "../workflows/types.js";
+ import { HostProcessRegistry } from "./processes.js";
++export declare function workerResumePayload(loaded: {
++    state: WorkflowRunState;
++}): {
++    state: WorkflowRunState;
++};
+ export type WorkflowHostOptions = {
+     /** Retained for callers; the host itself is global to the state database. */
+     cwd?: string;
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/runner.js b/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
+index fbc8bbc..0c5948e 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/runner.js
+@@ -34,6 +34,9 @@ const CONTROLLER_CLAIM_LEASE_MS = 120_000;
+ const CONTROLLER_RENEW_MS = 30_000;
+ const MAX_CONTROLLER_WORKERS = 4;
+ const DEFAULT_CONTROLLER_TIMEOUT_MS = 60_000;
++export function workerResumePayload(loaded) {
++    return { state: loaded.state };
++}
+ /** Global package-owned host. It writes state and supervises code-only workers. */
+ export class WorkflowHost {
+     options;
+@@ -2172,7 +2175,7 @@ export class WorkflowHost {
+                     break;
+                 case "store.prepareRunResume":
+                     await this.prepareInteractionResume(message.runId);
+-                    result = await this.runStore.prepareRunResume(message.runId);
++                    result = workerResumePayload(await this.runStore.prepareRunResume(message.runId));
+                     break;
+                 case "store.readRun":
+                     result = this.runStore.readRun(requireString(payload.runId, "runId"), payload.options);
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/view.d.ts b/node_modules/@osolmaz/pi-workflows/dist/host/view.d.ts
+index bbc7753..be651f9 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/view.d.ts
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/view.d.ts
+@@ -1,4 +1,4 @@
+-import { type OriginActivityReport, type WorkflowDisplay, type WorkflowRunListPage, type WorkflowRunView, type WorkflowSessionView } from "../client/view.js";
++import { type OriginActivityReport, type WorkflowDisplay, type WorkflowDisplayStatus, type WorkflowRunListPage, type WorkflowRunView, type WorkflowSessionView } from "../client/view.js";
+ import type { SqliteControllerStore, WorkflowRunQueueRecord } from "../controllers/sqlite.js";
+ import type { StateDatabase } from "../state/database.js";
+ import { type JsonValue } from "../state/json.js";
+@@ -8,6 +8,7 @@ import type { HostStateStore } from "./state.js";
+ export type { OriginActivityReport } from "../client/view.js";
+ export declare const WORKFLOW_PAGE_KINDS: readonly ["steps", "trace", "trace_at_step", "session_entries", "session_events", "settings", "follow_ups", "updates"];
+ export type WorkflowPageKind = (typeof WORKFLOW_PAGE_KINDS)[number];
++export declare function possiblyInterrupted(queueStatus: WorkflowRunQueueRecord["status"], displayStatus: WorkflowDisplayStatus): boolean;
+ type RunPageRequest = {
+     kind: WorkflowPageKind;
+     cursor: number;
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/view.js b/node_modules/@osolmaz/pi-workflows/dist/host/view.js
+index e5d258b..18502a9 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/host/view.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/host/view.js
+@@ -18,6 +18,9 @@ const VIEW_PAGE_ITEMS = 256;
+ const CONTENT_CHUNK_BYTES = 192 * 1024;
+ const CONTENT_CACHE_BYTES = 64 * 1024 * 1024;
+ const VIEW_CACHE_ITEMS = 64;
++export function possiblyInterrupted(queueStatus, displayStatus) {
++    return queueStatus === "parked" && displayStatus === "queued";
++}
+ export class HostViewStore {
+     state;
+     queue;
+@@ -66,7 +69,7 @@ export class HostViewStore {
+                     display,
+                     manifest: manifest(run, display.status),
+                     live: display.status === "running" || display.status === "waiting",
+-                    possiblyInterrupted: run.status === "parked" && display.status !== "paused",
++                    possiblyInterrupted: possiblyInterrupted(run.status, display.status),
+                 };
+             });
+             const items = byteBoundedForwardPage(summaries, (summary) => toJson(summary)).map((item) => item);
+@@ -191,7 +194,7 @@ export class HostViewStore {
+             updateStart: updatePage.start,
+             updateTotal: updatePage.total,
+             live: display.status === "running" || display.status === "waiting",
+-            possiblyInterrupted: queue.status === "parked" && display.status !== "paused",
++            possiblyInterrupted: possiblyInterrupted(queue.status, display.status),
+         };
+     }
+     session(sessionId) {
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js b/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
 index 9d68505..ce5437f 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js
@@ -242,7 +330,7 @@ index a3d34be..a2148f9 100644
 @@ -191,6 +191,14 @@ function currentPlan(context: WorkflowNodeContext): unknown {
    throw new Error("autodoc does not have a selected plan");
  }
- 
+
 +function inspectionRepository(request: AutodocInput): string | undefined {
 +  return (
 +    request.preparedWorkspace?.worktreePath
@@ -300,7 +388,7 @@ index a990e7e..030cacd 100644
 +  "pi-workflows.external-human-decision-presenter.v1",
 +);
  const sessionSnapshots = new Map<string, WorkflowSessionView>();
- 
+
 +export type WorkflowHumanDecisionPresentation = {
 +  requestId: string;
 +  runId: string;
@@ -370,7 +458,7 @@ index a990e7e..030cacd 100644
 @@ -764,6 +828,87 @@ async function executeControllerCommand(
    };
  }
- 
+
 +async function presentPendingDecisionWithRegisteredPresenter(
 +  client: WorkflowClient,
 +  context: ExtensionContext,
@@ -463,6 +551,68 @@ index a990e7e..030cacd 100644
    const interaction = {
      ...storedInteraction,
      contract: await client.hydrateContent(storedInteraction.runId, storedInteraction.contract),
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/runner.ts b/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
+index 4569ea9..0b85576 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/runner.ts
+@@ -102,6 +102,12 @@ const CONTROLLER_RENEW_MS = 30_000;
+ const MAX_CONTROLLER_WORKERS = 4;
+ const DEFAULT_CONTROLLER_TIMEOUT_MS = 60_000;
+
++export function workerResumePayload(loaded: { state: WorkflowRunState }): {
++  state: WorkflowRunState;
++} {
++  return { state: loaded.state };
++}
++
+ export type WorkflowHostOptions = {
+   /** Retained for callers; the host itself is global to the state database. */
+   cwd?: string;
+@@ -2602,7 +2608,7 @@ export class WorkflowHost {
+           break;
+         case "store.prepareRunResume":
+           await this.prepareInteractionResume(message.runId);
+-          result = await this.runStore.prepareRunResume(message.runId);
++          result = workerResumePayload(await this.runStore.prepareRunResume(message.runId));
+           break;
+         case "store.readRun":
+           result = this.runStore.readRun(
+diff --git a/node_modules/@osolmaz/pi-workflows/src/host/view.ts b/node_modules/@osolmaz/pi-workflows/src/host/view.ts
+index fd36986..2d3d002 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/host/view.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/host/view.ts
+@@ -70,6 +70,13 @@ const CONTENT_CHUNK_BYTES = 192 * 1024;
+ const CONTENT_CACHE_BYTES = 64 * 1024 * 1024;
+ const VIEW_CACHE_ITEMS = 64;
+
++export function possiblyInterrupted(
++  queueStatus: WorkflowRunQueueRecord["status"],
++  displayStatus: WorkflowDisplayStatus,
++): boolean {
++  return queueStatus === "parked" && displayStatus === "queued";
++}
++
+ export class HostViewStore {
+   private readonly activity = new Map<string, OriginActivity>();
+   private readonly contentRecords = new Map<string, ContentRecord>();
+@@ -118,7 +125,7 @@ export class HostViewStore {
+           display,
+           manifest: manifest(run, display.status),
+           live: display.status === "running" || display.status === "waiting",
+-          possiblyInterrupted: run.status === "parked" && display.status !== "paused",
++          possiblyInterrupted: possiblyInterrupted(run.status, display.status),
+         } satisfies WorkflowRunSummary;
+       });
+       const items = byteBoundedForwardPage(summaries, (summary) => toJson(summary)).map(
+@@ -314,7 +321,7 @@ export class HostViewStore {
+       updateStart: updatePage.start,
+       updateTotal: updatePage.total,
+       live: display.status === "running" || display.status === "waiting",
+-      possiblyInterrupted: queue.status === "parked" && display.status !== "paused",
++      possiblyInterrupted: possiblyInterrupted(queue.status, display.status),
+     };
+   }
+
 diff --git a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts b/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
 index 5d76c77..6d89260 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/host/worker-store.ts
@@ -482,7 +632,7 @@ index 5d76c77..6d89260 100644
 +    );
 +    return scope === null ? undefined : scope;
    }
- 
+
    async ensureSettingsScope(options: {
 @@ -124,10 +124,11 @@ export class HostBackedWorkflowStore implements WorkflowExecutionStore {
      scopeId: string,
@@ -495,7 +645,7 @@ index 5d76c77..6d89260 100644
      );
 +    return scope === null ? undefined : scope;
    }
- 
+
    async createHumanDecisionRequest(request: HumanDecisionRequest): Promise<"created" | "adopted"> {
 diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
 index f0f87eb..cbacade 100644

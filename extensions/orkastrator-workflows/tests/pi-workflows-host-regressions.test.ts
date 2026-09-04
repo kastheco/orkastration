@@ -63,6 +63,40 @@ test("worker protocol bounds one frame at the upstream limit", () => {
   assert.deepEqual(parseWorkerMessage(encoded.subarray(0, -1)), message);
 });
 
+test("intentional interaction parking is not reported as an interruption", async () => {
+  const view = await import(
+    "../../../node_modules/@osolmaz/pi-workflows/dist/host/view.js"
+  );
+  assert.equal(typeof view.possiblyInterrupted, "function");
+  assert.equal(view.possiblyInterrupted("parked", "running"), false);
+  assert.equal(view.possiblyInterrupted("parked", "waiting"), false);
+  assert.equal(view.possiblyInterrupted("parked", "paused"), false);
+  assert.equal(view.possiblyInterrupted("parked", "queued"), true);
+  assert.equal(view.possiblyInterrupted("running", "running"), false);
+});
+
+test("worker resume response excludes host-only run history", async () => {
+  const runner = await import(
+    "../../../node_modules/@osolmaz/pi-workflows/dist/host/runner.js"
+  );
+  assert.equal(typeof runner.workerResumePayload, "function");
+
+  const state = { schema: "pi-workflows.run-state.v1", status: "waiting" };
+  const payload = runner.workerResumePayload({
+    state,
+    trace: "x".repeat(1_200_000),
+  } as never);
+  assert.deepEqual(payload, { state });
+  assert.doesNotThrow(() =>
+    encodeWorkerLine({
+      schema: "pi-workflows.worker-response.v1",
+      messageId: "prepare-resume",
+      outcome: "accepted",
+      result: payload as never,
+    }),
+  );
+});
+
 test("worker store restores optional settings scopes lost to JSON null", async () => {
   const store = new HostBackedWorkflowStore(
     "settings-run",
