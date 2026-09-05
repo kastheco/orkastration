@@ -390,6 +390,59 @@ index 9d68505..ce5437f 100644
      }
      async createHumanDecisionRequest(request) {
          return await this.call("store.createHumanDecisionRequest", { request }, request.attemptId);
+diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/decision-presentation.js b/node_modules/@osolmaz/pi-workflows/dist/workflows/decision-presentation.js
+index 37c2fc1..eb78185 100644
+--- a/node_modules/@osolmaz/pi-workflows/dist/workflows/decision-presentation.js
++++ b/node_modules/@osolmaz/pi-workflows/dist/workflows/decision-presentation.js
+@@ -294,7 +294,9 @@ function presentationCodeUnits(presentation) {
+ function appendValue(blocks, value, label) {
+     if (isScalar(value)) {
+         const scalar = valueScalar(value);
+-        if (label === undefined || scalar.length > MAX_PRESENTATION_STRING_CODE_UNITS) {
++        if (label === undefined ||
++            hasControlCharacter(scalar, false) ||
++            scalar.length > MAX_PRESENTATION_STRING_CODE_UNITS) {
+             appendValueText(blocks, scalar, label === undefined ? "Decision details" : valueLabel(label));
+         }
+         else {
+@@ -310,7 +312,11 @@ function appendValue(blocks, value, label) {
+             return;
+         }
+         if (value.every(isScalar) &&
+-            value.every((item) => valueScalar(item).length <= MAX_PRESENTATION_STRING_CODE_UNITS)) {
++            value.every((item) => {
++                const scalar = valueScalar(item);
++                return (!hasControlCharacter(scalar, false) &&
++                    scalar.length <= MAX_PRESENTATION_STRING_CODE_UNITS);
++            })) {
+             const items = value.map(valueScalar);
+             for (let index = 0; index < items.length; index += MAX_PRESENTATION_ITEMS) {
+                 blocks.push({ kind: "bullets", items: items.slice(index, index + MAX_PRESENTATION_ITEMS) });
+@@ -328,12 +334,22 @@ function appendValue(blocks, value, label) {
+         return;
+     }
+     const fields = entries
+-        .filter(([, child]) => isScalar(child) && valueScalar(child).length <= MAX_PRESENTATION_STRING_CODE_UNITS)
++        .filter(([, child]) => {
++        if (!isScalar(child))
++            return false;
++        const scalar = valueScalar(child);
++        return (!hasControlCharacter(scalar, false) && scalar.length <= MAX_PRESENTATION_STRING_CODE_UNITS);
++    })
+         .map(([key, child]) => ({ label: valueLabel(key), value: valueScalar(child) }));
+     for (let index = 0; index < fields.length; index += MAX_PRESENTATION_ITEMS) {
+         blocks.push({ kind: "fields", items: fields.slice(index, index + MAX_PRESENTATION_ITEMS) });
+     }
+-    for (const [key, child] of entries.filter(([, child]) => !isScalar(child) || valueScalar(child).length > MAX_PRESENTATION_STRING_CODE_UNITS)) {
++    for (const [key, child] of entries.filter(([, child]) => {
++        if (!isScalar(child))
++            return true;
++        const scalar = valueScalar(child);
++        return (hasControlCharacter(scalar, false) || scalar.length > MAX_PRESENTATION_STRING_CODE_UNITS);
++    })) {
+         appendValue(blocks, child, key);
+     }
+ }
 diff --git a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js b/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
 index 33aceb9..25cea11 100644
 --- a/node_modules/@osolmaz/pi-workflows/dist/workflows/store.js
@@ -818,6 +871,71 @@ index 5d76c77..6d89260 100644
    }
 
    async createHumanDecisionRequest(request: HumanDecisionRequest): Promise<"created" | "adopted"> {
+diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/decision-presentation.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/decision-presentation.ts
+index 2b579b3..9e207c9 100644
+--- a/node_modules/@osolmaz/pi-workflows/src/workflows/decision-presentation.ts
++++ b/node_modules/@osolmaz/pi-workflows/src/workflows/decision-presentation.ts
+@@ -356,7 +356,11 @@ function appendValue(
+ ): void {
+   if (isScalar(value)) {
+     const scalar = valueScalar(value);
+-    if (label === undefined || scalar.length > MAX_PRESENTATION_STRING_CODE_UNITS) {
++    if (
++      label === undefined ||
++      hasControlCharacter(scalar, false) ||
++      scalar.length > MAX_PRESENTATION_STRING_CODE_UNITS
++    ) {
+       appendValueText(blocks, scalar, label === undefined ? "Decision details" : valueLabel(label));
+     } else {
+       blocks.push({ kind: "fields", items: [{ label: valueLabel(label), value: scalar }] });
+@@ -371,7 +375,13 @@ function appendValue(
+     }
+     if (
+       value.every(isScalar) &&
+-      value.every((item) => valueScalar(item).length <= MAX_PRESENTATION_STRING_CODE_UNITS)
++      value.every((item) => {
++        const scalar = valueScalar(item);
++        return (
++          !hasControlCharacter(scalar, false) &&
++          scalar.length <= MAX_PRESENTATION_STRING_CODE_UNITS
++        );
++      })
+     ) {
+       const items = value.map(valueScalar);
+       for (let index = 0; index < items.length; index += MAX_PRESENTATION_ITEMS) {
+@@ -391,18 +401,24 @@ function appendValue(
+     return;
+   }
+   const fields = entries
+-    .filter(
+-      ([, child]) =>
+-        isScalar(child) && valueScalar(child).length <= MAX_PRESENTATION_STRING_CODE_UNITS,
+-    )
++    .filter(([, child]) => {
++      if (!isScalar(child)) return false;
++      const scalar = valueScalar(child);
++      return (
++        !hasControlCharacter(scalar, false) && scalar.length <= MAX_PRESENTATION_STRING_CODE_UNITS
++      );
++    })
+     .map(([key, child]) => ({ label: valueLabel(key), value: valueScalar(child) }));
+   for (let index = 0; index < fields.length; index += MAX_PRESENTATION_ITEMS) {
+     blocks.push({ kind: "fields", items: fields.slice(index, index + MAX_PRESENTATION_ITEMS) });
+   }
+-  for (const [key, child] of entries.filter(
+-    ([, child]) =>
+-      !isScalar(child) || valueScalar(child).length > MAX_PRESENTATION_STRING_CODE_UNITS,
+-  )) {
++  for (const [key, child] of entries.filter(([, child]) => {
++    if (!isScalar(child)) return true;
++    const scalar = valueScalar(child);
++    return (
++      hasControlCharacter(scalar, false) || scalar.length > MAX_PRESENTATION_STRING_CODE_UNITS
++    );
++  })) {
+     appendValue(blocks, child, key);
+   }
+ }
 diff --git a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts b/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts
 index f0f87eb..cbacade 100644
 --- a/node_modules/@osolmaz/pi-workflows/src/workflows/store.ts

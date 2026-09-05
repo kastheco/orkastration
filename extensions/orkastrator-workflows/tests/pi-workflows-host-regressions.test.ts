@@ -11,6 +11,7 @@ import {
 } from "../../../node_modules/@osolmaz/pi-workflows/dist/host/worker-protocol.js";
 import { autodocWorkflow } from "../../../node_modules/@osolmaz/pi-workflows/dist/builtins/autodoc.workflow.js";
 import { HostBackedWorkflowStore } from "../../../node_modules/@osolmaz/pi-workflows/dist/host/worker-store.js";
+import { valueDecisionPresentation } from "../../../node_modules/@osolmaz/pi-workflows/dist/workflows/decision-presentation.js";
 
 const LARGE_WORKFLOW_PAYLOAD = "x".repeat(1_200_000);
 
@@ -83,6 +84,32 @@ test("worker protocol still rejects incompressible oversized wire frames", () =>
   };
 
   assert.throws(() => encodeWorkerLine(response), /exceeds 1 MiB/u);
+});
+
+test("multiline plan values use multiline decision blocks", () => {
+  const presentation = valueDecisionPresentation({
+    summary: "first line\nsecond line",
+    checks: ["short", "one\ntwo"],
+  });
+
+  assert.ok(
+    presentation.blocks.some(
+      (block) => block.kind === "paragraph" && block.text === "first line\nsecond line",
+    ),
+  );
+  assert.ok(
+    presentation.blocks.some(
+      (block) => block.kind === "paragraph" && block.text === "one\ntwo",
+    ),
+  );
+  for (const block of presentation.blocks) {
+    if (block.kind === "fields") {
+      assert.ok(block.items.every((item) => !/[\t\n\r]/u.test(item.value)));
+    }
+    if (block.kind === "bullets") {
+      assert.ok(block.items.every((item) => !/[\t\n\r]/u.test(item)));
+    }
+  }
 });
 
 test("intentional interaction parking is not reported as an interruption", async () => {
